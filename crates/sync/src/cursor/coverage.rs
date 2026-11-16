@@ -38,7 +38,7 @@
 //! So the engine issues its own monotonic `AckToken` per checkpoint-
 //! bearing publication, and the acknowledgement names it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -829,24 +829,31 @@ pub struct PendingCoverage {
     capacity: tokio::sync::Notify,
 }
 
-/// Sweeps finish the primary ledger transition before recording delivery loss.
-/// Keep their existing independent locks and delivery -> coverage ordering.
+/// Attachment and reset ownership captured when a loss requests deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackfillDiscard {
+    pub(crate) scope: CursorScope,
+    segment: u64,
+    fence: ScopeFence,
+}
+
+/// Loss recording takes the primary ledger lock before these locks, so reset
+/// fences and loss attribution share one ordering. Delivery locks come first.
 #[derive(Debug, Default)]
 struct LossLedger {
     /// Scopes whose durable backfill rows a recorded loss has asked to drop.
-    /// See [`PendingCoverage::note_undelivered`].
-    discard_requests: Mutex<HashSet<CursorScope>>,
+    /// See [`PendingCoverage::note_undelivered_publication`].
+    discard_requests: Mutex<HashMap<CursorScope, BackfillDiscard>>,
     /// Published backfill pages that reached nobody who could acknowledge them,
-    /// ever, PER SCOPE. See [`PendingCoverage::note_undelivered`].
+    /// ever, PER SCOPE. See [`PendingCoverage::note_undelivered_publication`].
     ///
     /// Keyed by scope rather than counted per account because the reading is
     /// consumed as a walk-wide verdict: an account-wide counter lets a page of
     /// scope X that reached nobody make scope Y's in-flight walk look holed and
     /// cost it a re-walk it did not earn. One entry per scope, so it stays
     /// bounded exactly as `fenced` does. Its own mutex rather than a field of
-    /// the ledger: `release_undelivered` records after it has dropped the
-    /// ledger lock, and giving the counter its own lock keeps that from becoming
-    /// a re-entrancy rule somebody has to remember.
+    /// the ledger so readers of the watermark need no primary ledger lock.
+    /// Writers hold the primary ledger lock through recording and retirement.
     undelivered: Mutex<HashMap<CursorScope, UndeliveredMark>>,
     /// Set by `detach` the moment teardown begins, and never cleared: the
     /// ledger dies with the attachment. Read by the departure sweep
@@ -856,7 +863,7 @@ struct LossLedger {
 }
 
 impl LossLedger {
-    fn record(&self, scope: &CursorScope, count: usize) {
+    fn record(&self, scope: &CursorScope, count: usize, segment: u64, fence: ScopeFence) {
         self.undelivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -866,7 +873,14 @@ impl LossLedger {
         self.discard_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope.clone());
+            .insert(
+                scope.clone(),
+                BackfillDiscard {
+                    scope: scope.clone(),
+                    segment,
+                    fence,
+                },
+            );
     }
 }
 
@@ -1732,19 +1746,24 @@ impl PendingCoverage {
             // `carried` slot and was lost at detach. Retirement and debt
             // extraction are the same decision and must not be two.
             ledger.claims.carry_and_forget(retired.iter().cloned());
+            for (scope, retired) in &by_scope {
+                self.loss.record(
+                    scope,
+                    *retired,
+                    self.segment,
+                    ledger.fences.scope_fence(scope),
+                );
+            }
             retired.len()
         };
         if count > 0 {
-            for (scope, retired) in &by_scope {
-                self.note_undelivered(scope, *retired);
-            }
             self.wake_capacity();
         }
         count
     }
 
-    /// Record that `count` published backfill pages OF THIS SCOPE reached
-    /// nobody who could acknowledge them.
+    /// Record that this backfill publication reached nobody who could
+    /// acknowledge it, unless a reset or discard has already fenced it.
     ///
     /// A monotonic per-scope counter, and monotonic on purpose: a backfill walk
     /// snapshots its scope's reading before it starts and compares afterwards,
@@ -1766,11 +1785,44 @@ impl PendingCoverage {
     /// end left the rows that point PAST the hole in the store with no marker
     /// above them. A `Fixed` plan re-walks everything and survives that; an
     /// `OpenPages` plan resumes from those rows and never replays the hole.
-    /// The request is taken by the walk itself, per scope
-    /// (`take_backfill_discard`), and whatever is left at teardown by `detach`
-    /// (`take_backfill_discards`) before the writer goes.
+    /// The request is stamped with this attachment's segment and the scope's
+    /// fence at recording time. It is settled in exactly one place: the
+    /// writer's successful unbounded discard of a CURRENT request
+    /// (`take_backfill_discard`). Whatever is left at teardown is drained by
+    /// `detach` (`take_backfill_discards`) and sent before the writer goes. A
+    /// request a reset or account clear has outdated is never settled; its
+    /// stamp makes the writer refuse it wherever it is delivered.
+    pub(crate) fn note_undelivered_publication(&self, id: &AckToken) {
+        let Some(Checkpoint::Backfill(checkpoint)) = id.1.checkpoint.as_ref() else {
+            return;
+        };
+        let scope = &checkpoint.scope;
+        let ledger = self.guard();
+        // A reset can land after the send guard releases but before its caller
+        // reports refusal. Users expect that old loss to leave the replacement
+        // walk alone. Registration is not required: retirement or supersession
+        // may already have removed it, without making a current loss harmless.
+        if !self.minted_here(id)
+            || ledger.fences.scope_fence(scope).excludes(id)
+            || ledger
+                .fences
+                .fenced_backfill
+                .get(scope)
+                .is_some_and(|fence| fence.excludes(id))
+        {
+            return;
+        }
+        self.loss
+            .record(scope, 1, self.segment, ledger.fences.scope_fence(scope));
+        drop(ledger);
+    }
+
+    /// Inject a current loss in tests that do not model publication delivery.
+    #[cfg(test)]
     pub(crate) fn note_undelivered(&self, scope: &CursorScope, count: usize) {
-        self.loss.record(scope, count);
+        let ledger = self.guard();
+        self.loss
+            .record(scope, count, self.segment, ledger.fences.scope_fence(scope));
     }
 
     /// Take ONE scope's outstanding discard request, reporting whether there was
@@ -1789,19 +1841,42 @@ impl PendingCoverage {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(scope)
+            .is_some()
     }
 
-    /// Take every outstanding request. For TEARDOWN only: `detach` is the last
-    /// moment anything can be written, and by then no walk is left to answer for
-    /// its own scope.
+    /// Take every outstanding request. For teardown only: `detach` drains these
+    /// while no walk is left to answer for its own scope. Stale entries among
+    /// them are refused by the writer's stamp check, so nothing else needs to
+    /// prune them.
     #[must_use]
-    pub(crate) fn take_backfill_discards(&self) -> Vec<CursorScope> {
+    pub(crate) fn take_backfill_discards(&self) -> Vec<BackfillDiscard> {
         self.loss
             .discard_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain()
+            .map(|(_, request)| request)
             .collect()
+    }
+
+    /// Bind an orchestrator decision to the walk that observed the loss. Never
+    /// resnapshot here: a reset may already have replaced that walk.
+    pub(crate) fn backfill_discard_for_walk(
+        &self,
+        scope: &CursorScope,
+        fence: ScopeFence,
+    ) -> BackfillDiscard {
+        BackfillDiscard {
+            scope: scope.clone(),
+            segment: self.segment,
+            fence,
+        }
+    }
+
+    /// Check before any writer mutation or await. The writer serializes resets
+    /// with deletion, and the segment also rejects a different attachment.
+    pub(crate) fn backfill_discard_is_current(&self, request: &BackfillDiscard) -> bool {
+        self.segment == request.segment && self.scope_fence(&request.scope) == request.fence
     }
 
     /// Snapshot of one scope's undelivered counter. A walk compares two
@@ -1978,11 +2053,16 @@ impl PendingCoverage {
                 .collect();
             let count = ids.len();
             ledger.claims.carry_and_forget(ids);
+            for (scope, abandoned) in &by_scope {
+                self.loss.record(
+                    scope,
+                    *abandoned,
+                    self.segment,
+                    ledger.fences.scope_fence(scope),
+                );
+            }
             count
         };
-        for (scope, abandoned) in &by_scope {
-            self.note_undelivered(scope, *abandoned);
-        }
         self.wake_capacity();
         count
     }
@@ -2003,7 +2083,7 @@ impl PendingCoverage {
     /// runs, on both of its passes, with nothing to remember at the call site
     /// and no window between retiring a publication and releasing its capacity.
     pub(crate) fn invalidate_scope(&self, scope: &CursorScope) -> CoverageClaim {
-        self.invalidate_in(scope, None, None)
+        self.invalidate_in(scope, None, None, false)
     }
 
     /// The BACKFILL half of the same operation: retire and fence only this
@@ -2028,7 +2108,7 @@ impl PendingCoverage {
         scope: &CursorScope,
         through: Option<&AckToken>,
     ) -> CoverageClaim {
-        self.invalidate_in(scope, Some(PublicationStreamKind::Backfill), through)
+        self.invalidate_in(scope, Some(PublicationStreamKind::Backfill), through, false)
     }
 
     /// Has this scope minted a BACKFILL publication above `ceiling`?
@@ -2049,11 +2129,29 @@ impl PendingCoverage {
             .is_some_and(|mint| *mint > ceiling.0)
     }
 
+    /// Retire the final discard window and settle its request under the same
+    /// lock used by publication loss recording. A concurrent new loss must
+    /// survive even when it lands before the writer next yields.
+    pub(crate) fn finish_backfill_discard(
+        &self,
+        scope: &CursorScope,
+        through: Option<&AckToken>,
+        succeeded: bool,
+    ) -> CoverageClaim {
+        self.invalidate_in(
+            scope,
+            Some(PublicationStreamKind::Backfill),
+            through,
+            through.is_none() && succeeded,
+        )
+    }
+
     fn invalidate_in(
         &self,
         scope: &CursorScope,
         stream_kind: Option<PublicationStreamKind>,
         through: Option<&AckToken>,
+        settle_discard: bool,
     ) -> CoverageClaim {
         let mut ledger = self.guard();
         let mut ids: Vec<AckToken> = Vec::new();
@@ -2137,6 +2235,9 @@ impl PendingCoverage {
             Some(PublicationStreamKind::Backfill) => {
                 ledger.fences.raise_backfill(scope, watermark);
             }
+        }
+        if settle_discard {
+            self.take_backfill_discard(scope);
         }
         drop(ledger);
         self.wake_capacity();
@@ -2233,11 +2334,9 @@ impl PendingCoverage {
         // bound - it holds the mint counter, whose current value is the id the
         // next, post-reset publication will take.
         let fenced_out = stream.scope().is_some_and(|scope| {
-            let scope_wide = ledger
-                .fences
-                .fenced
-                .get(scope)
-                .is_some_and(|watermark| watermark.excludes(&id));
+            let scope_wide = ledger.fences.fenced.get(scope).is_some_and(|watermark| {
+                watermark.excludes(&id) || (watermark.is_raised() && !self.minted_here(&id))
+            });
             let stream_wide = stream.kind() == PublicationStreamKind::Backfill
                 && ledger
                     .fences
@@ -2444,6 +2543,35 @@ fn carry_forward(carried: &mut Option<CoverageClaim>, claim: CoverageClaim) {
 
 #[cfg(test)]
 mod tests {
+    // Isolate the receipt fence from boundary retirement: a retained boundary
+    // must not let the callback run when its receipt is excluded.
+    #[test]
+    fn a_retained_backfill_boundary_cannot_cross_the_send_fence() {
+        let pending = PendingCoverage::new();
+        let scope = CursorScope::Account;
+        let fence = pending.scope_fence(&scope);
+        let id = pending.register(
+            backfill_checkpoint(b"page"),
+            CoverageClaim {
+                reports: Vec::new(),
+                generation: pending.next_generation(),
+            },
+        );
+        pending
+            .guard()
+            .fences
+            .fenced_backfill
+            .insert(scope.clone(), super::ScopeFence::after(&id));
+        assert_eq!(pending.scope_fence(&scope), fence);
+        assert_eq!(pending.pending_checkpoints(), 1);
+        let sent = std::cell::Cell::new(false);
+        assert_eq!(
+            pending.with_scope_fence(&scope, fence, Some(&id), || sent.set(true)),
+            None
+        );
+        assert!(!sent.get(), "excluded receipt must never reach broadcast");
+    }
+
     #[test]
     fn a_ledger_cannot_share_receiver_numbers_between_delivery_gates() {
         let ledger = super::PendingCoverage::new();
@@ -2615,6 +2743,35 @@ mod tests {
         assert!(matches!(
             current.claim_checkpoint(id, &cp),
             ClaimLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn a_scope_fence_refuses_a_foreign_change_receipt_but_spares_other_scopes() {
+        let current = PendingCoverage::new();
+        let foreign = PendingCoverage::new();
+        let cp = checkpoint(b"foreign");
+        let id = foreign.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(1)),
+        );
+        current.raise_scope_fence(&CursorScope::Account);
+        assert!(matches!(
+            current.claim_checkpoint(id.clone(), &cp),
+            ClaimLookup::Apply(_)
+        ));
+        current.raise_scope_fence(&scope());
+        assert!(matches!(
+            current.claim_checkpoint(id, &cp),
+            ClaimLookup::Unknown
+        ));
+        let fresh = current.register(
+            cp.clone(),
+            CoverageClaim::new(degraded("new"), crate::cursor::WalkGeneration::for_test(2)),
+        );
+        assert!(matches!(
+            current.claim_checkpoint(fresh, &cp),
+            ClaimLookup::Apply(_)
         ));
     }
 

@@ -208,7 +208,7 @@ async fn a_discarded_backfill_attempt_cannot_be_rebuilt_by_a_late_ack() {
 
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::DiscardBackfillProgress {
-        scope: scope.clone(),
+        request: coverage.backfill_discard_for_walk(&scope, coverage.scope_fence(&scope)),
         done,
     })
     .await
@@ -277,7 +277,7 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
 
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::DiscardBackfillProgress {
-        scope: scope.clone(),
+        request: coverage.backfill_discard_for_walk(&scope, coverage.scope_fence(&scope)),
         done,
     })
     .await
@@ -297,7 +297,8 @@ async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
     }))
     .await
     .expect("writer accepts the request");
-    wait.await
+    let _ = wait
+        .await
         .expect("writer answers")
         .expect("a live-lane acknowledgement must survive a backfill discard");
     assert!(
@@ -364,9 +365,12 @@ async fn a_marker_ack_retried_after_a_store_failure_keeps_the_scopes_rows() {
             generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
-    ack(&tx, page, Some(page_publication))
-        .await
-        .expect("the page persists");
+    assert_eq!(
+        ack(&tx, page, Some(page_publication))
+            .await
+            .expect("the page persists"),
+        crate::AckOutcome::Durable,
+    );
 
     failures.store(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -384,9 +388,12 @@ async fn a_marker_ack_retried_after_a_store_failure_keeps_the_scopes_rows() {
         ),
         "the transient store failure reaches the consumer"
     );
-    ack(&tx, marker, Some(marker_publication))
-        .await
-        .expect("and the retry is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(marker_publication))
+            .await
+            .expect("and the retry is honoured"),
+        crate::AckOutcome::Durable,
+    );
 
     let stored = store
         .get_backfill(&account, &scope)
@@ -437,9 +444,12 @@ async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
             generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
-    ack(&tx, page, Some(page_publication))
-        .await
-        .expect("the page persists");
+    assert_eq!(
+        ack(&tx, page, Some(page_publication))
+            .await
+            .expect("the page persists"),
+        crate::AckOutcome::Durable,
+    );
 
     // A second page, delivered and unacknowledged - what the sweep will strand.
     let stranded = register(
@@ -468,9 +478,12 @@ async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
     // who can answer for it, so this walk is holed.
     assert_eq!(coverage.release_undelivered(None), 1);
 
-    ack(&tx, marker, Some(marker_publication))
-        .await
-        .expect("the retry is honoured");
+    assert_eq!(
+        ack(&tx, marker, Some(marker_publication))
+            .await
+            .expect("the retry is honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::WalkNotWhole),
+    );
 
     assert!(
         store
@@ -613,7 +626,7 @@ async fn a_failed_discard_leaves_the_request_for_the_next_attempt() {
 
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::DiscardBackfillProgress {
-        scope: scope.clone(),
+        request: coverage.backfill_discard_for_walk(&scope, coverage.scope_fence(&scope)),
         done,
     })
     .await
@@ -706,9 +719,12 @@ async fn a_stale_marker_ack_leaves_a_later_attempts_rows_alone() {
     // attach and a re-walk of everything W2 has already offered.
     let retry_page = lane_page(&scope, "page:0:10", 5);
     let retry_publication = publish_a_page(&control, &coverage, &retry_page);
-    ack(&tx, retry_page, Some(retry_publication))
-        .await
-        .expect("the retry's page persists");
+    assert_eq!(
+        ack(&tx, retry_page, Some(retry_publication))
+            .await
+            .expect("the retry's page persists"),
+        crate::AckOutcome::Durable,
+    );
     assert!(
         store
             .get_backfill(&account, &scope)
@@ -719,9 +735,12 @@ async fn a_stale_marker_ack_leaves_a_later_attempts_rows_alone() {
     );
 
     // Only now does W1's marker acknowledgement arrive.
-    ack(&tx, stale, Some(stale_publication))
-        .await
-        .expect("the consumer's acknowledgement is honoured");
+    assert_eq!(
+        ack(&tx, stale, Some(stale_publication))
+            .await
+            .expect("the consumer's acknowledgement is honoured"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::WalkNotWhole),
+    );
 
     let stored = store
         .get_backfill(&account, &scope)
@@ -821,7 +840,8 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
     }))
     .await
     .expect("writer accepts the request");
-    wait.await
+    let _ = wait
+        .await
         .expect("writer answers")
         .expect("the consumer's acknowledgement is honoured");
 
@@ -848,7 +868,7 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
     }))
     .await
     .expect("writer accepts the request");
-    wait.await.expect("writer answers").expect(
+    let _ = wait.await.expect("writer answers").expect(
         "a page the RETRY published is newer than the marker being refused and must \
                  stay acknowledgeable",
     );
@@ -875,7 +895,10 @@ async fn a_completion_marker_acknowledged_without_a_publication_is_withheld() {
     let (account, store, _coverage, tx, writer) = writer_harness();
 
     let page = backfill_checkpoint(bifrost_types::Partition(b"page:0:10".to_vec()));
-    ack(&tx, page, None).await.expect("the page is honoured");
+    assert_eq!(
+        ack(&tx, page, None).await.expect("the page is honoured"),
+        crate::AckOutcome::Durable,
+    );
     assert!(
         store
             .get_backfill(&account, &email_scope())
@@ -932,9 +955,12 @@ async fn open_debt_does_not_mask_the_discard_a_lost_walk_needs() {
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(&tx, page, Some(page_publication))
-        .await
-        .expect("ack persisted");
+    assert_eq!(
+        ack(&tx, page, Some(page_publication))
+            .await
+            .expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
     assert!(
         store
             .get_backfill(&account, &email_scope())
@@ -1501,6 +1527,8 @@ impl CheckpointStore for FailingOnceStore {
 }
 
 struct GatedDeleteStore {
+    gate_backfill: std::sync::atomic::AtomicBool,
+    gate_ledger: std::sync::atomic::AtomicBool,
     fail_delete: std::sync::atomic::AtomicBool,
     fail_ledger: std::sync::atomic::AtomicBool,
     inner: Arc<crate::cursor::InMemoryCheckpointStore>,
@@ -1511,6 +1539,8 @@ struct GatedDeleteStore {
 impl GatedDeleteStore {
     fn new(inner: Arc<crate::cursor::InMemoryCheckpointStore>) -> Self {
         Self {
+            gate_backfill: std::sync::atomic::AtomicBool::new(false),
+            gate_ledger: std::sync::atomic::AtomicBool::new(false),
             fail_delete: std::sync::atomic::AtomicBool::new(false),
             fail_ledger: std::sync::atomic::AtomicBool::new(false),
             inner,
@@ -1574,7 +1604,13 @@ impl CheckpointStore for GatedDeleteStore {
         if self.fail_ledger.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(async { Err(Error::CheckpointStore("ledger refused".into())) });
         }
-        self.inner.put_ledger(account, ledger)
+        Box::pin(async move {
+            if self.gate_ledger.load(std::sync::atomic::Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.expect("ledger gate").forget();
+            }
+            self.inner.put_ledger(account, ledger).await
+        })
     }
 
     fn get_ledger<'a>(
@@ -1607,7 +1643,13 @@ impl CheckpointStore for GatedDeleteStore {
         account: &'a bifrost_types::AccountId,
         scope: &'a CursorScope,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.delete_backfill(account, scope)
+        Box::pin(async move {
+            if self.gate_backfill.load(std::sync::atomic::Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.expect("delete gate").forget();
+            }
+            self.inner.delete_backfill(account, scope).await
+        })
     }
 }
 
@@ -1734,9 +1776,12 @@ async fn an_acknowledged_degraded_page_persists_its_debt() {
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(&tx, checkpoint, Some(publication))
-        .await
-        .expect("ack persisted");
+    assert_eq!(
+        ack(&tx, checkpoint, Some(publication))
+            .await
+            .expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
 
     let ledger = store.get_ledger(&account).await.expect("ledger read");
     assert_eq!(
@@ -1984,7 +2029,10 @@ async fn each_partition_acknowledges_its_own_coverage() {
         ),
     );
 
-    ack(&tx, page_a, Some(first)).await.expect("ack persisted");
+    assert_eq!(
+        ack(&tx, page_a, Some(first)).await.expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
 
     let ledger = store.get_ledger(&account).await.expect("ledger read");
     assert_eq!(
@@ -2020,7 +2068,10 @@ async fn the_completion_sentinel_is_withheld_over_open_debt() {
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(&tx, page, Some(debt)).await.expect("ack persisted");
+    assert_eq!(
+        ack(&tx, page, Some(debt)).await.expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
 
     let completion =
         backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
@@ -2108,7 +2159,10 @@ async fn a_withheld_completion_sentinel_is_not_announced_durable() {
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(&tx, page.clone(), Some(debt)).await.expect("ack lands");
+    assert_eq!(
+        ack(&tx, page.clone(), Some(debt)).await.expect("ack lands"),
+        crate::AckOutcome::Durable,
+    );
 
     let completion =
         backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
@@ -2120,9 +2174,12 @@ async fn a_withheld_completion_sentinel_is_not_announced_durable() {
             generation: crate::cursor::WalkGeneration::for_test(1),
         },
     );
-    ack(&tx, completion.clone(), Some(sentinel))
-        .await
-        .expect("the acknowledgement itself still succeeds");
+    assert_eq!(
+        ack(&tx, completion.clone(), Some(sentinel))
+            .await
+            .expect("the acknowledgement itself still succeeds"),
+        crate::AckOutcome::Withheld(crate::CompletionRefusal::Unvouchable),
+    );
 
     let announced = control.durable_snapshot();
     assert!(
@@ -2161,7 +2218,10 @@ async fn a_waiver_releases_the_sentinel_without_claiming_proof() {
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(&tx, page, Some(debt)).await.expect("ack persisted");
+    assert_eq!(
+        ack(&tx, page, Some(debt)).await.expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
 
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::OperatorDecision {
@@ -2243,9 +2303,12 @@ async fn seed_debt(
             crate::cursor::WalkGeneration::for_test(1),
         ),
     );
-    ack(tx, page, Some(publication))
-        .await
-        .expect("ack persisted");
+    assert_eq!(
+        ack(tx, page, Some(publication))
+            .await
+            .expect("ack persisted"),
+        crate::AckOutcome::Durable,
+    );
 }
 
 async fn apply_repair(
@@ -2387,9 +2450,12 @@ async fn a_repair_acknowledgement_cannot_consume_a_checkpoint_publication() {
         "a repair acknowledgement must not resolve a checkpoint publication"
     );
 
-    ack(&tx, checkpoint.clone(), Some(publication))
-        .await
-        .expect("the real acknowledgement still persists");
+    assert_eq!(
+        ack(&tx, checkpoint.clone(), Some(publication))
+            .await
+            .expect("the real acknowledgement still persists"),
+        crate::AckOutcome::Durable,
+    );
 
     assert_eq!(
         store
@@ -2607,7 +2673,7 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     }))
     .await
     .expect("writer alive");
-    wait.await.expect("writer answered").expect("ack persisted");
+    let _ = wait.await.expect("writer answered").expect("ack persisted");
 
     let (done, wait) = oneshot::channel();
     tx.send(WriterRequest::ReattachAbort {
@@ -3872,9 +3938,12 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
             generation: crate::cursor::WalkGeneration::for_test(0),
         },
     );
-    ack(&tx, checkpoint.clone(), Some(publication.clone()))
-        .await
-        .expect("first ack");
+    assert_eq!(
+        ack(&tx, checkpoint.clone(), Some(publication.clone()))
+            .await
+            .expect("first ack"),
+        crate::AckOutcome::Durable,
+    );
     let handle = WriterHandle::new(tx.clone());
     handle
         .reattach_insert(
@@ -3883,9 +3952,12 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
         )
         .await
         .expect("insert");
-    ack(&tx, checkpoint, Some(publication))
-        .await
-        .expect("duplicate ack");
+    assert_eq!(
+        ack(&tx, checkpoint, Some(publication))
+            .await
+            .expect("duplicate ack"),
+        crate::AckOutcome::Durable,
+    );
     handle
         .reattach_abort(crate::engine::ReattachAttempt::for_test(7))
         .await;
@@ -3947,4 +4019,354 @@ async fn writer_reply_loss_is_shutdown_but_store_refusal_stays_intact() {
         }
         task.await.expect("writer task");
     }
+}
+
+// Model detach being descheduled after its drain and before queue admission.
+// Queue order is explicit, so this needs neither scheduling luck nor a timer.
+#[tokio::test]
+async fn drained_discards_cannot_delete_post_reset_backfill() {
+    for account_reset in [false, true] {
+        for drain_before_reset in [false, true] {
+            let (account, store, coverage, tx, task, _control) = writer_harness_observed();
+            let writer = WriterHandle::new(tx.clone());
+            let scope = CursorScope::Account;
+            coverage.note_undelivered(&scope, 1);
+            let mut requests = if drain_before_reset {
+                coverage.take_backfill_discards()
+            } else {
+                Vec::new()
+            };
+            if account_reset {
+                writer
+                    .reset_account_for_schema_recovery()
+                    .await
+                    .expect("account reset");
+            } else {
+                writer
+                    .reset_scope_for_restart(scope.clone())
+                    .await
+                    .expect("scope reset");
+            }
+            if !drain_before_reset {
+                requests = coverage.take_backfill_discards();
+            }
+            let bifrost_types::Checkpoint::Backfill(checkpoint) =
+                lane_page(&scope, "replacement", 7)
+            else {
+                unreachable!("backfill fixture");
+            };
+            writer
+                .persist_backfill(checkpoint.clone())
+                .await
+                .expect("replacement progress");
+            for request in requests {
+                writer
+                    .enqueue_discard(request)
+                    .await
+                    .expect("enqueue")
+                    .await
+                    .expect("reply")
+                    .expect("stale discard is harmless");
+            }
+            assert_eq!(
+                store.get_backfill(&account, &scope).await.expect("read"),
+                Some(checkpoint)
+            );
+
+            // An unrelated reset must not suppress a current loss on this scope.
+            coverage.note_undelivered(&scope, 1);
+            let request = coverage
+                .take_backfill_discards()
+                .pop()
+                .expect("current loss");
+            writer
+                .reset_scope_for_restart(email_scope())
+                .await
+                .expect("sibling reset");
+            writer
+                .enqueue_discard(request)
+                .await
+                .expect("enqueue current")
+                .await
+                .expect("reply")
+                .expect("current discard applies");
+            assert!(
+                store
+                    .get_backfill(&account, &scope)
+                    .await
+                    .expect("read")
+                    .is_none()
+            );
+            drop(writer);
+            drop(tx);
+            task.await.expect("writer exits");
+        }
+    }
+}
+
+#[tokio::test]
+async fn drained_discard_from_an_old_attachment_cannot_delete_new_attachment_progress() {
+    let (account, store, coverage, tx, task, control) = writer_harness_observed();
+    let scope = CursorScope::Account;
+    coverage.note_undelivered(&scope, 1);
+    let request = coverage.take_backfill_discards().pop().expect("old loss");
+    drop(tx);
+    task.await
+        .expect("old writer exits before lifecycle reservation releases");
+    drop(control);
+
+    // Reuse the account and durable store, with a fresh attachment's ledger.
+    let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+    let (boundary, _view) = crate::cancel::Boundary::new();
+    let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _b) = tokio::sync::watch::channel(None);
+    let control = crate::control::SyncControl::new_with_publications(
+        account.clone(),
+        boundary,
+        priority,
+        bandwidth,
+        Arc::clone(&coverage),
+    );
+    let (tx, rx) = mpsc::channel(8);
+    let task = tokio::spawn(ack_writer(
+        account.clone(),
+        Arc::clone(&store) as Arc<DynCheckpointStore>,
+        control,
+        coverage,
+        rx,
+    ));
+    let writer = WriterHandle::new(tx);
+    let bifrost_types::Checkpoint::Backfill(checkpoint) = lane_page(&scope, "new attachment", 9)
+    else {
+        unreachable!("backfill fixture");
+    };
+    writer
+        .persist_backfill(checkpoint.clone())
+        .await
+        .expect("new progress");
+    writer
+        .enqueue_discard(request)
+        .await
+        .expect("enqueue old request")
+        .await
+        .expect("reply")
+        .expect("foreign discard ignored");
+    assert_eq!(
+        store.get_backfill(&account, &scope).await.expect("read"),
+        Some(checkpoint)
+    );
+    drop(writer);
+    task.await.expect("new writer exits");
+}
+
+// Exercise the orchestrator's actual send helper with queue admission blocked.
+// Reset and replacement writes are explicitly ordered before forwarding the
+// captured request to the real writer, without sockets, sleeps or scheduler luck.
+#[tokio::test]
+async fn orchestrator_discard_keeps_its_walk_fence_across_queue_admission() {
+    for account_reset in [false, true] {
+        for decide_after_reset in [false, true] {
+            let (account, store, coverage, tx, task, control) = writer_harness_observed();
+            let writer = WriterHandle::new(tx.clone());
+            let scope = email_scope();
+            let walk_fence = coverage.scope_fence(&scope);
+            coverage.note_undelivered(&scope, 1);
+            let before = coverage.backfill_discard_for_walk(&scope, walk_fence);
+            if decide_after_reset {
+                if account_reset {
+                    writer
+                        .reset_account_for_schema_recovery()
+                        .await
+                        .expect("account reset");
+                } else {
+                    writer
+                        .reset_scope_for_restart(scope.clone())
+                        .await
+                        .expect("scope reset");
+                }
+            }
+            // A parked walk can notice loss only after reset. Stamping must use
+            // its saved fence, never the coverage owner's current fence.
+            let request = if decide_after_reset {
+                coverage.backfill_discard_for_walk(&scope, walk_fence)
+            } else {
+                before
+            };
+            let (queued_tx, mut queued_rx) = mpsc::channel(1);
+            let (done, _reply) = oneshot::channel();
+            queued_tx
+                .send(WriterRequest::GetLedger { done })
+                .await
+                .expect("fill queue");
+            let queued_writer = WriterHandle::new(queued_tx);
+            let mut discard = Box::pin(super::backfill::discard_backfill_progress(
+                &queued_writer,
+                &account,
+                request,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(discard.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if !decide_after_reset {
+                if account_reset {
+                    writer
+                        .reset_account_for_schema_recovery()
+                        .await
+                        .expect("account reset");
+                } else {
+                    writer
+                        .reset_scope_for_restart(scope.clone())
+                        .await
+                        .expect("scope reset");
+                }
+            }
+
+            let checkpoint = lane_page(&scope, "replacement", 11);
+            let publication = publish_a_page(&control, &coverage, &checkpoint);
+            let _ = ack(&tx, checkpoint.clone(), Some(publication))
+                .await
+                .expect("replacement ack");
+            let pending_checkpoint = lane_page(&scope, "replacement-next", 12);
+            let pending_publication = publish_a_page(&control, &coverage, &pending_checkpoint);
+            coverage.note_undelivered(&scope, 1);
+            queued_rx.recv().await.expect("remove queue filler");
+            // Poll once to admit the request; it then waits for the writer reply.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(discard.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tx.send(queued_rx.recv().await.expect("orchestrator request"))
+                .await
+                .expect("forward to writer");
+            assert!(discard.await, "stale request is a harmless success");
+            let bifrost_types::Checkpoint::Backfill(expected) = checkpoint else {
+                unreachable!("backfill fixture");
+            };
+            assert_eq!(
+                store.get_backfill(&account, &scope).await.expect("read"),
+                Some(expected)
+            );
+            assert!(
+                coverage.take_backfill_discard(&scope),
+                "stale reply must retain the new loss"
+            );
+            // The stale request must not invalidate the replacement publication.
+            assert_eq!(
+                ack(&tx, pending_checkpoint, Some(pending_publication))
+                    .await
+                    .expect("replacement remains acknowledgeable"),
+                crate::AckOutcome::Durable
+            );
+            drop(queued_writer);
+            drop(writer);
+            drop(tx);
+            task.await.expect("writer exits");
+        }
+    }
+}
+
+#[tokio::test]
+async fn current_orchestrator_discard_survives_a_sibling_reset_and_settles_its_loss() {
+    let (account, store, coverage, tx, task, control) = writer_harness_observed();
+    let writer = WriterHandle::new(tx.clone());
+    let scope = email_scope();
+    let checkpoint = lane_page(&scope, "current", 4);
+    let publication = publish_a_page(&control, &coverage, &checkpoint);
+    let _ = ack(&tx, checkpoint, Some(publication))
+        .await
+        .expect("page ack");
+    coverage.note_undelivered(&scope, 1);
+    let request = coverage.backfill_discard_for_walk(&scope, coverage.scope_fence(&scope));
+    writer
+        .reset_scope_for_restart(CursorScope::Account)
+        .await
+        .expect("sibling reset");
+    assert!(super::backfill::discard_backfill_progress(&writer, &account, request).await);
+    assert!(
+        store
+            .get_backfill(&account, &scope)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        !coverage.take_backfill_discard(&scope),
+        "successful current deletion settles loss"
+    );
+    drop(writer);
+    drop(tx);
+    task.await.expect("writer exits");
+}
+
+#[tokio::test]
+async fn discard_retains_loss_recorded_during_final_ledger_write() {
+    let account = bifrost_types::AccountId("discard-window".into());
+    let scope = email_scope();
+    let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+    let gate = Arc::new(GatedDeleteStore::new(Arc::new(
+        crate::cursor::InMemoryCheckpointStore::new(),
+    )));
+    gate.gate_backfill
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let store: Arc<DynCheckpointStore> = Arc::clone(&gate) as Arc<DynCheckpointStore>;
+    let (boundary, _view) = crate::cancel::Boundary::new();
+    let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _b) = tokio::sync::watch::channel(None);
+    let control = crate::control::SyncControl::new_with_publications(
+        account.clone(),
+        boundary,
+        priority,
+        bandwidth,
+        Arc::clone(&coverage),
+    );
+    let (tx, rx) = mpsc::channel(16);
+    let writer = tokio::spawn(ack_writer(
+        account.clone(),
+        store,
+        control,
+        Arc::clone(&coverage),
+        rx,
+    ));
+    coverage.note_undelivered(&scope, 1);
+    let handle = WriterHandle::new(tx);
+    let request = coverage.backfill_discard_for_walk(&scope, coverage.scope_fence(&scope));
+    let discard = async {
+        handle
+            .enqueue_discard(request)
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+    };
+    let loss = async {
+        gate.entered.acquire().await.unwrap().forget();
+        // Give pass two real debt, forcing its final ledger write to yield.
+        register(
+            &coverage,
+            &lane_page(&scope, "page:10:20", 1),
+            degraded_claim("during-delete"),
+        );
+        gate.gate_ledger
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        gate.release.add_permits(1);
+        gate.entered.acquire().await.unwrap().forget();
+        let token = register(
+            &coverage,
+            &lane_page(&scope, "page:20:30", 1),
+            degraded_claim("during-ledger"),
+        );
+        coverage.note_undelivered_publication(&token);
+        gate.release.add_permits(1);
+    };
+    let (result, ()) = tokio::join!(discard, loss);
+    result.unwrap();
+    assert!(
+        coverage.take_backfill_discard(&scope),
+        "the new loss still needs replay"
+    );
+    drop(handle);
+    writer.await.unwrap();
 }

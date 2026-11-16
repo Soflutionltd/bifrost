@@ -226,6 +226,7 @@ fn finish_translation(
         attempt: explicit_attempt,
         diagnostic_text,
         native_code,
+        unsupported_reason,
     } = translation;
     let is_transport = matches!(primary_cause.kind(), AccountErrorKind::Transport(_));
 
@@ -236,6 +237,9 @@ fn finish_translation(
         .context(ctx.identity())
         .operation(ctx.operation);
 
+    if let Some(reason) = unsupported_reason {
+        builder = builder.unsupported_reason(reason);
+    }
     if let Some(scope) = diagnostic_scope {
         builder = builder.scope(scope);
     }
@@ -330,6 +334,17 @@ pub(crate) fn sieve_account_error(
         Se::Sasl(error) => Error::from(error),
     };
     into_account_error(common, ctx)
+}
+
+pub(crate) fn unsupported_with_reason(
+    operation: AccountOperation,
+    reason: bifrost_types::UnsupportedReason,
+) -> AccountError {
+    unsupported(operation)
+        .into_builder()
+        .unsupported_reason(reason)
+        .try_build()
+        .expect("valid reason on unsupported refusal")
 }
 
 /// Build an `AccountError` for a locally detected `Unsupported` PIM
@@ -502,6 +517,7 @@ struct Translation {
     attempt: Option<TransmissionState>,
     diagnostic_text: Option<DiagnosticText>,
     native_code: Option<String>,
+    unsupported_reason: Option<bifrost_types::UnsupportedReason>,
 }
 
 impl Translation {
@@ -512,6 +528,7 @@ impl Translation {
             attempt: None,
             diagnostic_text: None,
             native_code: None,
+            unsupported_reason: None,
         }
     }
 }
@@ -697,6 +714,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             let mut t = Translation::new(PrimaryCause::Request(RequestCause::Unsupported {
                 operation,
             }));
+            t.unsupported_reason = Some(bifrost_types::UnsupportedReason::CapabilityUnavailable);
             t.diagnostic_text = Some(DiagnosticText::support_only(cap.clone()));
             t
         }

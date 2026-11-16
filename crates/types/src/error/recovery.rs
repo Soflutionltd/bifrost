@@ -543,37 +543,10 @@ pub(crate) fn derive(
             RecoveryClass::Cancelled
         }
         AccountErrorKind::Transport(_) => {
-            debug_assert!(
-                tx_state != TransmissionState::Acknowledged,
-                "transport failures cannot have acknowledged transmission state"
-            );
-            // Defensive fallback in release builds: a misbehaving
-            // producer pushing `Transport + Acknowledged` is treated as
-            // `InFlight` (the most conservative classification) rather
-            // than crashing the process. `try_build` rejects the same
-            // shape at construction so this branch is only reached when
-            // a builder somehow bypasses validation.
-            //
-            // Accepted, with its cost stated so it is not re-filed as a
-            // smell: `Transport + Acknowledged` is rejected TWICE. The
-            // first rejection is `try_build`, which returns
-            // `TransportAcknowledged` before ever calling this function,
-            // and since `derive` runs only from inside `try_build` after
-            // that branch has already returned `Err`, the check here is
-            // dead in normal flow - reachable only by calling the
-            // `pub(crate) derive` directly, which the tests do. It is kept
-            // as belt-and-suspenders on a classification that must never
-            // silently say "acknowledged" about a transport failure.
-            //
-            // Be aware of what the belt actually does, because it is a real
-            // behaviour split rather than a pure assertion: in debug builds
-            // the `debug_assert!` PANICS, while in release the same input
-            // is silently demoted to `InFlight`. A future producer that
-            // manages to mint this shape therefore fails loudly in tests
-            // and quietly in production. That asymmetry is deliberate -
-            // crashing a consumer's process over a producer bug is worse
-            // than conservative misclassification - but anything changing
-            // this branch should change both halves together.
+            // try_build rejects acknowledged transport evidence in the
+            // classification prefix. Direct internal callers still fail safe:
+            // an enterprise user expects uncertain writes reconciled rather
+            // than a process panic, regardless of the build profile.
             let effective_tx_state = if tx_state == TransmissionState::Acknowledged {
                 TransmissionState::InFlight
             } else {
@@ -1217,42 +1190,25 @@ mod tests {
         );
     }
 
-    /// `Transport + Acknowledged` is a producer-bug shape. In debug
-    /// builds, `derive` panics via `debug_assert!`. In release builds,
-    /// it falls back to treating the attempt as `InFlight` (the most
-    /// conservative defensible classify) so the process degrades rather
-    /// than crashes. The same shape is rejected at construction time by
-    /// `AccountErrorBuilder::try_build`.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "transport failures cannot have acknowledged transmission state")]
-    fn acknowledged_transport_failure_panics_in_debug() {
-        let _ = derive(
-            &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
-            None,
-            Some(AccountOperation::UpdateFlags),
-            &transport_chain(TransmissionState::Acknowledged),
-            None,
-            None,
-            None,
-        );
-    }
-
-    #[test]
-    #[cfg(not(debug_assertions))]
-    fn acknowledged_transport_failure_falls_back_to_inflight_in_release() {
-        let recovery = derive(
-            &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
-            None,
-            Some(AccountOperation::Send),
-            &transport_chain(TransmissionState::Acknowledged),
-            None,
-            None,
-            None,
-        );
-
-        // Non-idempotent + InFlight defensive fallback -> Reconcile.
-        assert!(recovery.requires_reconciliation());
+    fn acknowledged_transport_failure_falls_back_to_inflight() {
+        for operation in [AccountOperation::Send, AccountOperation::UpdateFlags] {
+            let derive_for = |state| {
+                derive(
+                    &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
+                    None,
+                    Some(operation),
+                    &transport_chain(state),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            assert_eq!(
+                derive_for(TransmissionState::Acknowledged),
+                derive_for(TransmissionState::InFlight),
+            );
+        }
     }
 
     #[test]

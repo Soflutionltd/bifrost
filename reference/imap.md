@@ -16,8 +16,11 @@ One tokio task owns the socket, parser state, and a watch channel exposing conne
 the command loop, in that same driver task. Readiness publishes the first state
 snapshot before returning the handle. A guard aborts the task if the readiness
 wait is cancelled; setup failures join teardown before returning. Retained pool
-leases therefore cover bootstrap too. One absolute setup deadline and one
-cumulative peer allowance cover all bootstrap exchanges. Absolute expiry uses
+leases therefore cover bootstrap too. Greeting and initial CAPABILITY each receive a fresh setup timeout and
+cumulative peer allowance. The atomic STARTTLS command, TLS handshake and
+post-upgrade CAPABILITY receive a combined three-timeout budget and peer
+allowance. This preserves time for a slow but progressing server while
+bounding every path, including bandwidth admission. Absolute expiry uses
 socket progress to distinguish Unsent from InFlight. Greeting ALERTs use the
 driver event sink, and the STARTTLS stream swap alone publishes encryption.
 An enterprise user expects interrupted account setup to release its connection
@@ -101,6 +104,35 @@ Search concatenates selectable folders in display-name order with canonical
 wire octets and mode breaking ties, keeping folder order deterministic across
 registry rebuilds. Search resumes by folder and UID position, not by offset;
 this ordering does not promise a stable snapshot when mail or folders change.
+Search cursors use an `imapsearch3:` envelope binding the structured filter,
+provider query and result surface (threads versus messages) to that position.
+Page size can change during a walk. The private structural binding is versioned
+with the envelope; representation changes require refusal or a new version.
+Older `imapsearch1:` and `imapsearch2:` cursors are refused with the shared `page_cursor`
+invalid-argument signal so callers restart the walk. An enterprise user changing
+a query expects fresh results rather than a continuation through another query.
+
+Both search surfaces also include retained mail discovery gaps on every page,
+including continuations: failed NAMESPACE, failed shared-prefix LIST, and shares
+excluded by a reported ACL without lookup and read rights. Folder restrictions
+filter known folder and namespace gaps; unknown account-wide discovery gaps
+remain visible. DAV collection gaps do not affect mail search. Repeated reports
+for the same scope, including a later per-folder refusal, appear once. Any gap
+suppresses `estimated_total`: an enterprise user must see incomplete search
+coverage rather than an apparently complete answer.
+
+Both search surfaces quarantine per-folder permission denial, scope revocation
+and mailbox disappearance in `Page::skipped_scopes`, retaining the classified
+error and folder cursor scope. Runtime folder skips travel forward in the bound cursor, deduplicated by
+scope with discovery skips on every later page, including the final page.
+The cursor retains folder identity and the error classification; provider
+support diagnostics remain on the page that observed the failure. An enterprise
+user reading only the final page must still see incomplete coverage.
+Healthy folders continue; a skipped folder is
+not evidence of zero matches, and an incomplete walk has no estimated total.
+Connection checkout (including authentication), transport, query,
+unsupported-command, protocol and cursor epoch failures still fail the call. An enterprise user expects a revoked share not to
+hide healthy mail, while a disconnected or invalid search must visibly fail.
 Canonical validated names retain their existing string ids; literal names
 beginning with the reserved prefix and control-bearing names are escaped too. Scope routing, grouping, command-response correlation, push admission
 and error/throttle keys use this same identity. LIST-STATUS pairs duplicate
@@ -1175,6 +1207,13 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   been stored, so appending again may duplicate it). The Sent-leg detail is a
   `Warning`, not an `AccountError`: an error stamped `Send` on a success value
   would advise re-sending.
+- `draft_send` and `draft_discard` require the handle's folder to have the
+  Drafts role, using the registry's existing SPECIAL-USE/name classification
+  (including shared folders) or resolved Drafts folder. Other handles receive
+  `Request(Malformed)` before body fetch, submission or deletion. The Draft flag
+  alone outside a recognized Drafts folder is not sufficient. An enterprise
+  Outlook user expects draft actions to address Drafts, never to send and delete
+  an ordinary message accidentally passed as a draft handle.
 - `draft_send` is "fetch + send + discard": a one-shot raw `BODY[]` fetch
   (bounded by `DRAFT_FETCH_BUDGET` 64 MiB, through `FetchLimit`) recovers the
   verbatim octets, the headers build the envelope, `Bcc:` is folded into RCPT but
@@ -1222,7 +1261,7 @@ CardDAV contact backend too; lookup is enabled only when CardDAV admitted a
 directory gateway, and CardDAV does not support empty-query enumeration.
 CalDAV contributes no directory capabilities. Without the config, the matching flags stay false and primitives return `Unsupported`.
 
-Composition is first-class for sync, not just primitives (subs are full `Arc<dyn Account>`s): `build_capabilities` delegates contact/directory and calendar capability projection to `bifrost_types::account_compose::merge_capabilities`; `route_scope` maps a `CursorScope` to `ScopeHandler::{Folder, Delegate}` and the four sync entry points forward to the sub on `Delegate`; discovery fans sub scopes in (sub errors fold to `Warning`). Routing, capability projection and fan-in use the reusable `bifrost_types::account_compose` helpers. `open_carddav`/`open_caldav` are fail-soft (`DavAttach::Degraded`, classified via `RecoveryClass`): a DAV open failure degrades to IMAP-only for the cycle and the next reopen retries, so a DAV outage never takes mail offline. The two run JOINED, not in sequence - each is an independent multi-round-trip discovery against its own endpoint with its own client, so awaiting them in turn made every IMAP open pay both latencies. They may complete in either order; attach decisions are applied in a fixed order. A failed DAV open contributes one classified `SkippedScope` to `OpenedAccount::skipped_scopes` (`ContactCollection` / `CalendarCollection`); discovery does not duplicate it as a prose warning. Successful DAV opens cover every discovered collection and forward any factory-reported skips. Ownership collisions likewise contribute classified skips rather than prose warnings. Each names the LOSING sub-account's collection scope (`ContactCollection` / `CalendarCollection`), never `Cursor(Folder(_))`: when a collection href equals an IMAP mailbox name, that folder scope is the mailbox's own, which does sync, and a consumer would read the mailbox as skipped. A href claimed by both sub-accounts reports once per losing sub-account. The collection URL rides in support-only detail, and the gap classifies as a configuration conflict (`Request(Malformed)`, as Graph classifies an unconfigured shared mailbox), not `Internal`, so the user is pointed at configuration rather than asked to report a bug. A failed NAMESPACE, or a failed LIST under one shared-namespace prefix, contributes a `SkippedScope` under `ErrorScope::Account`. Here that scope names the account's shared surface (or the one prefix), NOT the whole account: the personal namespace and every other prefix keep syncing, and mail stays online. bifrost-types has no namespace scope, and no in-workspace reader treats an Account-scoped skip as "the whole account skipped" (bifrost-sync only logs it and exposes it through `open_skipped_scopes`). Consumers must read it the same way. The account retains open-time skips on every `containers_list` snapshot: an enterprise user must see incomplete enumeration rather than infer that missing shares or collections were deleted.
+Composition is first-class for sync, not just primitives (subs are full `Arc<dyn Account>`s): `build_capabilities` delegates contact/directory and calendar capability projection to `bifrost_types::account_compose::merge_capabilities`; `route_scope` maps a `CursorScope` to `ScopeHandler::{Folder, Delegate}` and the four sync entry points forward to the sub on `Delegate`; discovery fans sub scopes in (sub errors fold to `Warning`). Routing, capability projection and fan-in use the reusable `bifrost_types::account_compose` helpers. `open_carddav`/`open_caldav` are fail-soft (`DavAttach::Degraded`, classified via `RecoveryClass`): a DAV open failure degrades to IMAP-only for the cycle and the next reopen retries, so a DAV outage never takes mail offline. The two run JOINED, not in sequence - each is an independent multi-round-trip discovery against its own endpoint with its own client, so awaiting them in turn made every IMAP open pay both latencies. They may complete in either order; attach decisions are applied in a fixed order. A failed DAV open contributes one classified `SkippedScope` to `OpenedAccount::skipped_scopes` (`ContactCollection` / `CalendarCollection`); discovery does not duplicate it as a prose warning. Successful DAV opens cover every discovered collection and forward any factory-reported skips. Ownership collisions likewise contribute classified skips rather than prose warnings. Each names the LOSING sub-account's collection scope (`ContactCollection` / `CalendarCollection`), never `Cursor(Folder(_))`: when a collection href equals an IMAP mailbox name, that folder scope is the mailbox's own, which does sync, and a consumer would read the mailbox as skipped. A href claimed by both sub-accounts reports once per losing sub-account. The collection URL rides in support-only detail, and the gap classifies as a configuration conflict (`Request(Malformed)`, as Graph classifies an unconfigured shared mailbox), not `Internal`, so the user is pointed at configuration rather than asked to report a bug. A failed NAMESPACE contributes a `SkippedScope` under `ErrorScope::Account`, naming the unknown shared surface rather than the whole account. A failed LIST under one shared-namespace prefix uses `ErrorScope::Namespace { prefix }`. The personal namespace and every other prefix keep syncing, and mail stays online. The account retains open-time skips on every `containers_list` snapshot: an enterprise user must see incomplete enumeration rather than infer that missing shares or collections were deleted.
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread`/`delete_thread` override the trait defaults via the cloneable account handle (add-then-remove); delete moves to the Trash role unless already in Trash, where it expunges from that mailbox.
 
@@ -1401,13 +1440,13 @@ count, and trailing reads after the last emitted batch have no batch field;
 these figures are batch observations, not complete command or TCP/TLS totals.
 
 An IDLE read pre-spends a slot before waiting on the peer; it holds no budget
-lock or exclusive turn. Bootstrap (greeting, initial CAPABILITY, STARTTLS, the
-TLS handshake and post-upgrade CAPABILITY) runs under one absolute setup
-deadline spanning every phase, not one per phase. It also has one cumulative
-peer-wait allowance: admitted I/O spends it, admission does not, and individual
-reads cannot reset it. The allowance is shared across stream upgrades and
-charges cancelled pending I/O as well. Re-entering a setup phase cannot reset
-either bound.
+lock or exclusive turn. Bootstrap gives greeting and initial CAPABILITY separate absolute deadlines
+and cumulative peer-wait allowances. STARTTLS, its TLS handshake and its
+mandatory CAPABILITY refresh share a combined three-phase budget. Admitted
+I/O spends the peer allowance, admission does not, and individual reads cannot
+reset it. The upgrade allowance survives the stream swap and charges cancelled
+pending I/O. Enterprise users expect each setup phase to have time to complete
+without allowing a stalled server to hold a connection indefinitely.
 ManageSieve places a cumulative peer-read allowance below `MeteredStream`,
 covering one whole line or literal while excluding admission waits. Explicit
 command deadlines still bound the whole operation, including admission.
@@ -1491,7 +1530,11 @@ uses account scope; a failed per-prefix LIST uses `ErrorScope::Namespace` with
 that prefix rather than inventing a mailbox identity. A failed NAMESPACE keeps the rediscovery capability
 flag true: an enterprise user expects a later reattach to recover missing shares,
 and a failed probe is not evidence of a personal-only server. MYRIGHTS remains
-advisory because SELECT is authoritative.
+advisory because SELECT is authoritative. A successful MYRIGHTS response lacking
+lookup or read records a classified folder skip in the open result and retained
+container/search snapshots, so sync consumers also receive the omission through
+the existing open skip lane. The container retains its shared identity and rights;
+it is excluded from cursor discovery. Discovery does not issue SELECT itself.
 
 `factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `PrincipalId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Owner(owner)` per shared entry - explicitly, because `CursorScope::covers` never equates an owner with a folder.
 
@@ -1665,7 +1708,7 @@ latch remains. Connection sessions ignore the maintenance gate.
 
 Push always dials fresh and never adopts or parks a data member. A previously selected data connection may carry unsolicited mailbox-less FETCH, VANISHED or EXISTS events; adopting it would absorb those into the wrong folder's cache. To make room, fresh acquisition retires a parked member or waits for a checked-out member to return. That wait may be as long as a data stream; polling continues meanwhile. Capacity and worker topology are fixed at open from the admission profile, even if a later dial advertises different capabilities.
 
-Acquisition has two phases. During the capacity wait, subscription changes re-choose the assignment while preserving the same pending reservation, or drop it if no folder remains. During dial and authentication, only shutdown and cancellation interrupt; a subscription change never wastes a dial, and the assignment is re-chosen before SELECT. A session that waited for either a push slot or shared capacity publishes a per-folder invalidation after SELECT and NOTIFY handling for its selected folder and, if registration succeeded, every other watched folder. Immediate acquisition emits no coverage invalidation. The invalidation compensates for the latency window the wait stretched (polling already covers it; bifrost-sync never suppresses polling on push coverage); same-session re-IDLE does not emit it. A wait, and so this invalidation, is routine in two accepted places: a reassignment redial usually waits for its own previous session's LOGOUT tail and publishes right after the account-wide `Unknown` of the interrupt (redundant, harmless), and a first push session opened while discovery and inventory hold every data session publishes right after subscribe.
+Acquisition has two phases. During the capacity wait, subscription changes re-choose the assignment while preserving the same pending reservation, or drop it if no folder remains. During dial and authentication, only shutdown and cancellation interrupt; a subscription change never wastes a dial, and the assignment is re-chosen before SELECT. A session that waited for either a push slot or shared capacity publishes a per-folder invalidation after SELECT and NOTIFY handling for its selected folder and, if registration succeeded, every other watched folder. Immediate acquisition emits no coverage invalidation. The invalidation compensates for the latency window the wait stretched (polling already covers it; bifrost-sync never suppresses polling on push coverage); same-session re-IDLE instead invalidates newly covered non-selected folders after NOTIFY SET acknowledges them. This closes the pre-registration window: an enterprise user expects changes made while adding a watched folder to appear too. A refused registration retains the coarse coverage-loss invalidation; a later successful registration invalidates all newly restored non-selected coverage. A wait, and so this invalidation, is routine in two accepted places: a reassignment redial usually waits for its own previous session's LOGOUT tail and publishes right after the account-wide `Unknown` of the interrupt (redundant, harmless), and a first push session opened while discovery and inventory hold every data session publishes right after subscribe.
 
 Admission is per scope, under the same lock as the insert, so two concurrent subscribes cannot both take the last slot. A folder already pushed costs no new session and is always admitted; without NOTIFY, a new distinct folder is admitted in request order while `covered.len() < push_capacity`; nothing is admitted at zero push capacity. Admission accepts exactly what worker assignment can watch: a folder scope whose name fails `MailboxName::new` (NUL/CR/LF) is refused into the failed lane, because `subscribed_idle_folders` drops such names and admitting one would report it as pushed while burning a slot on a mailbox no worker can SELECT. Every admitted folder always has a worker, because without NOTIFY admission caps the admitted set at the push capacity, which is also the worker count - but the folder-to-slot *index* is recomputed lexically from the whole subscribed set on every wake, so a folder's slot number is not stable across subscription changes even though its coverage is. When push capacity is exhausted, `push_subscribe` puts excess scopes in `PushSubscription::outcomes().failed()` as `Unsupported(PushSubscribe)` carrying budget-specific diagnostic text; a subscribe that accepts nothing returns no handle. bifrost-sync records only the succeeded scopes and keeps the rest in the polling lane - it never suppresses polling on push coverage, which is what keeps a refused folder visible. Unsubscribe frees a folder slot once its last handle leaves.
 
@@ -1675,7 +1718,7 @@ waits keep one reservation across assignment changes; dial/auth is interrupted
 only by stop or shutdown. A session that waited for capacity invalidates each
 covered folder before establishment; an immediate acquisition does not.
 
-Every connection minted by the pool is registered with a weak connection handle and a shared driver-task owner, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, closes the session semaphore, clears member waiters, drains the parked list and registry, concurrently requests LOGOUT on every live connection under one `command_timeout`, then joins each driver. Drivers whose connection handles already disappeared are already running the driver's bounded best-effort LOGOUT; close waits for it up to `LOGOUT_DRAIN_TIMEOUT` and aborts and joins on expiry.
+Every connection minted by the pool is registered with a weak connection handle and a shared driver-task owner, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, cancels its local capacity waiters, clears member waiters, drains the parked list and registry, concurrently requests LOGOUT on every live connection under one `command_timeout`, then joins each driver. Drivers whose connection handles already disappeared are already running the driver's bounded best-effort LOGOUT; close waits for it up to `LOGOUT_DRAIN_TIMEOUT` and aborts and joins on expiry.
 
 Account close uses the shutdown token as its single admission state; the shared
 completion records teardown outcome and the send gate drains admitted work.
@@ -1709,7 +1752,7 @@ exit lifetime.
 Connect and authentication retain their configured timeouts; OAuth token
 lookup is also bounded by the authentication command timeout.
 
-The `registry` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. Both acquisition paths re-check the flag after receiving capacity. Close closes the session semaphore and clears the member waiter queue under the idle lock; registration of a waiter checks the same flag under that lock. Blocked acquisitions receive `TransportFailure::Closed`.
+The `registry` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. Both acquisition paths re-check the flag after receiving capacity. Close cancels local capacity waits and clears the member waiter queue under the idle lock; registration of a waiter checks the same flag under that lock. Blocked acquisitions receive `TransportFailure::Closed`.
 
 The return side takes the matching linearization under the idle lock. Returning a reusable member checks `closed` while holding that lock, before either handing to the oldest waiter or parking. A return either lands before the drain and is drained, or observes the flag and parks nothing. Cancellation removes a waiter synchronously and returns an already handed member through the same FIFO path, so dropping an acquisition cannot strand capacity.
 
@@ -1856,6 +1899,11 @@ crates/imap/src/
 
 ## Unsupported error construction
 
+Local missing-capability refusals carry `UnsupportedReason::CapabilityUnavailable`.
+Draft creation without a Drafts mailbox and trash moves without a Trash mailbox
+carry `MissingMailboxRole`. Delegate send-as refusals carry `SendAsUnavailable`.
+These reasons preserve the existing Unsupported operation and recovery.
+
 Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Imap`, including for inherited
@@ -1915,6 +1963,12 @@ write, an unsatisfiable target can spend its remaining attempt budget on
 writes that cannot stick. This bounded futility is accepted.
 
 ## Partial commitment of PIM operations
+
+PIM folder-effect partial-commit message scopes preserve the exact submitted
+source id, including legacy `imap1` and non-canonical `imap2` spellings, for
+committed effects, failed legs and marked-deleted cleanup. An enterprise client
+expects to correlate partial results with the handles it submitted. Synthesized
+thread members and new destination identities retain canonical encodings.
 
 `copy_messages`, `delete_messages` and `set_flag` call the same folder mutation
 engine as bulk operations, through `mutate::result_folder_mutation`. There is no
@@ -2422,7 +2476,12 @@ worklist, so teardown also avoids one call frame per reply.
 ESEARCH supplies its own `EsearchNumbers::Uids` or `Seqs`, with
 typed nonzero MIN/MAX identities and wire ALL ranges in that addressing. A
 SEARCH consumer refuses a selected ESEARCH whose addressing disagrees with its
-command. Enterprise users must never act on sequence numbers mistaken for UIDs.
+command. This includes UID SEARCH replies without the UID marker: omission
+means sequence addressing on the wire, and tag correlation alone cannot prove
+that a lenient server intended UIDs. Such replies remain protocol errors.
+Enterprise users must never open or mutate a different message because sequence
+numbers were mistaken for UIDs. The decoder preserves the observed addressing;
+it does not infer or repair it from the command.
 Raw FETCH/EXPUNGE observations and contextual MODIFIED ranges remain wire values;
 FETCH assembly starts with an unaddressed default before its outer parser
 supplies the sequence number, so a nonzero wrapper would require a separate
@@ -2488,3 +2547,40 @@ OAuth sources retain their shared identity and live rotation behavior.
 type. `None` denotes plaintext. The net-owned `TlsService` port table preserves
 IMAP's 993/143 and ManageSieve's 4190 for every mode; submission uses 465/587.
 Explicit ports and authentication policy remain protocol-specific.
+
+Factory opens share the Net bandwidth registry's separate physical-session
+budget by account id, including primed connects and driver tails from failed or
+cancelled opens. Pool close cancels local waiters without closing the shared
+semaphore. The shared registry serializes admission per account and reserves the
+replacement's primed-session permit before retiring anything. A spare permit is
+taken directly. At the cap, admission checks every live pool sharing the budget
+in registration order, claiming one parked or returned member before retiring
+it under bounded LOGOUT and handing its capacity to the queued open. It never
+retires a checked-out or dedicated push session. Losing member waiters return
+concurrent handoffs through the normal pool return path. Only one member is
+retired per open, even when several pools have idle capacity. Pools stay open
+so they can redial if replacement fails. If no capacity becomes available within
+one `command_timeout`, admission returns an Unsent transport timeout without
+closing any pool. Enterprise users expect reconnect to respect the provider
+limit while ongoing work and push remain available.
+
+Session replacement coordination lives beside the account session semaphore in
+Net's bandwidth registry. An admission mutex serializes capacity decisions and
+permit handoff decisions. After claiming a member, admission keeps its queued
+semaphore acquisition and releases coordination before bounded LOGOUT. A spare
+permit likewise releases coordination immediately. No network I/O runs under
+that mutex: connect, server-ID probing, IMAP discovery and DAV discovery all
+run unlocked.
+A separate short pool-list mutex protects ordered weak references to every
+pool, including overlapping incarnations, rather than only the latest pool.
+Registration takes only that pool-list mutex and wakes pending admission so a
+pool completed during a capacity wait becomes a reclaim candidate. Rebuilding
+candidates preserves registration order and returns losing handoffs normally.
+An enterprise user expects slow discovery not to time out another open that
+has available connection capacity. Dead registrations are pruned on the next open. Reclaim
+waiters retain pool internals, not the registered pool owner, so dropping a pool
+while reclamation waits cannot keep its registration alive; an already returned
+member can still finish the in-flight handoff safely. Cancellation removes
+waiters and returns any handed-off member. Waiting for the coordination lock
+and capacity each has a command-timeout bound. Driver tails retain their
+permits until exit, including cancelled reclamation and failed replacement.

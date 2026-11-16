@@ -1,17 +1,4 @@
-//! Read-only hydration and PIM passthrough onto the live account handle.
-//!
-//! On the ~900 lines of near-identical forwarders below, observed and
-//! deliberately left alone: every one of the roughly 60 methods here is a 1:1
-//! passthrough - `live_account(id)?` then forward - carrying an identical doc
-//! comment shape and inventing no semantics of its own. A macro or a blanket
-//! forwarding trait would collapse them. It was not done because this is a
-//! PUBLISHED-SURFACE question rather than a structural one: these methods are
-//! `SyncEngine`'s public API, and generating them changes how they read in
-//! rustdoc, how their docs are written, and how easily a single method can
-//! deviate later when one of them eventually does need to invent semantics.
-//! The verbosity is the cost of keeping each published signature explicit and
-//! independently documentable. Re-raise it as an API decision with the
-//! repository owner, not as a refactor.
+//! Direct hydration and PIM calls with incarnation-attributed scope recovery.
 
 use super::*;
 use bifrost_types::AccountConveniences;
@@ -35,7 +22,7 @@ impl SyncEngine {
     //
     // Two deliberate properties:
     //
-    // - Every method resolves the handle through `live_account`, i.e.
+    // - Every method resolves the handle through the current incarnation, i.e.
     //   `ArcSwap::load_full`, so a hydrate issued after a reopen runs
     //   against the freshly-installed connection, never a stale snapshot
     //   the consumer cached. This is the same discipline the spawned
@@ -49,6 +36,68 @@ impl SyncEngine {
     // The forwarded methods return `'static` streams / futures that
     // capture their own internal `Arc` clones, so they outlive the
     // short-lived handle resolved per call.
+
+    // Opening a stale folder must schedule its repair immediately, just as
+    // background sync does: enterprise users expect opening mail to refresh
+    // the folder too. Preserve the original error and never replay the call.
+    async fn direct_call<T>(
+        &self,
+        account_id: &AccountId,
+        call: impl FnOnce(Arc<crate::types::Incarnation>) -> AccountFuture<Result<T, AccountError>>,
+    ) -> Result<T, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let incarnation = slot.current.load_full();
+        let generation = incarnation.generation();
+        let result = call(incarnation).await;
+        if let Some(error) = result.as_ref().err().cloned() {
+            dispatch_direct_error(&slot.reopen_tx, &slot.shutdown, generation, &error);
+        }
+        result.map_err(Error::Account)
+    }
+
+    fn direct_stream<T: Send + 'static>(
+        &self,
+        account_id: &AccountId,
+        call: impl FnOnce(Arc<crate::types::Incarnation>) -> AccountStream<SyncEvent<T>>,
+        item_error: fn(&T) -> Option<&AccountError>,
+    ) -> Result<AccountStream<SyncEvent<T>>, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let incarnation = slot.current.load_full();
+        let generation = incarnation.generation();
+        let stream = call(incarnation);
+        // A retained consumer stream must not retain attachment resources after
+        // detach. Upgrade only while dispatching synchronous best-effort advice.
+        let slot = Arc::downgrade(&slot);
+        Ok(Box::pin(stream.map(move |event| {
+            if let Some(slot) = slot.upgrade() {
+                match &event {
+                    SyncEvent::Terminated(error) => {
+                        dispatch_direct_error(&slot.reopen_tx, &slot.shutdown, generation, error);
+                    }
+                    SyncEvent::Batch(batch) => {
+                        for error in batch.items.iter().filter_map(item_error) {
+                            dispatch_direct_error(
+                                &slot.reopen_tx,
+                                &slot.shutdown,
+                                generation,
+                                error,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            event
+        })))
+    }
 
     /// Announce that a forwarded page came back with a non-empty loss
     /// lane, on the account's normal warning channel.
@@ -104,23 +153,6 @@ impl SyncEngine {
         slot.delivery.publish_warning(EventScope::Account, warning);
     }
 
-    /// Resolve the live `Account` handle for an attached account.
-    ///
-    /// Loads through the slot's `ArcSwap` so the caller sees the handle
-    /// installed by the most recent reopen. Errors with
-    /// `AccountNotAttached` when no slot exists for `account_id`.
-    fn live_account(
-        &self,
-        account_id: &AccountId,
-    ) -> Result<Arc<crate::types::Incarnation>, Error> {
-        let slot = self
-            .accounts
-            .get(account_id)
-            .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        Ok(slot.current.load_full())
-    }
-
     /// Hydrate a stream of known ids at a chosen projection.
     ///
     /// Forwards to [`Account::get_stream`]. The input ids are streamed
@@ -134,7 +166,15 @@ impl SyncEngine {
         ids: AccountStream<bifrost_types::ObjectId>,
         projection: bifrost_types::Projection,
     ) -> Result<AccountStream<SyncEvent<ItemOutcome<bifrost_types::HydratedObject>>>, Error> {
-        Ok(self.live_account(account_id)?.get_stream(ids, projection))
+        self.direct_stream(
+            account_id,
+            |account| account.get_stream(ids, projection),
+            |item| match item {
+                ItemOutcome::Failed(failure) => Some(&failure.error),
+                ItemOutcome::Uncertain(failure) => Some(&failure.error),
+                ItemOutcome::Succeeded(_) => None,
+            },
+        )
     }
 
     /// Hydrate a single message at a specific projection level.
@@ -150,10 +190,10 @@ impl SyncEngine {
         message: bifrost_types::ObjectId,
         projection: bifrost_types::HydrationProjection,
     ) -> Result<bifrost_types::Message, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .message_hydrate(message, projection)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.message_hydrate(message, projection)
+        })
+        .await
     }
 
     /// Hydrate every message in a thread.
@@ -166,10 +206,8 @@ impl SyncEngine {
         account_id: &AccountId,
         thread: bifrost_types::ThreadId,
     ) -> Result<bifrost_types::ThreadHydration, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .thread_hydrate(thread)
-            .await?)
+        self.direct_call(account_id, |account| account.thread_hydrate(thread))
+            .await
     }
 
     /// Open a message's assembled RFC822 octets for streaming download.
@@ -183,7 +221,11 @@ impl SyncEngine {
         account_id: &AccountId,
         message: bifrost_types::ObjectId,
     ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
-        Ok(self.live_account(account_id)?.open_raw_rfc822(message))
+        self.direct_stream(
+            account_id,
+            |account| account.open_raw_rfc822(message),
+            |_| None,
+        )
     }
 
     /// Open a blob for streaming download.
@@ -195,7 +237,7 @@ impl SyncEngine {
         account_id: &AccountId,
         handle: bifrost_types::BlobHandle,
     ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
-        Ok(self.live_account(account_id)?.open_blob(handle))
+        self.direct_stream(account_id, |account| account.open_blob(handle), |_| None)
     }
 
     /// Open a byte range of a blob for streaming download.
@@ -209,9 +251,11 @@ impl SyncEngine {
         handle: bifrost_types::BlobHandle,
         range: bifrost_types::ByteRange,
     ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .open_blob_range(handle, range))
+        self.direct_stream(
+            account_id,
+            |account| account.open_blob_range(handle, range),
+            |_| None,
+        )
     }
 
     /// Host an over-limit attachment in the account's cloud drive and
@@ -220,7 +264,7 @@ impl SyncEngine {
     /// Forwards to [`Account::host_attachment`]. Gated by
     /// `capabilities().pim_methods.host_attachment`; an account whose
     /// flag is false resolves the future with
-    /// `Unsupported(HostAttachment)`. The synchronous `live_account`
+    /// `Unsupported(HostAttachment)`. The synchronous incarnation
     /// resolution surfaces `AccountNotAttached` here, while the returned
     /// `AccountFuture` surfaces the trait's `AccountError` when awaited.
     pub fn host_attachment(
@@ -229,7 +273,24 @@ impl SyncEngine {
         bytes: bytes::Bytes,
         meta: bifrost_types::CloudUploadMeta,
     ) -> Result<AccountFuture<Result<bifrost_types::HostedAttachment, AccountError>>, Error> {
-        Ok(self.live_account(account_id)?.host_attachment(bytes, meta))
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let incarnation = slot.current.load_full();
+        let generation = incarnation.generation();
+        let future = incarnation.host_attachment(bytes, meta);
+        // A retained consumer future must not retain attachment resources
+        // after detach, exactly as `direct_stream` does not.
+        let slot = Arc::downgrade(&slot);
+        Ok(Box::pin(async move {
+            let result = future.await;
+            if let (Some(error), Some(slot)) = (result.as_ref().err(), slot.upgrade()) {
+                dispatch_direct_error(&slot.reopen_tx, &slot.shutdown, generation, error);
+            }
+            result
+        }))
     }
 
     // ---------- mutation passthrough (direct) ----------
@@ -239,13 +300,14 @@ impl SyncEngine {
     // container CRUD a consumer needs to drive object-level mutations
     // against the live attached connection without holding the
     // engine-private `Arc<dyn Account>`. Like the read cluster, every
-    // method resolves through `live_account` (so a mutation issued after
+    // method resolves through the current incarnation (so a mutation issued after
     // a reopen runs against the freshly-installed connection, never a
     // stale snapshot the consumer cached) and forwards to the matching
-    // `Account` method 1:1, inventing no new semantics.
+    // `Account` method 1:1, dispatching scope restart advice without replay.
     //
     // These forward direct Account calls and deliberately bypass the
-    // idempotency / read-back / recovery pipeline. The forwarded error's
+    // idempotency and read-back pipeline. RestartScope advice is sent to the
+    // supervisor with the failing incarnation, while the error stays intact. The forwarded error's
     // recovery() describes the operation; leg_recovery() and partial_commit()
     // retain the failed leg and historical effects. That pipeline guards
     // the *volume* mutations (`bulk_set_flags`, `bulk_move`,
@@ -266,10 +328,8 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         starred: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_starred(target, starred)
-            .await?)
+        self.direct_call(account_id, |account| account.set_starred(target, starred))
+            .await
     }
 
     /// Set or clear `target`'s read state. Forwards to
@@ -280,10 +340,8 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         is_read: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_read(target, is_read)
-            .await?)
+        self.direct_call(account_id, |account| account.set_read(target, is_read))
+            .await
     }
 
     /// Apply `label` to `target`. Forwards to [`AccountConveniences::apply_label`],
@@ -294,10 +352,8 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         label: bifrost_types::Label,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .apply_label(target, label)
-            .await?)
+        self.direct_call(account_id, |account| account.apply_label(target, label))
+            .await
     }
 
     /// Remove `label` from `target`. Forwards to
@@ -308,10 +364,8 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         label: bifrost_types::Label,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .remove_label(target, label)
-            .await?)
+        self.direct_call(account_id, |account| account.remove_label(target, label))
+            .await
     }
 
     /// Mark `message` as replied. Forwards to [`AccountConveniences::mark_replied`].
@@ -320,7 +374,8 @@ impl SyncEngine {
         account_id: &AccountId,
         message: bifrost_types::ObjectId,
     ) -> Result<(), Error> {
-        Ok(self.live_account(account_id)?.mark_replied(message).await?)
+        self.direct_call(account_id, |account| account.mark_replied(message))
+            .await
     }
 
     /// Mark `message` as forwarded. Forwards to
@@ -330,10 +385,8 @@ impl SyncEngine {
         account_id: &AccountId,
         message: bifrost_types::ObjectId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .mark_forwarded(message)
-            .await?)
+        self.direct_call(account_id, |account| account.mark_forwarded(message))
+            .await
     }
 
     /// Persist that an MDN (read receipt) was dispatched for `message`.
@@ -343,10 +396,8 @@ impl SyncEngine {
         account_id: &AccountId,
         message: bifrost_types::ObjectId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .mark_mdn_sent(message)
-            .await?)
+        self.direct_call(account_id, |account| account.mark_mdn_sent(message))
+            .await
     }
 
     /// Move a thread between containers. Forwards to
@@ -359,10 +410,10 @@ impl SyncEngine {
         target: bifrost_types::ContainerId,
         source: Option<bifrost_types::ContainerId>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .move_thread(thread, target, source)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.move_thread(thread, target, source)
+        })
+        .await
     }
 
     /// Move a thread to Trash, or delete-permanently if already in Trash.
@@ -373,10 +424,8 @@ impl SyncEngine {
         thread: bifrost_types::ThreadId,
         current: Option<bifrost_types::ContainerId>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .delete_thread(thread, current)
-            .await?)
+        self.direct_call(account_id, |account| account.delete_thread(thread, current))
+            .await
     }
 
     /// Add `target` to `container`. Forwards to
@@ -387,10 +436,10 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         container: bifrost_types::ContainerId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .add_to_container(target, container)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.add_to_container(target, container)
+        })
+        .await
     }
 
     /// Remove `target` from `container`. Forwards to
@@ -402,10 +451,10 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         container: bifrost_types::ContainerId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .remove_from_container(target, container)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.remove_from_container(target, container)
+        })
+        .await
     }
 
     /// Set or clear `target`'s read state. The membership-primitive
@@ -416,10 +465,8 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         is_read: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_is_read(target, is_read)
-            .await?)
+        self.direct_call(account_id, |account| account.set_is_read(target, is_read))
+            .await
     }
 
     /// Set or clear a single IMAP / JMAP keyword on `target`. Forwards to
@@ -431,10 +478,10 @@ impl SyncEngine {
         keyword: bifrost_types::Flag,
         value: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_keyword(target, keyword, value)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.set_keyword(target, keyword, value)
+        })
+        .await
     }
 
     /// Set or clear membership in a Gmail-style label. Forwards to
@@ -446,10 +493,10 @@ impl SyncEngine {
         label: bifrost_types::ContainerId,
         value: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_label_membership(target, label, value)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.set_label_membership(target, label, value)
+        })
+        .await
     }
 
     /// Set or clear a Graph category on `target`. Forwards to
@@ -461,10 +508,10 @@ impl SyncEngine {
         category: String,
         value: bool,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_category(target, category, value)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.set_category(target, category, value)
+        })
+        .await
     }
 
     /// Set `target`'s importance to exactly `level`. Forwards to
@@ -475,17 +522,15 @@ impl SyncEngine {
         target: bifrost_types::MutationTarget,
         level: bifrost_types::Importance,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .set_importance(target, level)
-            .await?)
+        self.direct_call(account_id, |account| account.set_importance(target, level))
+            .await
     }
 
     /// Enumerate an account's containers (folders, labels, mailboxes).
     /// Forwards 1:1 to [`Account::containers_list`].
     ///
     /// The read companion to the container-mutation cluster below: like
-    /// every passthrough it resolves through `live_account` so a list
+    /// every passthrough it resolves through the current incarnation so a list
     /// issued after a `RestartAccount` reopen runs against the freshly
     /// installed connection, and yields `Error::AccountNotAttached` up
     /// front when no live slot exists. Read-only, so it does not pass
@@ -494,7 +539,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<bifrost_types::ContainerList, Error> {
-        Ok(self.live_account(account_id)?.containers_list().await?)
+        self.direct_call(account_id, |account| account.containers_list())
+            .await
     }
 
     /// Forwards to the account's provider category-definition surface.
@@ -502,10 +548,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Vec<bifrost_types::CategoryDefinition>, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .category_definitions_list()
-            .await?)
+        self.direct_call(account_id, |account| account.category_definitions_list())
+            .await
     }
 
     /// Forwards to the account's provider reaction-read surface.
@@ -517,10 +561,8 @@ impl SyncEngine {
         bifrost_types::BatchOutcome<bifrost_types::MessageReactionState, bifrost_types::ObjectId>,
         Error,
     > {
-        Ok(self
-            .live_account(account_id)?
-            .message_reactions(ids)
-            .await?)
+        self.direct_call(account_id, |account| account.message_reactions(ids))
+            .await
     }
 
     /// Create a new container of `kind` named `name` under `parent`.
@@ -535,10 +577,10 @@ impl SyncEngine {
         parent: Option<bifrost_types::ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> Result<bifrost_types::ContainerId, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .container_create(kind, name, parent, style)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.container_create(kind, name, parent, style)
+        })
+        .await
     }
 
     /// Rename a container. Forwards to [`Account::container_rename`].
@@ -551,10 +593,10 @@ impl SyncEngine {
         name: String,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .container_rename(container, name, style)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.container_rename(container, name, style)
+        })
+        .await
     }
 
     /// Move a container under a new parent. Forwards to
@@ -565,10 +607,10 @@ impl SyncEngine {
         container: bifrost_types::ContainerId,
         new_parent: Option<bifrost_types::ContainerId>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .container_move(container, new_parent)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.container_move(container, new_parent)
+        })
+        .await
     }
 
     /// Delete a container. Forwards to [`Account::container_delete`].
@@ -577,17 +619,15 @@ impl SyncEngine {
         account_id: &AccountId,
         container: bifrost_types::ContainerId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .container_delete(container)
-            .await?)
+        self.direct_call(account_id, |account| account.container_delete(container))
+            .await
     }
 
     // ---------- compose passthrough (direct) ----------
     //
     // The send / draft / scheduled-send companion to the mutation
     // passthrough cluster above. Same discipline: every method resolves
-    // through `live_account` (so a compose issued after a reopen runs
+    // through the current incarnation (so a compose issued after a reopen runs
     // against the freshly-installed connection), forwards 1:1 to the
     // matching `Account` method, invents no new semantics, and bails
     // `AccountNotAttached` up front. The forwarded `Account` future is
@@ -603,7 +643,8 @@ impl SyncEngine {
         account_id: &AccountId,
         request: bifrost_types::SendRequest,
     ) -> Result<bifrost_types::SendReceipt, Error> {
-        Ok(self.live_account(account_id)?.send_message(request).await?)
+        self.direct_call(account_id, |account| account.send_message(request))
+            .await
     }
 
     /// Send pre-assembled RFC 5322 / RFC 8098 octets verbatim. Forwards to
@@ -614,10 +655,10 @@ impl SyncEngine {
         raw: bytes::Bytes,
         save_to_sent: Option<bool>,
     ) -> Result<bifrost_types::SendReceipt, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .send_raw_message(raw, save_to_sent)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.send_raw_message(raw, save_to_sent)
+        })
+        .await
     }
 
     /// Create a new draft. Forwards to [`Account::draft_create`].
@@ -626,7 +667,8 @@ impl SyncEngine {
         account_id: &AccountId,
         patch: bifrost_types::DraftPatch,
     ) -> Result<bifrost_types::DraftHandle, Error> {
-        Ok(self.live_account(account_id)?.draft_create(patch).await?)
+        self.direct_call(account_id, |account| account.draft_create(patch))
+            .await
     }
 
     /// Update an existing draft. Forwards to [`Account::draft_update`].
@@ -636,10 +678,8 @@ impl SyncEngine {
         draft: bifrost_types::DraftHandle,
         patch: bifrost_types::DraftPatch,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .draft_update(draft, patch)
-            .await?)
+        self.direct_call(account_id, |account| account.draft_update(draft, patch))
+            .await
     }
 
     /// Discard (delete) a draft without sending. Forwards to
@@ -649,7 +689,8 @@ impl SyncEngine {
         account_id: &AccountId,
         draft: bifrost_types::DraftHandle,
     ) -> Result<(), Error> {
-        Ok(self.live_account(account_id)?.draft_discard(draft).await?)
+        self.direct_call(account_id, |account| account.draft_discard(draft))
+            .await
     }
 
     /// Convert a draft into a sent message. Forwards to
@@ -659,7 +700,8 @@ impl SyncEngine {
         account_id: &AccountId,
         draft: bifrost_types::DraftHandle,
     ) -> Result<bifrost_types::SendReceipt, Error> {
-        Ok(self.live_account(account_id)?.draft_send(draft).await?)
+        self.direct_call(account_id, |account| account.draft_send(draft))
+            .await
     }
 
     /// Cancel a previously scheduled send. Forwards to
@@ -670,10 +712,8 @@ impl SyncEngine {
         account_id: &AccountId,
         handle: bifrost_types::ObjectId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .cancel_scheduled_send(handle)
-            .await?)
+        self.direct_call(account_id, |account| account.cancel_scheduled_send(handle))
+            .await
     }
 
     /// Reschedule a previously scheduled send to a new instant. Forwards
@@ -685,20 +725,20 @@ impl SyncEngine {
         handle: bifrost_types::ObjectId,
         scheduled: std::time::SystemTime,
     ) -> Result<bifrost_types::ObjectId, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .reschedule_send(handle, scheduled)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.reschedule_send(handle, scheduled)
+        })
+        .await
     }
 
     // ---------- contact passthrough (direct) ----------
     //
     // The contact companion to the container / compose passthrough
     // clusters above. Same discipline: every method resolves through
-    // `live_account` (so a call issued after a `RestartAccount` reopen
+    // the current incarnation (so a call issued after a `RestartAccount` reopen
     // runs against the freshly-installed connection, never a stale
-    // snapshot the consumer cached), forwards 1:1 to the matching
-    // `Account` method, invents no new semantics, and yields
+    // snapshot the consumer cached), forwards to the matching
+    // `Account` method, dispatches scope restart advice, and yields
     // `Error::AccountNotAttached` up front when no live slot exists. The
     // forwarded `Account` future is `'static` and captures its own `Arc`
     // clones, so it outlives the short-lived handle resolved per call.
@@ -718,7 +758,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Vec<bifrost_types::AddressBook>, Error> {
-        Ok(self.live_account(account_id)?.address_books_list().await?)
+        self.direct_call(account_id, |account| account.address_books_list())
+            .await
     }
 
     /// List contacts, optionally scoped to one address book, resuming from
@@ -730,8 +771,9 @@ impl SyncEngine {
         page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::ContactCard>, Error> {
         let page = self
-            .live_account(account_id)?
-            .contacts_list(address_book, page_cursor)
+            .direct_call(account_id, |account| {
+                account.contacts_list(address_book, page_cursor)
+            })
             .await?;
         self.announce_page_loss(account_id, "contacts_list", &page);
         Ok(page)
@@ -744,7 +786,8 @@ impl SyncEngine {
         account_id: &AccountId,
         contact: bifrost_types::ContactId,
     ) -> Result<bifrost_types::ContactCard, Error> {
-        Ok(self.live_account(account_id)?.contact_get(contact).await?)
+        self.direct_call(account_id, |account| account.contact_get(contact))
+            .await
     }
 
     /// Create one contact card. Forwards to [`Account::contact_create`].
@@ -753,10 +796,8 @@ impl SyncEngine {
         account_id: &AccountId,
         contact: bifrost_types::ContactCreate,
     ) -> Result<bifrost_types::ContactId, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .contact_create(contact)
-            .await?)
+        self.direct_call(account_id, |account| account.contact_create(contact))
+            .await
     }
 
     /// Partially update one contact card. Forwards to
@@ -767,10 +808,8 @@ impl SyncEngine {
         contact: bifrost_types::ContactId,
         patch: bifrost_types::ContactPatch,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .contact_update(contact, patch)
-            .await?)
+        self.direct_call(account_id, |account| account.contact_update(contact, patch))
+            .await
     }
 
     /// Delete one contact card. Forwards to [`Account::contact_delete`].
@@ -779,10 +818,8 @@ impl SyncEngine {
         account_id: &AccountId,
         contact: bifrost_types::ContactId,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .contact_delete(contact)
-            .await?)
+        self.direct_call(account_id, |account| account.contact_delete(contact))
+            .await
     }
 
     /// Delete with the caller's optional version, forwarded unchanged.
@@ -792,10 +829,10 @@ impl SyncEngine {
         contact: bifrost_types::ContactId,
         expected_version: Option<bifrost_types::ServerVersion>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .contact_delete_if_version(contact, expected_version)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.contact_delete_if_version(contact, expected_version)
+        })
+        .await
     }
 
     /// Delete one calendar event. Forwards to [`Account::event_delete`].
@@ -804,7 +841,8 @@ impl SyncEngine {
         account_id: &AccountId,
         event: bifrost_types::EventId,
     ) -> Result<(), Error> {
-        Ok(self.live_account(account_id)?.event_delete(event).await?)
+        self.direct_call(account_id, |account| account.event_delete(event))
+            .await
     }
 
     /// Delete with the caller's optional version, forwarded unchanged.
@@ -814,10 +852,10 @@ impl SyncEngine {
         event: bifrost_types::EventId,
         expected_version: Option<bifrost_types::ServerVersion>,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .event_delete_if_version(event, expected_version)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.event_delete_if_version(event, expected_version)
+        })
+        .await
     }
 
     /// Search the organization directory (Global Address List). Forwards
@@ -832,8 +870,9 @@ impl SyncEngine {
         page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryCard>, Error> {
         let page = self
-            .live_account(account_id)?
-            .directory_search(query, limit, page_cursor)
+            .direct_call(account_id, |account| {
+                account.directory_search(query, limit, page_cursor)
+            })
             .await?;
         self.announce_page_loss(account_id, "directory_search", &page);
         Ok(page)
@@ -850,8 +889,9 @@ impl SyncEngine {
         page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroup>, Error> {
         let page = self
-            .live_account(account_id)?
-            .directory_groups_list(page_cursor)
+            .direct_call(account_id, |account| {
+                account.directory_groups_list(page_cursor)
+            })
             .await?;
         self.announce_page_loss(account_id, "directory_groups_list", &page);
         Ok(page)
@@ -869,8 +909,9 @@ impl SyncEngine {
         page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroupMember>, Error> {
         let page = self
-            .live_account(account_id)?
-            .directory_group_expand(group, page_cursor)
+            .direct_call(account_id, |account| {
+                account.directory_group_expand(group, page_cursor)
+            })
             .await?;
         self.announce_page_loss(account_id, "directory_group_expand", &page);
         Ok(page)
@@ -884,7 +925,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Vec<bifrost_types::ServerFilter>, Error> {
-        Ok(self.live_account(account_id)?.filters_list().await?)
+        self.direct_call(account_id, |account| account.filters_list())
+            .await
     }
 
     /// Create one server-side filter rule or script. Forwards to
@@ -894,7 +936,8 @@ impl SyncEngine {
         account_id: &AccountId,
         filter: bifrost_types::ServerFilterCreate,
     ) -> Result<bifrost_types::ServerFilterId, Error> {
-        Ok(self.live_account(account_id)?.filter_create(filter).await?)
+        self.direct_call(account_id, |account| account.filter_create(filter))
+            .await
     }
 
     /// Partially update one server-side filter rule or script. Forwards
@@ -905,10 +948,8 @@ impl SyncEngine {
         filter: bifrost_types::ServerFilterId,
         patch: bifrost_types::ServerFilterPatch,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .filter_update(filter, patch)
-            .await?)
+        self.direct_call(account_id, |account| account.filter_update(filter, patch))
+            .await
     }
 
     /// Delete one server-side filter rule or script. Forwards to
@@ -918,7 +959,8 @@ impl SyncEngine {
         account_id: &AccountId,
         filter: bifrost_types::ServerFilterId,
     ) -> Result<(), Error> {
-        Ok(self.live_account(account_id)?.filter_delete(filter).await?)
+        self.direct_call(account_id, |account| account.filter_delete(filter))
+            .await
     }
 
     /// Validate a server-side filter payload without storing it. Forwards
@@ -928,10 +970,8 @@ impl SyncEngine {
         account_id: &AccountId,
         filter: bifrost_types::ServerFilterCreate,
     ) -> Result<bifrost_types::FilterValidation, Error> {
-        Ok(self
-            .live_account(account_id)?
-            .filter_validate(filter)
-            .await?)
+        self.direct_call(account_id, |account| account.filter_validate(filter))
+            .await
     }
 
     /// List the account's sending identities. Forwards 1:1 to
@@ -941,7 +981,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Vec<bifrost_types::Identity>, Error> {
-        Ok(self.live_account(account_id)?.identities_list().await?)
+        self.direct_call(account_id, |account| account.identities_list())
+            .await
     }
 
     /// Partially update one sending identity. Forwards to
@@ -952,10 +993,10 @@ impl SyncEngine {
         identity: bifrost_types::IdentityId,
         patch: bifrost_types::IdentityPatch,
     ) -> Result<(), Error> {
-        Ok(self
-            .live_account(account_id)?
-            .identity_update(identity, patch)
-            .await?)
+        self.direct_call(account_id, |account| {
+            account.identity_update(identity, patch)
+        })
+        .await
     }
 
     /// Read the vacation responder config, when supported. Forwards to
@@ -964,7 +1005,8 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Option<bifrost_types::VacationConfig>, Error> {
-        Ok(self.live_account(account_id)?.vacation_get().await?)
+        self.direct_call(account_id, |account| account.vacation_get())
+            .await
     }
 
     /// Replace the vacation responder config. Forwards to
@@ -974,7 +1016,8 @@ impl SyncEngine {
         account_id: &AccountId,
         config: bifrost_types::VacationConfig,
     ) -> Result<(), Error> {
-        Ok(self.live_account(account_id)?.vacation_set(config).await?)
+        self.direct_call(account_id, |account| account.vacation_set(config))
+            .await
     }
 
     /// Read the storage quota readout, when supported. Forwards to
@@ -983,13 +1026,118 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<Option<bifrost_types::QuotaInfo>, Error> {
-        Ok(self.live_account(account_id)?.quota_get().await?)
+        self.direct_call(account_id, |account| account.quota_get())
+            .await
+    }
+}
+
+fn dispatch_direct_error(
+    requests: &mpsc::Sender<ReopenRequest>,
+    shutdown: &CancellationToken,
+    generation: crate::types::AccountGeneration,
+    error: &AccountError,
+) {
+    if let RecoveryClass::Engine(EngineDirective::RestartScope(scope)) = error.recovery() {
+        let request = ReopenRequest::Recovery {
+            scope: Some(scope.clone()),
+            error: error.clone(),
+            generation: Some(generation),
+        };
+        if !shutdown.is_cancelled() {
+            // Opening mail must return its error even when recovery is busy.
+            // Advice is best-effort: the sync lane observes the same stale
+            // scope and requests recovery if this bounded channel is full.
+            let _ = requests.try_send(request);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_restart_advice_carries_the_failing_incarnation() {
+        let scope = CursorScope::Folder(bifrost_types::FolderId("inbox".into()));
+        let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+            bifrost_types::StateCause::CursorInvalid {
+                scope: scope.clone(),
+            },
+        ))
+        .try_build()
+        .expect("cursor invalid error");
+        let generation = crate::types::Incarnation::initial_generation();
+        let (tx, mut rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        dispatch_direct_error(&tx, &shutdown, generation, &error);
+        let request = rx.try_recv().expect("immediate scope recovery");
+        let ReopenRequest::Recovery {
+            scope: found,
+            generation: found_generation,
+            error: found_error,
+        } = request
+        else {
+            panic!("scope recovery request");
+        };
+        assert_eq!(found, Some(scope));
+        assert_eq!(found_generation, Some(generation));
+        assert_eq!(found_error.recovery(), error.recovery());
+        shutdown.cancel();
+        dispatch_direct_error(&tx, &shutdown, generation, &error);
+        assert!(rx.try_recv().is_err(), "detach cancels advice delivery");
+    }
+
+    #[tokio::test]
+    async fn direct_restart_advice_does_not_wait_for_a_full_channel() {
+        let scope = CursorScope::Folder(bifrost_types::FolderId("inbox".into()));
+        let error = bifrost_types::AccountErrorBuilder::new(bifrost_types::PrimaryCause::State(
+            bifrost_types::StateCause::CursorInvalid {
+                scope: scope.clone(),
+            },
+        ))
+        .try_build()
+        .expect("cursor invalid error");
+        let generation = crate::types::Incarnation::initial_generation();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(ReopenRequest::ScopeCreated { scope })
+            .expect("fill channel");
+        let shutdown = CancellationToken::new();
+        dispatch_direct_error(&tx, &shutdown, generation, &error);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ReopenRequest::ScopeCreated { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_direct_stream_does_not_keep_detached_slot_alive() {
+        let account = Arc::new(crate::test_common::StubAccount::new(Vec::new()));
+        let engine = SyncEngine::builder().build().expect("engine");
+        let account_id = AccountId("retained-stream".into());
+        let factory = Arc::new(crate::test_common::StubFactory::queue(vec![account]));
+        engine
+            .attach(account_id.clone(), factory)
+            .await
+            .expect("attach");
+        let weak = {
+            let slot = engine.accounts.get(&account_id).expect("attached slot");
+            Arc::downgrade(slot.value())
+        };
+        let stream = engine
+            .direct_stream::<u8>(
+                &account_id,
+                |_| Box::pin(futures::stream::pending()),
+                |_| None,
+            )
+            .expect("direct stream");
+        engine.detach(&account_id).await.expect("detach");
+        assert!(
+            weak.upgrade().is_none(),
+            "consumer stream must release the slot"
+        );
+        drop(stream);
+    }
 
     #[tokio::test]
     async fn event_delete_forwards_account_error() {

@@ -48,6 +48,8 @@ fn default_problem_type() -> ProblemType {
 #[derive(Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct MethodError {
+    #[serde(skip)]
+    pub(crate) repeated_unknown_method: bool,
     #[serde(rename = "type")]
     p_type: MethodErrorType,
     /// RFC 8620 s3.6.2: the server's own explanation of the failure.
@@ -329,6 +331,7 @@ mod safe_format_tests {
         );
         assert!(!format!("{problem:?} {problem}").contains(marker));
         let method = MethodError {
+            repeated_unknown_method: false,
             p_type: MethodErrorType::Other(marker.into()),
             description: Some(marker.into()),
             limit: Some(marker.into()),

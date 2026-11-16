@@ -1219,8 +1219,11 @@ mod ladder_tests {
         // The base64 of the shared builder output for user/token must equal the
         // exact literal SMTP pins for the same inputs (commands.rs), proving the
         // moved bytes are unchanged on the wire.
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(bifrost_sasl::xoauth2_payload("user", "token").as_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            bifrost_sasl::xoauth2_payload("user", "token")
+                .unwrap()
+                .as_bytes(),
+        );
         assert_eq!(encoded, "dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=");
     }
 
@@ -1249,8 +1252,11 @@ mod ladder_tests {
         // The base64 of the shared bifrost-sasl builder for identity/token must
         // be byte-identical to the RFC 7628 frame the consumer sends on the
         // wire: `n,a=user,\x01auth=Bearer token\x01\x01`.
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(bifrost_sasl::oauthbearer_payload("user", "token").as_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            bifrost_sasl::oauthbearer_payload("user", "token")
+                .unwrap()
+                .as_bytes(),
+        );
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&encoded)
             .unwrap();

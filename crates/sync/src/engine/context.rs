@@ -164,6 +164,7 @@ impl AccountSlot {
         let writer = self.writer();
         let mut recovery = self.recovery(&writer);
         recovery.expected_generation = expected_generation;
+        recovery.observed_schema_reset = Some(self.deferred_schema_reset.completed());
         let followup = handle_account_error(&recovery, scope, error).await;
         self.park_followup(followup);
     }
@@ -238,6 +239,7 @@ impl AccountSlot {
 
     pub(super) fn recovery<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         RecoveryContext {
+            observed_schema_reset: None,
             slot: self,
             writer,
             expected_generation: None,

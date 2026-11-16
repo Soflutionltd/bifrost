@@ -1,6 +1,10 @@
 //! Account-wide schema recovery and parked reset execution.
 
-use super::{pacing::*, scoped::re_establish_scope_with_backoff, *};
+use super::{
+    pacing::*,
+    scoped::{establish_if_absent_after_schema_reset, re_establish_scope_after_schema_reset},
+    *,
+};
 
 /// The `SchemaReset` arm, called under the reopen lock.
 ///
@@ -18,7 +22,7 @@ pub(crate) async fn run_parked_schema_reset(
     let mut declined = HashMap::new();
     for (scope, epoch) in reestablish {
         if let RecoveryFollowUp::ParkScope { scope, epoch } =
-            establish_if_absent(ctx, scope, epoch).await
+            establish_if_absent_after_schema_reset(ctx, scope, epoch).await
         {
             declined.insert(scope, epoch);
         }
@@ -109,7 +113,7 @@ pub(in crate::engine) async fn handle_schema_incompatible(
                     {
                         continue;
                     }
-                    re_establish_scope_with_backoff(ctx, scope, &admitted, walk_fence).await;
+                    re_establish_scope_after_schema_reset(ctx, scope, &admitted, walk_fence).await;
                 }
                 return RecoveryFollowUp::None;
             }

@@ -102,6 +102,10 @@ impl InventoryWalk {
         if coverage.has_barrier()
             && cross_waived_barriers(Some(&publisher.writer), coverage, generation).await?
         {
+            self.degraded |= coverage
+                .obligations()
+                .iter()
+                .any(|obligation| !obligation.is_barrier());
             return Ok(PageVerdict::CrossedWaived);
         }
         if !coverage.is_complete() {
@@ -141,14 +145,23 @@ impl InventoryWalk {
         verdict: PageVerdict,
         terminal: bool,
     ) {
-        if coverage.is_complete() || verdict.crossed() {
+        if coverage.is_complete() {
             return;
         }
         if verdict != PageVerdict::Stop && !terminal && self.warned_incomplete {
             return;
         }
+        // Waiving an unreplayable region does not waive the other losses.
+        // Users still need to know which coverage remains incomplete.
+        let count = coverage
+            .obligations()
+            .iter()
+            .filter(|obligation| !verdict.crossed() || !obligation.is_barrier())
+            .count();
+        if count == 0 {
+            return;
+        }
         self.warned_incomplete = true;
-        let count = coverage.obligations().len();
         let barriers = coverage
             .obligations()
             .iter()
@@ -373,6 +386,48 @@ mod tests {
                 recovery: RegionRecovery::barrier(),
             }],
         )
+    }
+
+    #[test]
+    fn waived_barriers_still_warn_about_other_obligations() {
+        let report = barrier();
+        let mut obligations = report.obligations().to_vec();
+        obligations.push(bifrost_types::InventoryObligation::Object {
+            key: bifrost_types::ObligationKey(b"missing".to_vec()),
+            id: bifrost_types::ObjectId("missing".into()),
+            error: crate::test_common::close_refused(),
+            repair: Vec::new(),
+        });
+        let mixed = InventoryCoverageReport::degraded(report.domain.clone(), obligations);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let delivery = crate::delivery::ChangeDelivery::new(tx);
+        let mut walk = InventoryWalk::default();
+        // A barrier-only waiver must not consume the first-loss warning.
+        walk.warn_coverage(
+            &delivery,
+            &report.domain.scope,
+            &report,
+            PageVerdict::CrossedWaived,
+            false,
+        );
+        assert!(rx.try_recv().is_err());
+        walk.warn_coverage(
+            &delivery,
+            &mixed.domain.scope,
+            &mixed,
+            PageVerdict::CrossedWaived,
+            false,
+        );
+        let event = rx.try_recv().expect("non-barrier loss warning");
+        let bifrost_types::SyncEvent::Warning(warning) = event.event.as_ref() else {
+            panic!("expected warning");
+        };
+        assert_eq!(
+            warning.kind,
+            bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::DegradedCoverage {
+                obligations: 1
+            },)
+        );
     }
 
     #[test]

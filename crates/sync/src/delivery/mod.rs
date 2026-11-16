@@ -384,7 +384,7 @@ impl PagePublisher {
             .publish_inventory_if_fence(event, &self.coverage, &scope, fence)
             .unwrap_or(false);
         if !reached {
-            self.coverage.note_undelivered(&scope, 1);
+            self.coverage.note_undelivered_publication(&id);
             self.control.retire_publication(id);
         }
         reached
@@ -421,8 +421,13 @@ impl PagePublisher {
             .publish_inventory_if_fence(event, &self.coverage, &scope, fence)
             .unwrap_or(false);
         if !reached {
+            // Keep the discard even if detach just closed delivery. Closing
+            // delivery does not fence acknowledgements of already sent pages
+            // or prove retained resume rows stop before this unsent page.
+            // Retiring only its receipt cannot establish that proof. Users
+            // expect a replay rather than a resume that could skip messages.
             if backfill {
-                self.coverage.note_undelivered(&scope, 1);
+                self.coverage.note_undelivered_publication(&id);
             }
             self.control.retire_publication(id);
         }
@@ -855,8 +860,8 @@ impl ChangeDelivery {
     ///
     /// The flag lives on the ledger, but it is set HERE, under this lock,
     /// because the sweep runs under this lock from start to finish
-    /// ([`Self::depart`]: retire, then `note_undelivered`, which records the
-    /// loss AND inserts the discard request). A bare atomic store raced a
+    /// ([`Self::depart`]: atomically retire and record the
+    /// loss and insert the discard request). A bare atomic store raced a
     /// sweep already admitted: it had recorded the watermark, was preempted
     /// before inserting the request, and `detach` then drained an empty
     /// request set and finished the writer - so a loss recorded BEFORE

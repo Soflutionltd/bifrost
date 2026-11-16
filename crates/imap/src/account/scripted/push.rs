@@ -708,7 +708,7 @@ async fn a_refused_notify_registration_invalidates_on_fresh_and_interrupted_roun
             respond(&mut server, "+ idling\r\n").await;
             tokio::time::sleep(Duration::from_millis(10)).await;
             account
-                .push_subscribe(&[push_folder("INBOX")])
+                .push_subscribe(&[push_folder("Z-New")])
                 .await
                 .unwrap();
             let done = read_line(&mut server).await;
@@ -716,6 +716,7 @@ async fn a_refused_notify_registration_invalidates_on_fresh_and_interrupted_roun
             respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&idle))).await;
             let notify = read_line(&mut server).await;
             assert!(notify.contains("NOTIFY SET"), "re-registered: {notify}");
+            assert!(notify.contains("Z-New"), "new folder registered: {notify}");
             respond(&mut server, &answer(tag_of(&notify))).await;
             let again = read_line(&mut server).await;
             assert!(again.contains("IDLE"), "{again}");
@@ -733,6 +734,16 @@ async fn a_refused_notify_registration_invalidates_on_fresh_and_interrupted_roun
             interrupted.iter().any(coarse),
             refuse,
             "interrupted round: {interrupted:?}"
+        );
+        assert_eq!(
+            interrupted.iter().any(|event| matches!(event,
+                E::Invalidated(InvalidationHint {
+                    payload: HintPayload::SpecificCursorScope(bifrost_types::CursorScope::Folder(folder)),
+                    ..
+                }) if folder.0 == "Z-New"
+            )),
+            !refuse,
+            "new coverage invalidates after acknowledgement: {interrupted:?}"
         );
         assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(session);

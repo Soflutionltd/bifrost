@@ -35,6 +35,8 @@
 //! - `(lineage key, attempts u32, exhausted u8)` rows, the per-lineage retry
 //!   budgets (since version 3).
 //!
+//! Version 15 may append a `u32` reason count and `(record kind u8, key bytes,
+//! reason tag u8)` rows. This table is omitted when every reason is unknown.
 //! The payload must be consumed exactly; trailing bytes are refused.
 //!
 //! Version 3 moved the retry budget off the discharged lineage-root entry and
@@ -77,6 +79,9 @@
 //! Version 14 adds PayloadTooLarge and PreconditionFailed request subkinds
 //! (tags 2 and 3 under kind tag 6); older rows reject these new tags.
 //!
+//! Version 15 adds an optional trailing table of UnsupportedReason values for
+//! entry and barrier error digests. Versions 3-14 restore reasons as unknown.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -85,7 +90,8 @@
 //! # Why the error is a digest and not a reconstruction
 //!
 //! `LedgerEntry::last_error` and `BarrierIncident::evidence` contain
-//! `ErrorDigest`: kind, scope, operation, provider, protocol and diagnostics.
+//! `ErrorDigest`: kind, optional unsupported reason, scope, operation, provider,
+//! protocol and diagnostics.
 //! They are historical operator evidence, not live `AccountError` values.
 //! No cause, recovery advice, message key, throttle override or partial-commit
 //! record is reconstructed. Repair uses the separately retained target.
@@ -116,8 +122,8 @@ use bifrost_types::{ObligationKey, wire::Reader};
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-// Version 14 adds payload and target-state request refusal kinds.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 14;
+// Version 15 retains optional unsupported reasons on durable refusals.
+pub const LEDGER_ENVELOPE_VERSION: u32 = 15;
 const _: () = assert!(LEDGER_ENVELOPE_VERSION >= bifrost_types::wire::ledger::VOCABULARY_VERSION);
 
 /// Lowest ledger envelope version still readable by this engine.
@@ -142,6 +148,13 @@ const HEADER_LEN: usize = 20;
 /// vocabulary encoders match exhaustively in bifrost-types.
 #[must_use]
 pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
+    encode_ledger_with_reasons(ledger, encode_unsupported_reason)
+}
+
+fn encode_ledger_with_reasons(
+    ledger: &DebtLedger,
+    encode_reason: impl Fn(bifrost_types::UnsupportedReason) -> Option<u8>,
+) -> Vec<u8> {
     let entries: Vec<&LedgerEntry> = ledger.entries().collect();
     let barriers: Vec<&BarrierIncident> = ledger.barriers().collect();
     let proved = ledger.proved();
@@ -185,6 +198,33 @@ pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
         write_bytes(&mut out, &lineage.0);
         out.extend_from_slice(&budget.attempts.to_le_bytes());
         out.push(u8::from(budget.exhausted));
+    }
+    // Optional v15 extension, keyed by record identity so historical digest
+    // layouts remain readable. No extension is needed when no reason is known.
+    let reasons: Vec<_> = ledger
+        .entries()
+        .filter_map(|entry| {
+            entry
+                .last_error
+                .unsupported_reason
+                .and_then(&encode_reason)
+                .map(|tag| (0u8, &entry.key, tag))
+        })
+        .chain(ledger.barriers().filter_map(|barrier| {
+            barrier
+                .evidence
+                .unsupported_reason
+                .and_then(&encode_reason)
+                .map(|tag| (1u8, &barrier.key, tag))
+        }))
+        .collect();
+    if !reasons.is_empty() {
+        write_count(&mut out, reasons.len(), "unsupported reasons");
+        for (record, key, reason) in reasons {
+            out.push(record);
+            write_bytes(&mut out, &key.0);
+            out.push(reason);
+        }
     }
     out
 }
@@ -286,6 +326,35 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         }
     }
 
+    if version >= 15 && !reader.is_finished() {
+        let count = reader.u32()?;
+        // The reason extension first appeared in v15. Its encoder omits an
+        // empty table, so rejecting this cannot strand historical ledgers.
+        if count == 0 {
+            return Err(Error::Other("ledger envelope: empty reason table".into()));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..count {
+            let record = reader.u8()?;
+            let key = ObligationKey(reader.bytes()?);
+            if !seen.insert((record, key.clone())) {
+                return Err(duplicate("unsupported reason"));
+            }
+            let reason = decode_unsupported_reason(reader.u8()?)?;
+            let digest = match record {
+                0 => entries.get_mut(&key).map(|entry| &mut entry.last_error),
+                1 => barriers.get_mut(&key).map(|barrier| &mut barrier.evidence),
+                other => return Err(unknown_tag("reason record", other)),
+            }
+            .ok_or_else(|| Error::Other("ledger envelope: reason without record".into()))?;
+            if !matches!(digest.kind, bifrost_types::AccountErrorKind::Unsupported(_)) {
+                return Err(Error::Other(
+                    "ledger envelope: reason on supported error".into(),
+                ));
+            }
+            digest.unsupported_reason = Some(reason);
+        }
+    }
     if !reader.is_finished() {
         return Err(Error::Other("ledger envelope: trailing bytes".into()));
     }
@@ -649,6 +718,7 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<ErrorDigest, Error> {
     };
     let diagnostics = decode_diagnostics(reader)?;
     Ok(ErrorDigest {
+        unsupported_reason: None,
         kind,
         scope,
         operation,
@@ -656,6 +726,59 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<ErrorDigest, Error> {
         protocol,
         diagnostics,
     })
+}
+
+fn encode_unsupported_reason(reason: bifrost_types::UnsupportedReason) -> Option<u8> {
+    Some(match reason {
+        bifrost_types::UnsupportedReason::OperationUnavailable => 0,
+        bifrost_types::UnsupportedReason::CapabilityUnavailable => 1,
+        bifrost_types::UnsupportedReason::SubmissionUnavailable => 2,
+        bifrost_types::UnsupportedReason::ScheduledSendUnavailable => 3,
+        bifrost_types::UnsupportedReason::SendAsUnavailable => 4,
+        bifrost_types::UnsupportedReason::ForeignScheduledSend => 5,
+        bifrost_types::UnsupportedReason::ForeignSubmissionUnavailable => 6,
+        bifrost_types::UnsupportedReason::ContainerKind => 7,
+        bifrost_types::UnsupportedReason::LabelKind => 8,
+        bifrost_types::UnsupportedReason::FlagOperation => 9,
+        bifrost_types::UnsupportedReason::CursorScope => 10,
+        bifrost_types::UnsupportedReason::Projection => 11,
+        bifrost_types::UnsupportedReason::RangeTransport => 12,
+        bifrost_types::UnsupportedReason::RequestShape => 13,
+        bifrost_types::UnsupportedReason::DataRepresentation => 14,
+        bifrost_types::UnsupportedReason::MissingMailboxRole => 15,
+        bifrost_types::UnsupportedReason::IdentitySelection => 16,
+        bifrost_types::UnsupportedReason::ConfigurationUnavailable => 17,
+        bifrost_types::UnsupportedReason::ConditionalRelocation => 18,
+        // A newer types crate may add reasons before this codec learns their
+        // tags. Preserve the debt without optional detail, as old rows do;
+        // users must not lose checkpoint writing to a diagnostic addition.
+        _ => return None,
+    })
+}
+
+fn decode_unsupported_reason(tag: u8) -> Result<bifrost_types::UnsupportedReason, Error> {
+    match tag {
+        0 => Ok(bifrost_types::UnsupportedReason::OperationUnavailable),
+        1 => Ok(bifrost_types::UnsupportedReason::CapabilityUnavailable),
+        2 => Ok(bifrost_types::UnsupportedReason::SubmissionUnavailable),
+        3 => Ok(bifrost_types::UnsupportedReason::ScheduledSendUnavailable),
+        4 => Ok(bifrost_types::UnsupportedReason::SendAsUnavailable),
+        5 => Ok(bifrost_types::UnsupportedReason::ForeignScheduledSend),
+        6 => Ok(bifrost_types::UnsupportedReason::ForeignSubmissionUnavailable),
+        7 => Ok(bifrost_types::UnsupportedReason::ContainerKind),
+        8 => Ok(bifrost_types::UnsupportedReason::LabelKind),
+        9 => Ok(bifrost_types::UnsupportedReason::FlagOperation),
+        10 => Ok(bifrost_types::UnsupportedReason::CursorScope),
+        11 => Ok(bifrost_types::UnsupportedReason::Projection),
+        12 => Ok(bifrost_types::UnsupportedReason::RangeTransport),
+        13 => Ok(bifrost_types::UnsupportedReason::RequestShape),
+        14 => Ok(bifrost_types::UnsupportedReason::DataRepresentation),
+        15 => Ok(bifrost_types::UnsupportedReason::MissingMailboxRole),
+        16 => Ok(bifrost_types::UnsupportedReason::IdentitySelection),
+        17 => Ok(bifrost_types::UnsupportedReason::ConfigurationUnavailable),
+        18 => Ok(bifrost_types::UnsupportedReason::ConditionalRelocation),
+        other => Err(unknown_tag("unsupported reason", other)),
+    }
 }
 
 fn unknown_tag(what: &str, tag: u8) -> Error {
@@ -691,6 +814,147 @@ mod tests {
         assert!(restored.is_empty());
         assert_eq!(restored.entries().count(), 0);
         assert_eq!(restored.barriers().count(), 0);
+    }
+
+    #[test]
+    fn an_explicit_empty_reason_table_is_malformed() {
+        for ledger in [DebtLedger::new(), refusal_ledger(None)] {
+            let mut bytes = encode_ledger(&ledger);
+            decode_ledger(&bytes).expect("omitted reason table is canonical");
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            assert!(matches!(decode_ledger(&bytes), Err(Error::Other(_))));
+        }
+    }
+
+    fn refusal_ledger(reason: Option<bifrost_types::UnsupportedReason>) -> DebtLedger {
+        let mut builder = bifrost_types::AccountError::unsupported(
+            bifrost_types::AccountOperation::Send,
+            bifrost_types::Protocol::Jmap,
+        )
+        .into_builder();
+        if let Some(reason) = reason {
+            builder = builder.unsupported_reason(reason);
+        }
+        let error = builder.try_build().expect("valid refusal");
+        let domain = bifrost_types::CoverageDomain::full(CursorScope::Account);
+        let generation = crate::cursor::WalkGeneration::for_test(1);
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                domain.clone(),
+                vec![bifrost_types::InventoryObligation::Region {
+                    key: bifrost_types::ObligationKey(b"entry".to_vec()),
+                    failure_label: "refused".into(),
+                    error: error.clone(),
+                    recovery: bifrost_types::RegionRecovery::DurableReplay {
+                        token: b"token".to_vec(),
+                    },
+                }],
+            ),
+            generation,
+            100,
+        );
+        ledger.record_barrier(super::BarrierIncident {
+            key: bifrost_types::ObligationKey(b"barrier".to_vec()),
+            domain,
+            generation,
+            failure_label: "refused".into(),
+            evidence: error.into(),
+            policy: super::BarrierPolicy::Undecided,
+            resume_from: None,
+        });
+        ledger
+    }
+
+    #[test]
+    fn every_unsupported_reason_tag_round_trips() {
+        // Pin existing tags independently of the fallback for future reasons.
+        for tag in 0..=18 {
+            let reason = super::decode_unsupported_reason(tag).expect("mapped tag");
+            assert_eq!(super::encode_unsupported_reason(reason), Some(tag));
+        }
+        assert!(super::decode_unsupported_reason(19).is_err());
+    }
+
+    #[test]
+    fn unmapped_reason_encoding_preserves_entries_and_barriers_without_detail() {
+        let ledger = refusal_ledger(Some(bifrost_types::UnsupportedReason::ForeignScheduledSend));
+        // No future enum variant can be constructed by this crate. Inject the
+        // encoder's unmapped result through the real envelope writer instead.
+        let encoded = super::encode_ledger_with_reasons(&ledger, |_| None);
+        assert_eq!(encoded, encode_ledger(&refusal_ledger(None)));
+        let restored = decode_ledger(&encoded).expect("unmapped reasons remain readable");
+        assert_eq!(restored.entries().count(), 1);
+        assert_eq!(restored.barriers().count(), 1);
+        assert_eq!(
+            restored
+                .entries()
+                .next()
+                .expect("entry")
+                .last_error
+                .unsupported_reason,
+            None
+        );
+        assert_eq!(
+            restored
+                .barriers()
+                .next()
+                .expect("barrier")
+                .evidence
+                .unsupported_reason,
+            None
+        );
+    }
+
+    #[test]
+    fn refusal_reasons_round_trip_for_entries_and_barriers_and_old_rows_still_decode() {
+        let reason = bifrost_types::UnsupportedReason::ForeignScheduledSend;
+        let current = refusal_ledger(Some(reason));
+        let encoded = encode_ledger(&current);
+        let restored = decode_ledger(&encoded).expect("v15 reasons");
+        assert_eq!(
+            restored
+                .entries()
+                .next()
+                .expect("entry")
+                .last_error
+                .unsupported_reason,
+            Some(reason)
+        );
+        assert_eq!(
+            restored
+                .barriers()
+                .next()
+                .expect("barrier")
+                .evidence
+                .unsupported_reason,
+            Some(reason)
+        );
+        assert_eq!(encode_ledger(&restored), encoded);
+        let mut legacy = encode_ledger(&refusal_ledger(None));
+        legacy[4..8].copy_from_slice(&14u32.to_le_bytes());
+        let restored = decode_ledger(&legacy).expect("stored v14 ledger");
+        assert_eq!(
+            restored
+                .entries()
+                .next()
+                .expect("entry")
+                .last_error
+                .unsupported_reason,
+            None
+        );
+        assert_eq!(
+            restored
+                .barriers()
+                .next()
+                .expect("barrier")
+                .evidence
+                .unsupported_reason,
+            None
+        );
+        let mut invalid = encoded;
+        *invalid.last_mut().expect("reason tag") = u8::MAX;
+        assert!(decode_ledger(&invalid).is_err());
     }
 
     #[test]

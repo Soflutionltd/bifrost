@@ -530,6 +530,10 @@ fn missing_capability_with_push_subscribe_maps_to_unsupported() {
         account.kind(),
         AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
     ));
+    assert_eq!(
+        account.unsupported_reason(),
+        Some(bifrost_types::UnsupportedReason::CapabilityUnavailable)
+    );
 }
 
 /// A client-side failure is never the server's fault: every internal
@@ -1370,4 +1374,20 @@ fn stale_uidvalidity_requests_folder_reinventory_for_every_access() {
             &RecoveryClass::Engine(EngineDirective::RestartScope(scope.clone()))
         );
     }
+}
+
+#[test]
+fn missing_mailbox_role_has_typed_reason() {
+    let error = super::unsupported_with_reason(
+        AccountOperation::BulkMove,
+        bifrost_types::UnsupportedReason::MissingMailboxRole,
+    );
+    assert_eq!(
+        error.unsupported_reason(),
+        Some(bifrost_types::UnsupportedReason::MissingMailboxRole)
+    );
+    assert!(matches!(
+        error.kind(),
+        AccountErrorKind::Unsupported(AccountOperation::BulkMove)
+    ));
 }

@@ -140,16 +140,19 @@ async fn assert_inventory_removal(fusion: bool) {
     rows = transaction;
     assert!(!rows.contains(&removed));
     assert!(rows.contains(&ObjectId("sibling".into())));
-    engine
-        .ack(
-            &account,
-            event
-                .ack_token()
-                .cloned()
-                .expect("acknowledgeable publication"),
-        )
-        .await
-        .expect("ack");
+    assert_eq!(
+        engine
+            .ack(
+                &account,
+                event
+                    .ack_token()
+                    .cloned()
+                    .expect("acknowledgeable publication"),
+            )
+            .await
+            .expect("ack"),
+        bifrost_sync::AckOutcome::Durable,
+    );
     match checkpoint {
         Checkpoint::Change(cursor) => {
             assert_eq!(

@@ -77,7 +77,7 @@ pub enum RequestErrorKind {
 
 /// Why a locally unsupported operation was refused. Independent of provider
 /// prose and recovery: callers can explain the unavailable feature precisely.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[non_exhaustive]
 pub enum UnsupportedReason {
     OperationUnavailable,
@@ -97,6 +97,10 @@ pub enum UnsupportedReason {
     DataRepresentation,
     MissingMailboxRole,
     IdentitySelection,
+    /// Required consumer configuration for the operation is absent.
+    ConfigurationUnavailable,
+    /// Relocation cannot preserve a caller-supplied version precondition.
+    ConditionalRelocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

@@ -1873,6 +1873,11 @@ and each is also stated at the code it describes.
 
 ## Unsupported error construction
 
+Gmail scheduled sends, cancellation and rescheduling carry
+`UnsupportedReason::ScheduledSendUnavailable`; delegate send-as refusals carry
+`SendAsUnavailable`. Blob range refusals carry `RangeTransport`. These reasons
+preserve the existing Unsupported operation and recovery classification.
+
 Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Gmail`, including for inherited

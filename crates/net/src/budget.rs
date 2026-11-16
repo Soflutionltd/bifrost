@@ -361,8 +361,20 @@ impl Drop for Reservation {
 /// Entries are weak; reservations keep their source budget alive across retag.
 #[derive(Default)]
 pub struct BandwidthRegistry {
+    sessions: Mutex<HashMap<AccountId, SessionEntry>>,
     budgets: Mutex<HashMap<AccountId, Weak<BudgetInner>>>,
 }
+
+#[derive(Default)]
+struct SessionEntry {
+    semaphore: Weak<tokio::sync::Semaphore>,
+    state: HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// The supplied session semaphore does not belong to this registry/account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("session budget does not match the registered account budget")]
+pub struct SessionStateError;
 
 impl BandwidthRegistry {
     /// Construct an empty registry.
@@ -386,6 +398,66 @@ impl BandwidthRegistry {
         budget
     }
 
+    /// Returns an error if the semaphore is not registered for this account.
+    /// Share protocol coordination state for the lifetime of a session budget.
+    /// Keep `sessions` alive while using the state. State must not own that
+    /// semaphore, directly or indirectly, because registry entries own state.
+    /// Protocols coordinating multiple pools must retain every live participant
+    /// weakly, in registration order, rather than overwrite a previous owner.
+    /// An in-flight operation may temporarily own participant internals, but
+    /// must not keep an otherwise dropped pool registered through this state.
+    pub fn session_state<T: Default + Send + Sync + 'static>(
+        &self,
+        id: AccountId,
+        sessions: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<Arc<T>, SessionStateError> {
+        let mut entries = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = entries.get_mut(&id).ok_or(SessionStateError)?;
+        if !entry.semaphore.ptr_eq(&Arc::downgrade(sessions)) {
+            return Err(SessionStateError);
+        }
+        Arc::clone(
+            entry
+                .state
+                .entry(std::any::TypeId::of::<T>())
+                .or_insert_with(|| Arc::new(T::default())),
+        )
+        .downcast::<T>()
+        .map_err(|_| SessionStateError)
+    }
+
+    /// Share a physical-session budget across opens of the same account.
+    /// The first live owner sets the capacity; outstanding driver permits keep
+    /// it alive. Callers must cancel their own waiters, never close this semaphore.
+    #[must_use]
+    pub fn session_budget(&self, id: AccountId, capacity: usize) -> Arc<tokio::sync::Semaphore> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry lock poisoned");
+        sessions.retain(|_, entry| entry.semaphore.strong_count() != 0);
+        if let Some(budget) = sessions
+            .get(&id)
+            .and_then(|entry| entry.semaphore.upgrade())
+        {
+            return budget;
+        }
+        // Reopening must not bypass a provider's limit while old sockets tail.
+        // Enterprise users expect reconnect to recover without extra sessions.
+        let budget = Arc::new(tokio::sync::Semaphore::new(capacity.max(1)));
+        sessions.insert(
+            id,
+            SessionEntry {
+                semaphore: Arc::downgrade(&budget),
+                ..Default::default()
+            },
+        );
+        budget
+    }
+
     fn remove(&self, id: &AccountId, inner: *const BudgetInner) {
         let mut budgets = self
             .budgets
@@ -401,6 +473,89 @@ impl BandwidthRegistry {
 mod tests {
     use super::*;
     use BandwidthDirection::{Inbound, Outbound};
+
+    #[test]
+    fn session_state_refuses_unregistered_semaphores() {
+        let registry = BandwidthRegistry::new();
+        let id = AccountId("session-state".into());
+        let foreign = Arc::new(tokio::sync::Semaphore::new(1));
+        assert_eq!(
+            registry
+                .session_state::<usize>(id.clone(), &foreign)
+                .unwrap_err(),
+            SessionStateError
+        );
+    }
+
+    #[test]
+    fn session_state_refuses_mismatched_semaphores() {
+        let registry = BandwidthRegistry::new();
+        let id = AccountId("session-state".into());
+        let foreign = Arc::new(tokio::sync::Semaphore::new(1));
+        let registered = registry.session_budget(id.clone(), 1);
+        assert_eq!(
+            registry
+                .session_state::<usize>(id.clone(), &foreign)
+                .unwrap_err(),
+            SessionStateError
+        );
+        assert_eq!(
+            *registry.session_state::<usize>(id, &registered).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn session_coordination_survives_factory_owners_but_not_expired_budgets() {
+        let registry = BandwidthRegistry::new();
+        let id = AccountId("coordination".into());
+        let sessions = registry.session_budget(id.clone(), 1);
+        let state = registry
+            .session_state::<Mutex<usize>>(id.clone(), &sessions)
+            .unwrap();
+        *state.lock().unwrap() = 7;
+        drop(state);
+        let replacement = registry.session_budget(id.clone(), 9);
+        let state = registry
+            .session_state::<Mutex<usize>>(id.clone(), &replacement)
+            .unwrap();
+        assert_eq!(*state.lock().unwrap(), 7);
+        assert!(Arc::ptr_eq(&sessions, &replacement));
+        drop(state);
+        drop(sessions);
+        drop(replacement);
+        let fresh = registry.session_budget(id.clone(), 2);
+        assert_eq!(
+            *registry
+                .session_state::<Mutex<usize>>(id, &fresh)
+                .unwrap()
+                .lock()
+                .unwrap(),
+            0
+        );
+        assert_eq!(fresh.available_permits(), 2);
+    }
+
+    #[test]
+    fn session_tail_keeps_the_budget_across_incarnations() {
+        let registry = BandwidthRegistry::new();
+        let id = AccountId("session-tail".into());
+        let first = registry.session_budget(id.clone(), 1);
+        let tail = Arc::clone(&first)
+            .try_acquire_owned()
+            .expect("first session");
+        drop(first);
+        let replacement = registry.session_budget(id.clone(), 1);
+        assert!(Arc::clone(&replacement).try_acquire_owned().is_err());
+        drop(tail);
+        let fresh = Arc::clone(&replacement)
+            .try_acquire_owned()
+            .expect("tail exited");
+        drop(fresh);
+        drop(replacement);
+        let changed = registry.session_budget(id, 2);
+        assert_eq!(changed.available_permits(), 2);
+    }
 
     fn commit(budget: &BandwidthBudget, len: usize) {
         let mut grant = budget.reserve(Inbound, len);

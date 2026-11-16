@@ -185,6 +185,7 @@ impl Pool {
         self.inner.meter.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         config: Arc<ImapAccountConfig>,
         primed: ImapConnection,
@@ -197,6 +198,17 @@ impl Pool {
             .try_acquire_owned()
             .expect("fresh session budget");
         primed.driver_task().retain_until_exit(Box::new(permit));
+        Self::new_shared(config, primed, connector, meter, bandwidth_budget, sessions)
+    }
+
+    pub(crate) fn new_shared(
+        config: Arc<ImapAccountConfig>,
+        primed: ImapConnection,
+        connector: Connector,
+        meter: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_budget: bifrost_net::BandwidthBudget,
+        sessions: Arc<Semaphore>,
+    ) -> Self {
         let primed = Arc::new(primed);
         let primed_weak = Arc::downgrade(&primed);
         let primed_driver = primed.driver_task();
@@ -303,6 +315,41 @@ impl Pool {
         })
     }
 
+    /// Claim only an idle or returned member for shared-budget admission.
+    /// This never dials or touches checked-out or dedicated push sessions.
+    pub(crate) fn reclaim_member(
+        &self,
+    ) -> impl std::future::Future<Output = Result<PooledConn, Error>> + Send + 'static + use<> {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let mut waiter = {
+                let mut idle = inner.idle.lock().expect("pool lock poisoned");
+                if inner.is_closed() {
+                    return Err(Error::closed());
+                }
+                idle.parked.retain(|member| member.conn.is_alive());
+                if idle.waiters.is_empty()
+                    && let Some(member) = idle.parked.pop()
+                {
+                    return Ok(PooledConn {
+                        member: Some(member),
+                        pool: Arc::clone(&inner),
+                    });
+                }
+                inner.waiter(&mut idle)
+            };
+            let member = tokio::select! {
+                biased;
+                () = inner.cancel_dials.cancelled() => return Err(Error::closed()),
+                member = &mut waiter.rx => member.map_err(|_| Error::closed())?,
+            };
+            Ok(PooledConn {
+                member: Some(member),
+                pool: Arc::clone(&inner),
+            })
+        }
+    }
+
     /// Capacity for a fresh session that never comes from the parked list
     /// (push). `extra` values live as long as the session's transport.
     pub(crate) async fn reserve_fresh(
@@ -320,9 +367,19 @@ impl Pool {
         self.reserve_fresh(extra).await?.dial().await
     }
 
+    /// Whether this pool draws on `sessions`, the shared account budget.
+    pub(crate) fn shares_sessions(&self, sessions: &Arc<Semaphore>) -> bool {
+        Arc::ptr_eq(&self.inner.sessions, sessions)
+    }
+
     #[cfg(test)]
     pub(crate) fn available_sessions(&self) -> usize {
         self.inner.sessions.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// The recorded selection of every parked member, in parking order.
@@ -346,7 +403,6 @@ impl Pool {
                 self.inner
                     .closed
                     .store(true, std::sync::atomic::Ordering::Release);
-                self.inner.sessions.close();
                 self.inner
                     .idle
                     .lock()
@@ -454,6 +510,7 @@ impl PoolInner {
             };
             tokio::select! {
                 biased;
+                () = self.cancel_dials.cancelled() => return Err(Error::closed()),
                 member = &mut guard.rx => match member {
                     Ok(m) if m.conn.is_alive() => return Ok(m),
                     Ok(_) => continue,
@@ -609,6 +666,7 @@ impl PoolInner {
             let guard = guard.as_mut().expect("fresh waiter present");
             tokio::select! {
                 biased;
+                () = self.cancel_dials.cancelled() => return Err(Error::closed()),
                 permit = &mut acquire => {
                     let permit = permit.map_err(|_| Error::closed())?;
                     if let Some(member) = guard.take_handoff() { self.return_member(member); }
@@ -907,6 +965,13 @@ impl PooledConn {
             selected: None,
         });
         Ok(())
+    }
+
+    /// The factory has already queued its shared-budget permit acquisition.
+    pub(crate) async fn retire_for_admission(mut self) {
+        if let Some(member) = self.member.take() {
+            self.pool.retire(member).await;
+        }
     }
 
     pub(crate) fn discard(&mut self) {

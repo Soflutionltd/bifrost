@@ -47,6 +47,13 @@ happen, plus one surface gap that matters if the consumer relies on it.
   for calendar, as it is for contacts.
 - **`BatchOutcome::iter()` yields builder push order, not submission order.**
   The docs now say so; whether consumers need submission order is open.
+- **`AccountFactory` has no permanent-removal notification.** JMAP's
+  per-factory method refusal history (which keeps a server that refuses an
+  advertised method from looping account restarts) is pruned only through
+  `forget_account`, which a caller retaining the factory must invoke on
+  detach; clearing it on an ordinary account drop would reopen the restart
+  loop. Whether the shared factory trait gains a removal hook is an API
+  decision.
 - **`UnsupportedReason::LabelKind` has no producer.** Its only producers were
   JMAP's label overrides, replaced by declared `LabelShape`s. Keep or remove is
   the owner's call (published variant).
@@ -298,104 +305,28 @@ Narrow edge cases, audits with no known defect, and design work.
     carries no cursor scope the placeholder now routes recovery silently; the
     old builder rejected that shape. Correct for Gmail history today, but the
     placeholder pattern hides a missing scope elsewhere.
-  - Transport derivation still panics in debug builds on acknowledged
-    transport evidence, while release builds treat it as in-flight.
 - **Lateral findings from the review of the November 2026 resolution batch.**
-  - IMAP: an ESEARCH answer without the UID indicator to a UID SEARCH is now a
-    hard protocol error; a lenient server that omits the indicator fails every
-    search.
-  - JMAP: one server-minted id containing the owner separator now fails the
-    whole response; needs a ruling on dropping that item versus failing all.
-    Shared-account contacts and calendars have no routing door: the optional
-    families live once on `Registry::families` and select the primary account
-    (capability question).
+  - JMAP: shared-account contacts and calendars have no routing door: the
+    optional families live once on `Registry::families` and select the primary
+    account (capability question).
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.
-  - SASL: `strip_frame_delim` in `crates/sasl/src/oauth.rs` still
-    rewrites for callers that bypass `SaslClient`.
-  - JMAP: a capability dropped mid-session yields terminal `Unsupported` where
-    `CapabilityChanged` may fit (ruling).
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
-    sends have no BDAT entry point (ruling). `reference/smtp.md` describes
-    async pool recycle behaviour in two conflicting ways.
-  - sync: two tests are missing around the guarded send in
-    `crates/sync/src/delivery/mod.rs`. Nothing pins that a change-lane
-    inventory page whose publication a concurrent live publication superseded
-    is still broadcast (only backfill receipts go through the publication
-    check; sending the change page is what keeps the survivor's
-    acknowledgement honest). The discard arm of
-    `registered_pages_and_markers_are_not_sent_after_invalidation` passes
-    through the boundary-removal refusal, so the `fenced_backfill.excludes`
-    clause is not bitten independently.
-  - sync: a backfill page mid-publish in the synchronous window of
-    `DetachingAccount::begin` (delivery closed before control stop) is
-    forfeited as a backfill discard, so the next attach re-walks the scope
-    instead of resuming. Conservative and documented; narrowing the window is
-    optional.
+    sends have no BDAT entry point (ruling). The message builder does not
+    enforce the RFC 5322 998-octet line limit (the comments now say so).
+    Folding inside an unbreakable ASCII token changes its value and refusing
+    such a message changes what the builder accepts today, so enforcement
+    needs a ruling.
   - sync: the operator-override warning moved from `user_safe` to
-    `support_only` (ruling). `AckOutcome` is not `#[must_use]`: adding it is clean in
-    production but about fifty test call sites discard the value.
-  - Graph: `public_folder` change events carry `Owner` memberships that only
-    `Account` cursors cover.
+    `support_only` (ruling).
   - Calendars: CalDAV and JMAP normalize floating times to UTC.
 
-- **Residue of the 413, JMAP limit, stale UIDVALIDITY and hold-provenance
-  batch (November 2026).** Each is small; none is a known live defect.
-  - Honest backfill completion counts removed the old ordering safety net
-    (`items_done = total_seen + 1`) for external `CheckpointStore`
-    implementations that still select the resume row by greatest
-    `items_done` instead of calling `backfill_checkpoint_is_later`.
-  - Engine direct PIM and hydration passthroughs return `RestartScope` advice
-    to the caller without dispatching it, so a stale-UIDVALIDITY folder is
-    re-inventoried only when the sync lane next notices. A delay, not a loss.
-- **JMAP raw-message reads collapse two failures into `NotFound(Message)`.**
-  `open_raw_rfc822` in `crates/jmap/src/sync/blob.rs` takes the same
-  `raw_message_not_found` lane when the correlated Email has no `blobId` and
-  when the `Email/get` list does not contain the requested id at all. The
-  second is a server answering a different object than asked, which reads as a
-  contract violation rather than a vanished message. Needs a call on whether to
-  split them.
-
-- **IMAP `draft_send` and `draft_discard` do not check that the handle is a
-  draft.** Both decode any `imap2` object id (`crates/imap/src/account/pim.rs`)
-  and neither verifies Drafts-folder membership or the `\Draft` flag, so a
-  handle naming an ordinary message submits it and then marks it `\Deleted`
-  and expunges it. Only that one UID can be removed (the expunge fallback's
-  allowed set is the singleton), so this is an input-contract question, not
-  collateral expunging. Needs a ruling on whether a non-draft handle is
-  `Request(Malformed)`.
-
-- **IMAP search: one failing folder fails the whole page.** `search` and
-  `search_messages` (`crates/imap/src/account/pim.rs`) propagate any
-  per-folder SELECT or SEARCH error with `?` across every selectable folder,
-  shared ones included, and never use `Page::skipped_scopes`; Graph
-  quarantines a revoked mailbox instead. Needs a ruling on which per-folder
-  failures quarantine rather than fail. The November 2026 design hunt
-  (imap-account scope) reported the same and filed IMAP's wider skip-lane gap
-  (shared-namespace LIST / NAMESPACE failures dropped at open) in the hunt's
-  `bugs.md`.
-- **IMAP search cursor is not bound to its query.** The `imapsearch1:` cursor
-  carries only a position, so it is accepted for a different `SearchRequest`.
-  A position is meaningful under any query, so this resumes rather than
-  corrupts, but JMAP and Graph bind their search cursors to owner and state.
 - **No persistence contract for a `ChangeCursor` held outside the engine.**
   bifrost#3 offered it as the alternative to the UID polling surface; the
   surface landed instead. The cursor codec lives in bifrost-sync and nothing
   documents how a direct `Account` consumer persists and migrates a cursor.
   Design work, no consumer asking today.
-
-- **IMAP PIM partial-commit scopes name the canonical id, not the submitted
-  one.** `folder_effect_targets` (`crates/imap/src/account/pim.rs`) rebuilds
-  `ErrorScope::Message` from a `FolderEffect`'s folder, UIDVALIDITY and UID,
-  and `copy_messages`, `delete_messages` and `set_flag` reduce their decoded
-  targets to numeric UIDs via `valid_uids`, so a legacy `imap1` or
-  non-canonical source id is reported in its `imap2` spelling. Batch lanes and
-  hydration already echo the submitted id; no in-workspace consumer matches
-  these diagnostic scopes against submitted ids (sync attributes partial
-  commits by the enclosing `BatchItemId`), so this is attribution polish.
-  Fixing it means carrying `DecodedObjectId::id` through `FolderEffect`; new
-  destination ids stay canonical.
 
 - **A refused JMAP send drops an unanswered Email create or import.** In
   `send_message` / `send_raw_message` the failure branch reads the Email
@@ -418,28 +349,9 @@ Narrow edge cases, audits with no known defect, and design work.
   (`WatchEvent` or `SinkPush` side) while keeping the unattributed door;
   sampling the current generation at push time was rejected, since it labels
   an old event with the new identity.
-- **Lateral findings from the review of the structural batch after 83339bcb.**
-  - IMAP setup has one total deadline across greeting, CAPABILITY, STARTTLS
-    and the TLS handshake where each phase used to get its own, so a slow
-    STARTTLS server gets less time than before.
-  - `unsubscribe_push` cancelled after taking the registry discards in-flight
-    and unattempted handles. Marking orphans in place instead risks the
-    retrier racing the delete to `NotFound`.
-  - A waived barrier on a page hides non-barrier obligations in the same
-    coverage report from the warning.
-  - Backfill runner `Stop` pages now write the barrier before the removal
-    projection can fail.
-  - `UnsupportedReason` is not carried into the ledger or telemetry exports,
-    and only JMAP sets it.
-  - A library batching bug that overflows `maxCallsInRequest` would surface as
-    `PayloadTooLarge` rather than an internal fault.
-- **Session cap does not span account incarnations.** A failed or cancelled
-  factory open, or a closing incarnation during reopen, can leave a transport
-  tail that the next incarnation's cap does not count.
-- **IMAP push: same-session NOTIFY extension is uncovered until
-  registration.** In the Reidle branch, a newly added folder is watched only
-  after the re-issued NOTIFY SET. Changes before registration are not
-  invalidated.
+- **`unsubscribe_push` cancelled after taking the registry discards in-flight
+  and unattempted handles.** Marking orphans in place instead risks the
+  retrier racing the delete to `NotFound`; needs a design.
 - **IMAP literals are not emitted incrementally.** FETCH body and binary
   literals are `Bytes` slices of the framed response, but a FETCH response is
   fully framed and parsed before delivery. Standalone parsers without an owned
@@ -457,21 +369,6 @@ Narrow edge cases, audits with no known defect, and design work.
     `CrossWaivedBarriers` sent by a walk that predates a scope or account
     reset are accepted; a stale barrier fails closed (it blocks the
     replacement walk and asks an operator) and needs its own policy.
-    `RecordDebt` acceptance is the safe direction and stays.
-  - Schema-incompatibility evidence discarded before classification: a
-    lifecycle `Created` restart deletes a preexisting row unread;
-    `run_establish` types an unreadable row as `Engine(SchemaIncompatible)`
-    without routing it to the account reset, and the per-scope retry loop
-    treats it as retryable. Reachable for a preexisting row of a scope absent
-    from discovery at attach that returns mid-session before any sibling door
-    failure.
-  - Per-scope fences do not refuse foreign publications: the account fence
-    refuses ids minted by earlier attachments; per-scope resets still accept a
-    prior attachment's change receipt through the fallback.
-  - Duplicate SchemaIncompatible directives run duplicate account resets:
-    every scope whose door fails sends its own directive, and each runs a full
-    clear and re-establishment, for directives already queued by distinct live
-    drives.
   - `ack_checkpoint` with no publication bypasses every fence: a change cursor
     or backfill page acknowledged with `publication: None` skips the claim
     lookup and every reset fence in `persist_ack_request`; after an account
@@ -480,10 +377,6 @@ Narrow edge cases, audits with no known defect, and design work.
     answers to rule on: name it as a consumer assertion path, or refuse a
     `None`-publication backfill acknowledgement (always, by the reasoning
     `completion_refusal` already records, or once an account fence is raised).
-  - Backfill discard requests survive an account reset: detach drains
-    `take_backfill_discards()` and sends `DiscardBackfillProgress` per scope; a
-    discard recorded before an account reset deletes the post-reset walk's rows
-    at detach. Safe direction (costs a re-walk).
 
 ## Coverage gaps from the October 2026 hunt
 

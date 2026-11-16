@@ -18,6 +18,8 @@ use super::response::Response;
 pub(crate) struct CallHandle<M: JmapMethod> {
     pub(crate) call_id: String,
     pub(crate) answer_context: super::answer::AnswerContext,
+    pub(crate) method_refusals: crate::client::MethodRefusals,
+    pub(crate) account_id: String,
     pub(crate) _phantom: PhantomData<M>,
 }
 
@@ -234,6 +236,8 @@ impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
         });
 
         Ok(CallHandle {
+            method_refusals: std::sync::Arc::clone(&self.client.method_refusals),
+            account_id: self.account_id.to_string(),
             answer_context,
             call_id,
             _phantom: PhantomData,

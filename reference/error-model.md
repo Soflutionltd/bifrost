@@ -88,8 +88,10 @@ transport hooks without parsing diagnostic prose. The reason is optional for
 other producers and survives cloning and `into_builder` decoration. Recovery
 and `unsupported.operation` stay derived from the kind; native codes remain
 provider wire evidence. `try_build` rejects a reason on any other kind with
-`UnsupportedReasonNotApplicable`. The ledger error digest retains the kind and
-diagnostics, not this live refusal metadata.
+`UnsupportedReasonNotApplicable`. The ledger error digest retains the optional `UnsupportedReason` alongside
+the kind, scope, operation, provider, protocol and diagnostics. Ledger envelope
+version 15 persists reasons for entries and barriers; versions 3-14 restore
+them as unknown. Digests do not reconstruct causes or live recovery advice.
 
 ## AccountErrorBuilder funnel
 
@@ -159,6 +161,10 @@ Arc. Derivation is pure: same parts in, same classification out.
 A malformed sync-state chain passed directly to the internal derivation helper
 fails closed as terminal `InternalFailure`; it never panics or invents a cursor
 target. The builder's primary-derived kind prevents that shape in normal use.
+Acknowledged transport evidence is rejected by `try_build` in the classification
+prefix. If passed directly to internal derivation, it is conservatively read as
+InFlight in every build profile, without a panic: an enterprise user expects
+uncertain writes reconciled rather than a crashed client.
 
 ## AccountErrorKind and message keys
 

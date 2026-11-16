@@ -263,6 +263,8 @@ mod client;
 mod commands;
 mod connection_url;
 pub(crate) mod error;
+#[cfg(test)]
+mod hermetic_transport_tests;
 // pub: users build typed ESMTP send options and parameters.
 pub mod extension;
 mod pool;

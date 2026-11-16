@@ -66,6 +66,12 @@ pub struct CheckpointTransition {
 /// tag 3 decodes to CalendarEvent (canonical tag 6); raw-byte indexes must
 /// migrate those keys or admit both encodings on lookup. Preserve checkpoint
 /// progress and ledger debt if historical rows exist under both tags.
+///
+/// Backfill resume selection MUST use [`backfill_checkpoint_is_later`].
+/// Selecting the greatest `items_done` is a contract violation: completion
+/// counts are honest counts, can tie or fall below earlier page counts, and
+/// are not ordering keys. Use the helper for maintained indexes as well as
+/// scans; do not reproduce a historical ordering from item counts.
 pub trait CheckpointStore: Send + Sync {
     /// Persist a checkpoint advance and the account's ledger, atomically.
     ///
@@ -120,7 +126,7 @@ pub trait CheckpointStore: Send + Sync {
     /// Select using [`backfill_checkpoint_is_later`], the engine-owned resume
     /// policy. A proven completion wins independently of item counts; other
     /// rows retain the historical count, page-bound and raw-byte ordering.
-    /// Consumers can call this helper instead of copying the key codec.
+    /// Implementations must call this helper, including when updating an index.
     /// [`Self::apply_transition`] also compacts redundant rows using
     /// [`backfill_checkpoint_compacts`].
     ///

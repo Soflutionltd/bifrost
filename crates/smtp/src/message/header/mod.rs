@@ -349,26 +349,12 @@ impl<'a> HeaderValueEncoder<'a> {
     /// verbatim, and a run of words containing unallowed bytes is buffered and
     /// emitted as RFC 2047 encoded-words.
     ///
-    /// Accepted limit: an unbreakable ALLOWED token - all-ASCII, no spaces,
-    /// hundreds of characters - is written whole even when it is the only word
-    /// on the line, so the emitted line can exceed 78 octets. This is
-    /// deliberate on both halves of the choice. Folding inside an atom would
-    /// insert whitespace into the value and change it; and RFC 2047 covers
-    /// NON-ASCII text only, so encoding an all-ASCII word to force a fold would
-    /// be using that mechanism outside its remit. The binding rule is RFC 5322
-    /// Section 2.1.1, where 78 octets is a SHOULD and 998 a MUST: this misses
-    /// the SHOULD and stays well inside the MUST, which makes it a preference
-    /// rather than a conformance defect. RFC 6532 UTF-8 headers over RFC 6531
-    /// remove the need to ENCODE non-ASCII but do nothing for folding an
-    /// unbreakable ASCII atom, so no later RFC supersedes the question (RFC
-    /// standing rechecked 2026-07-31).
-    ///
-    /// What would change it: a decision to RFC 2047-encode over-long allowed
-    /// tokens when the header already carries encoded words. That is the
-    /// repository owner's call, and it would require changing
-    /// `format_ascii_with_folding_giant_word` and
-    /// `long_non_ascii_display_names_fold_on_every_address_path`, which pin the
-    /// current behaviour.
+    /// Unbreakable allowed ASCII tokens are written verbatim, regardless of
+    /// length. Space-driven folding can therefore exceed both the recommended
+    /// 78-octet line length and RFC 5322 Section 2.1.1's hard 998-octet limit.
+    /// Folding inside such a token would insert whitespace into its value.
+    /// The builder preserves accepted values rather than rejecting them;
+    /// callers must keep unbreakable tokens within the hard line limit.
     fn format(mut self, words_iter: impl Iterator<Item = &'a str>) -> fmt::Result {
         for next_word in words_iter {
             let allowed = allowed_str(next_word);
@@ -635,27 +621,10 @@ mod tests {
         );
     }
 
-    /// A pathological (500+ char) non-ASCII display name folds on every
-    /// address-header path, typed and raw alike. RFC 2047 words are
-    /// individually short and the writer folds between them, so the length of
-    /// the NAME never reaches the emitted line - the recorded worry that long
-    /// names flatten their folds does not hold for a name that actually needs
-    /// encoding.
-    ///
-    /// What does still emit an over-long line is an unbreakable ALLOWED token
-    /// (all-ASCII, no spaces) next to encoded ones: it is written verbatim,
-    /// because folding inside an atom would change the value and encoding it
-    /// is not this encoder's rule. That is the same deliberate behavior
-    /// `format_ascii_with_folding_giant_word` pins, and it stays under the
-    /// RFC 5322 Section 2.1.1 hard 998-octet limit - only the SHOULD-78 is
-    /// missed. Both shapes are asserted here so the split stays visible.
-    ///
-    /// The SHOULD-78 miss is an accepted limit, not an open defect: RFC 2047
-    /// applies to non-ASCII text only, so it has no bearing on an all-ASCII
-    /// token, and no later RFC (6531/6532 included) supersedes the folding
-    /// question. Changing it means deciding to encode over-long allowed tokens
-    /// when the header already carries encoded words, which would rewrite the
-    /// expectation below; see the reasoning on `HeaderValueEncoder::format`.
+    /// Long non-ASCII display names fold between encoded words on typed and
+    /// raw address paths. The ASCII-token example below is shorter than 998
+    /// octets, but that is a property of this fixture, not an enforced limit:
+    /// longer unbreakable tokens are also written verbatim.
     #[test]
     fn long_non_ascii_display_names_fold_on_every_address_path() {
         fn longest_line(headers: &Headers) -> usize {
@@ -695,7 +664,7 @@ mod tests {
             longest > 78,
             "the giant-token case is the one that overflows"
         );
-        assert!(longest < 998, "but it stays inside the RFC 5322 hard limit");
+        assert!(longest < 998, "this fixture is shorter than the hard limit");
     }
 
     #[test]

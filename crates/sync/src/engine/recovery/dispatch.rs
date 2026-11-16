@@ -273,7 +273,11 @@ async fn handle_engine_directive(
             if let Some(scope) = fallback_scope {
                 extra.insert(scope.clone(), ctx.cursors.lifecycle_epoch(&scope));
             }
-            deferred = handle_schema_incompatible(ctx, extra).await;
+            deferred = if let Some(observed) = ctx.observed_schema_reset {
+                super::schema::run_parked_schema_reset(ctx, extra, observed).await
+            } else {
+                handle_schema_incompatible(ctx, extra).await
+            };
         }
         EngineDirective::OperatorOverrideRequired { reason } => {
             // Auto-pause the account: the engine no longer drives work

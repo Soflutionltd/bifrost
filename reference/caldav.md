@@ -1525,6 +1525,12 @@ explicit.
 
 ## Unsupported error construction
 
+Replacing recurrence on a resource containing override VEVENTs carries
+`UnsupportedReason::DataRepresentation`. Event relocation with a caller-supplied
+version guard carries `ConditionalRelocation`, since the relocation path cannot
+preserve that precondition. Existing refusal kinds and recovery remain unchanged;
+recurrence-instance doors classified as malformed requests keep that classification.
+
 Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::CalDav`, including for inherited

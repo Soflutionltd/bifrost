@@ -128,6 +128,8 @@ impl JmapMethod for TestMailGet {
 
 pub(crate) fn make_handle<M: JmapMethod>(call_id: &str) -> CallHandle<M> {
     CallHandle {
+        method_refusals: Default::default(),
+        account_id: "test".into(),
         call_id: call_id.to_string(),
         answer_context: crate::core::answer::AnswerContext {
             method: M::NAME,

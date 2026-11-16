@@ -67,7 +67,10 @@ async fn setup_deadline_case(phase: usize) {
         }
     ));
     assert_eq!(error.attempt(), Some(TransmissionState::Unsent));
-    assert_eq!(start.elapsed(), Duration::from_millis(100));
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(if phase == 2 { 300 } else { 100 })
+    );
     assert_eq!(
         inbound.load(std::sync::atomic::Ordering::Relaxed) == 0,
         phase == 0,
@@ -119,8 +122,7 @@ async fn setup_peer_case(capability: bool) {
         }
     });
     let mut reader = reader(client, BandwidthBudget::default());
-    // Exercise the cumulative peer allowance independently of the absolute
-    // setup deadline, through the same production initializer.
+    // Exercise the phase bound through the production initializer.
     reader.set_peer_timeout(Some(Duration::from_millis(100)));
     let mut state = state::ProtocolState::new();
     let mut tags = tag::TagGenerator::new();
@@ -136,7 +138,7 @@ async fn setup_peer_case(capability: bool) {
             host: "imap.invalid".into(),
             tls_mode: TlsMode::None,
             tls_connector: connector(),
-            timeout: Duration::from_secs(1),
+            timeout: Duration::from_millis(100),
             tls_active: Arc::default(),
         },
     )
@@ -354,4 +356,84 @@ async fn setup_panic_before_readiness_reclaims_transport_and_lease() {
     assert!(driver.has_exited());
     assert_eq!(release.try_recv(), Ok(()));
     assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+}
+
+/// Both phases fit individually but their sum exceeds a single timeout.
+#[tokio::test(start_paused = true)]
+async fn setup_capability_receives_a_fresh_budget_after_a_slow_greeting() {
+    let (client, mut peer) = tokio::io::duplex(256);
+    let leases = LeaseHandoff::none();
+    let setup = ImapConnection::from_wire_reader(
+        reader(client, BandwidthBudget::default()),
+        "imap.invalid",
+        TlsMode::None,
+        connector(),
+        Duration::from_millis(100),
+        &leases,
+    );
+    let script = async {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        peer.write_all(b"* OK hello\r\n").await.unwrap();
+        let line = test_support::read_line(&mut peer).await;
+        assert!(line.contains(" CAPABILITY"));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        test_support::respond(
+            &mut peer,
+            &format!(
+                "* CAPABILITY IMAP4rev1\r\n{} OK caps\r\n",
+                test_support::tag_of(&line)
+            ),
+        )
+        .await;
+        peer
+    };
+    let start = tokio::time::Instant::now();
+    let (result, _peer) = tokio::join!(setup, script);
+    let _conn = result.unwrap();
+    assert_eq!(start.elapsed(), Duration::from_millis(150));
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_starttls_budget_grows_only_when_the_upgrade_runs() {
+    let (client, mut peer) = tokio::io::duplex(256);
+    let leases = LeaseHandoff::none();
+    let setup = ImapConnection::from_wire_reader(
+        reader(client, BandwidthBudget::default()),
+        "imap.invalid",
+        TlsMode::StartTls,
+        connector(),
+        Duration::from_millis(100),
+        &leases,
+    );
+    let script = async {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        peer.write_all(b"* OK hello\r\n").await.unwrap();
+        let capability = test_support::read_line(&mut peer).await;
+        assert!(capability.contains(" CAPABILITY"));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        test_support::respond(
+            &mut peer,
+            &format!(
+                "* CAPABILITY IMAP4rev1 STARTTLS\r\n{} OK caps\r\n",
+                test_support::tag_of(&capability)
+            ),
+        )
+        .await;
+        let starttls = test_support::read_line(&mut peer).await;
+        assert!(starttls.contains(" STARTTLS"));
+        // No socket or TLS endpoint: stall the protocol phase until its bound.
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    };
+    let start = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(setup, script);
+    let error = result.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Transport {
+            kind: crate::error::TransportFailure::Timeout,
+            ..
+        }
+    ));
+    assert_eq!(error.attempt(), Some(TransmissionState::InFlight));
+    assert_eq!(start.elapsed(), Duration::from_millis(450));
 }

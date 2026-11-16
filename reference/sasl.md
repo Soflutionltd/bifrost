@@ -42,7 +42,8 @@ commands, base64 framing, terminal protocol replies, deadlines and token lookup.
 - `SaslError` - `#[non_exhaustive]`. `Protocol(String)` for malformed or
   unexpected SASL/SCRAM messages and peer-controlled input (the server's
   certificate); `InvalidCredential(String)` for a caller-supplied username or
-  password that fails SASLprep or a PLAIN field containing NUL;
+  password that fails SASLprep, a PLAIN field containing NUL, or an OAuth
+  field containing SOH, NUL, CR or LF;
   `ServerRejected(ScramServerError)` for a typed SCRAM `e=` refusal;
   `LocalRuntime(String)` for a local cryptographic facility failure.
 - `ScramHash` - `#[non_exhaustive]` `{ Sha1, Sha256 }`. Names the hash, not a
@@ -134,16 +135,19 @@ commands, base64 framing, terminal protocol replies, deadlines and token lookup.
   `name()` returns the wire token; `error_ack()` returns the raw error answer
   as a static string: empty for XOAUTH2, SOH for OAUTHBEARER (RFC 7628
   Section 3.2.3). Protocol crates base64-frame the answer and append CRLF.
-- `xoauth2_payload(user, access_token) -> Secret` /
-  `oauthbearer_payload(identity, access_token) -> Secret` (`oauth.rs`) - OAuth
+- `xoauth2_payload(user, access_token) -> Result<Secret, SaslError>` /
+  `oauthbearer_payload(identity, access_token) -> Result<Secret, SaslError>` (`oauth.rs`) - OAuth
   SASL client payloads as a zeroizing `Secret` of the *raw* (un-base64'd)
   bytes; the protocol crate frames them (IMAP base64-encodes for AUTHENTICATE,
   SMTP's AUTH command base64-encodes downstream). XOAUTH2 has no GS2 framing so
   nothing is escaped; OAUTHBEARER's `a=` identity is GS2-escaped via
   `escape_username` (same RFC-derived escape table as SCRAM saslname) and the
   optional RFC 7628 `host=` / `port=` attributes are deliberately omitted to
-  stay transport-agnostic. The frame-delimiter-stripped intermediate copies,
-  including the access token when it contains `\x01`, use zeroizing storage.
+  stay transport-agnostic. Both helpers refuse SOH, NUL, CR and LF in either
+  field as `InvalidCredential`; `SaslClient::oauth` uses these same fallible
+  helpers. Enterprise users expect malformed saved credentials refused locally,
+  never silently rewritten into another identity or token. GS2 escaping uses
+  zeroizing intermediate storage.
 
 The per-hash proof helpers, `scram_field`, `escape_username`, and the HMAC/XOR
 primitives stay private to the crate. Password-derived SCRAM intermediates and the CRAM-MD5
@@ -199,8 +203,8 @@ correct:
 - Shared client (`client.rs`): the absolute RFC 5802 SHA-1 exchange, premature
   success, failed verifier/refusal terminality, both hashes across n/y/p binding,
   positional LOGIN, single-use PLAIN, binary CRAM, OAuth error answers and local
-  delimiter refusal. Removing the OAuth validation guard makes its regression
-  test fail; restoring it passes.
+  delimiter refusal. Direct OAuth helper tests cover SOH, NUL, CR and LF in
+  both fields for both mechanisms, alongside the shared-client refusal test.
 - RFC 5802 SHA-1 client-final + server signature (`scram.rs`), now passing
   `ScramChannelBinding::None` - proves the `None` path stays byte-identical to
   the old `c=biws`.

@@ -329,6 +329,14 @@ impl CalDavAccount {
     }
 }
 
+fn guarded_relocation_error() -> AccountError {
+    unsupported_error(AccountOperation::EventUpdate)
+        .into_builder()
+        .unsupported_reason(bifrost_types::UnsupportedReason::ConditionalRelocation)
+        .try_build()
+        .expect("valid guarded relocation refusal")
+}
+
 impl Account for CalDavAccount {
     bifrost_dav_core::dav_unsupported_account_methods!(CalDavDialect);
 
@@ -666,7 +674,7 @@ impl Account for CalDavAccount {
                 ));
             }
             if expected_etag.is_some() && relocation.is_some() {
-                return Err(unsupported_error(AccountOperation::EventUpdate));
+                return Err(guarded_relocation_error());
             }
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
@@ -1025,7 +1033,13 @@ async fn hydrated_event_page<K: Fn(&CalendarEvent) -> bool>(
 /// not the server erring - which is why it is not the provider's fault.
 fn patch_error(operation: AccountOperation, error: PatchError) -> AccountError {
     let detail = match error {
-        PatchError::RecurrenceOverride => return unsupported_error(operation),
+        PatchError::RecurrenceOverride => {
+            return unsupported_error(operation)
+                .into_builder()
+                .unsupported_reason(bifrost_types::UnsupportedReason::DataRepresentation)
+                .try_build()
+                .expect("valid recurrence representation refusal");
+        }
         PatchError::Write(error) => return write_error(operation, error),
         PatchError::NoSpliceableVevent => {
             "CalDAV patch writer found no VEVENT in the body the event was projected from"
@@ -2878,6 +2892,10 @@ mod tests {
             PatchError::RecurrenceOverride,
         );
         assert_eq!(
+            refused.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::DataRepresentation)
+        );
+        assert_eq!(
             refused.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
         );
@@ -4014,4 +4032,18 @@ mod partial_commit_rsvp_tests {
             ]
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn guarded_relocation_has_typed_reason() {
+    let error = guarded_relocation_error();
+    assert_eq!(
+        error.unsupported_reason(),
+        Some(bifrost_types::UnsupportedReason::ConditionalRelocation)
+    );
+    assert_eq!(
+        error.kind(),
+        &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+    );
 }

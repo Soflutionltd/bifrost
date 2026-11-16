@@ -1177,6 +1177,7 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             let mut builder =
                 AccountError::unsupported(AccountOperation::OpenBlobRange, protocol_for(ctx))
                     .into_builder()
+                    .unsupported_reason(bifrost_types::UnsupportedReason::RangeTransport)
                     .context(ctx.identity())
                     .text(DiagnosticText::support_only(format!(
                         "gmail blob {blob_id} does not support range reads"
@@ -2006,6 +2007,10 @@ mod tests {
             blob_id: "b1".to_owned(),
         });
         let acc = into_account_error(err, GmailErrorContext::open_blob_range());
+        assert_eq!(
+            acc.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::RangeTransport)
+        );
         assert!(matches!(
             acc.kind(),
             AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange)

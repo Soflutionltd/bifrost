@@ -227,16 +227,19 @@ async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_aft
         while done.len() < 2 {
             let event = receiver.recv().await.expect("event");
             if event.checkpoint.is_some() {
-                engine
-                    .ack(
-                        &id,
-                        event
-                            .ack_token()
-                            .cloned()
-                            .expect("acknowledgeable publication"),
-                    )
-                    .await
-                    .expect("ack");
+                assert_eq!(
+                    engine
+                        .ack(
+                            &id,
+                            event
+                                .ack_token()
+                                .cloned()
+                                .expect("acknowledgeable publication"),
+                        )
+                        .await
+                        .expect("ack"),
+                    bifrost_sync::AckOutcome::Durable,
+                );
             }
             if matches!(event.event.as_ref(), SyncEvent::Done(_)) {
                 done.insert(event.scope);

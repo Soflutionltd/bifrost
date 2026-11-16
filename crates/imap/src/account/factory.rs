@@ -44,6 +44,16 @@ fn discover_err(err: crate::Error) -> AccountError {
     account_error_with(err, ImapErrorContext::operation(AccountOperation::Discover))
 }
 
+// Admission is serialized only through the permit handoff. Registration must
+// remain possible while another open waits for capacity: an enterprise user
+// expects slow discovery on one connection not to block another available slot.
+#[derive(Default)]
+struct PoolIncarnations {
+    admission: tokio::sync::Mutex<()>,
+    pools: std::sync::Mutex<Vec<std::sync::Weak<Pool>>>,
+    registered: tokio::sync::Notify,
+}
+
 /// Configuration used by `ImapAccountFactory`.
 #[non_exhaustive]
 #[derive(Clone)]
@@ -192,7 +202,10 @@ impl ImapAccountFactory {
             Arc<ImapAccountConfig>,
             Option<bifrost_net::MeterSinkHandle>,
             bifrost_net::BandwidthBudget,
-        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>,
+            crate::connection::LeaseHandoff,
+        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>
+        + Send
+        + 'static,
     ) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let opening = self.open_concrete_using(account_id, default, connect);
         Box::pin(async move {
@@ -239,15 +252,128 @@ impl ImapAccountFactory {
             Arc<ImapAccountConfig>,
             Option<bifrost_net::MeterSinkHandle>,
             bifrost_net::BandwidthBudget,
-        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>,
+            crate::connection::LeaseHandoff,
+        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>
+        + Send
+        + 'static,
     ) -> AccountFuture<Result<(ImapAccount, Vec<SkippedScope>), AccountError>> {
         let cfg = Arc::clone(&self.cfg);
         let net = Arc::new(self.resolve_net(default));
         let bandwidth_budget = net.bandwidth_registry().budget(account_id.clone());
         let meter = meter_handle(&cfg, account_id.clone());
-        let connected = connect(Arc::clone(&cfg), meter.clone(), bandwidth_budget.clone());
+        let sessions = net
+            .bandwidth_registry()
+            .session_budget(account_id.clone(), cfg.session_cap());
+        let incarnation = net
+            .bandwidth_registry()
+            .session_state::<PoolIncarnations>(account_id.clone(), &sessions);
+        let cfg_for_connect = Arc::clone(&cfg);
+        let meter_for_connect = meter.clone();
+        let budget_for_connect = bandwidth_budget.clone();
         Box::pin(async move {
-            let conn = connected.await.map_err(discover_err)?;
+            let incarnation = incarnation.map_err(|error| {
+                discover_err(crate::Error::Internal {
+                    kind: crate::error::InternalFailure::Invariant(error.to_string()),
+                    mid_exchange: None,
+                })
+            })?;
+            let admission_timeout = cfg_for_connect.imap.command_timeout;
+            let admission_error = || {
+                discover_err(crate::Error::Transport {
+                    kind: crate::error::TransportFailure::Timeout,
+                    attempt: Some(bifrost_types::TransmissionState::Unsent),
+                })
+            };
+            let mut admission = Some(
+                tokio::time::timeout(admission_timeout, incarnation.admission.lock())
+                    .await
+                    .map_err(|_| admission_error())?,
+            );
+            // Keep every live pool in registration order. Enterprise users expect
+            // reconnect to reclaim idle capacity without interrupting work or push
+            // on another account incarnation sharing this provider budget.
+            incarnation
+                .pools
+                .lock()
+                .expect("pool registry lock poisoned")
+                .retain(|pool| pool.strong_count() != 0);
+            let permit = tokio::time::timeout(admission_timeout, async {
+                let acquire = Arc::clone(&sessions).acquire_owned();
+                tokio::pin!(acquire);
+                if let std::task::Poll::Ready(permit) = futures::poll!(&mut acquire) {
+                    return permit.expect("shared session budget is never closed");
+                }
+                'registry: loop {
+                    // Register the notification before reading the registry so
+                    // completion of an unlocked discovery cannot be missed.
+                    let registered = incarnation.registered.notified();
+                    tokio::pin!(registered);
+                    registered.as_mut().enable();
+                    let mut candidates: Vec<_> = {
+                        let mut previous = incarnation.pools.lock().expect("pool registry lock poisoned");
+                        previous.retain(|pool| pool.strong_count() != 0);
+                        previous.iter()
+                            .filter_map(std::sync::Weak::upgrade)
+                            .filter(|pool| pool.shares_sessions(&sessions))
+                            .map(|pool| Box::pin(pool.reclaim_member()))
+                            .collect()
+                    };
+                    while !candidates.is_empty() {
+                        // Poll in registration order. Claim a member
+                        // before retiring it, so a pending LOGOUT cannot cause a
+                        // second pool's parked member to be retired as well.
+                        let (member, index) = tokio::select! {
+                            biased;
+                            permit = &mut acquire => return permit.expect("shared session budget is never closed"),
+                            () = &mut registered => continue 'registry,
+                            result = futures::future::poll_fn(|cx| {
+                                for (index, candidate) in candidates.iter_mut().enumerate() {
+                                    if let std::task::Poll::Ready(member) =
+                                        std::future::Future::poll(candidate.as_mut(), cx)
+                                    {
+                                        return std::task::Poll::Ready((member, index));
+                                    }
+                                }
+                                std::task::Poll::Pending
+                            }) => result,
+                        };
+                        drop(candidates.remove(index));
+                        if let Ok(member) = member {
+                            // Losing waiters return any concurrent handoffs on Drop.
+                            drop(candidates);
+                            // The queued acquisition reserves our position in
+                            // the handoff. Release coordination before LOGOUT;
+                            // this claimed member cannot be retired twice.
+                            drop(admission.take());
+                            member.retire_for_admission().await;
+                            return acquire.await.expect("shared session budget is never closed");
+                        }
+                    }
+                    // Rebuild reclaim waiters if an open registered while this
+                    // admission was pending. Losing waiters return handoffs.
+                    drop(candidates);
+                    tokio::select! {
+                        biased;
+                        permit = &mut acquire => return permit.expect("shared session budget is never closed"),
+                        () = &mut registered => {},
+                    }
+                }
+            }).await.map_err(|_| admission_error())?;
+            drop(admission);
+            let leases = crate::connection::LeaseHandoff::new(vec![Box::new(permit)]);
+            let conn = connect(
+                cfg_for_connect,
+                meter_for_connect,
+                budget_for_connect,
+                leases.clone(),
+            )
+            .await
+            .map_err(discover_err)?;
+            // Production hands the lease to the driver before any later await.
+            // Test connectors can leave it here for adoption after returning.
+            for lease in leases.take() {
+                conn.driver_task().retain_until_exit(lease);
+            }
 
             let mut profile = conn.server_profile();
             let server_id = read_server_id(&conn, &cfg, &profile)
@@ -312,13 +438,20 @@ impl ImapAccountFactory {
                 &imap_mailboxes,
             );
             skipped_scopes.extend(dav_scope_skips);
-            let pool = Arc::new(Pool::new(
+            let pool = Arc::new(Pool::new_shared(
                 Arc::clone(&cfg),
                 conn,
                 super::pool::production_connector(),
                 meter,
                 bandwidth_budget.clone(),
+                sessions,
             ));
+            incarnation
+                .pools
+                .lock()
+                .expect("pool registry lock poisoned")
+                .push(Arc::downgrade(&pool));
+            incarnation.registered.notify_waiters();
             let account = ImapAccount::new(ImapAccountParts {
                 config: cfg,
                 capabilities: caps,
@@ -342,10 +475,17 @@ fn production_connect(
     cfg: Arc<ImapAccountConfig>,
     meter: Option<bifrost_net::MeterSinkHandle>,
     budget: bifrost_net::BandwidthBudget,
+    leases: crate::connection::LeaseHandoff,
 ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>> {
     Box::pin(async move {
         cfg.imap
-            .connect_authenticated_metered(&cfg.credentials, &cfg.auth_policy, meter, Some(budget))
+            .connect_authenticated_metered(
+                &cfg.credentials,
+                &cfg.auth_policy,
+                meter,
+                Some(budget),
+                &leases,
+            )
             .await
             .map(|(conn, _auth)| conn)
     })
@@ -637,6 +777,26 @@ pub(crate) struct SharedDiscovery {
     pub(crate) foreign_namespaces_advertised: bool,
 }
 
+fn unreadable_share_skip(
+    name: &crate::types::MailboxName,
+    owner: &bifrost_types::PrincipalId,
+) -> SkippedScope {
+    use bifrost_types::{AccessCause, AccountErrorBuilder, PrimaryCause};
+    let scope = super::folder_scope(name);
+    let error = AccountErrorBuilder::new(PrimaryCause::Access(AccessCause::PermissionDenied {
+        resource: Some(bifrost_types::ResourceKind::Mailbox),
+    }))
+    .operation(AccountOperation::Discover)
+    .scope(bifrost_types::ErrorScope::Cursor(scope.clone()))
+    .try_build()
+    .expect("ACL denial is a valid discovery error")
+    .revoke_foreign_scope(scope.clone(), Some(owner));
+    SkippedScope {
+        scope: bifrost_types::ErrorScope::Cursor(scope),
+        error,
+    }
+}
+
 /// Pure decision: does a NAMESPACE response advertise any non-empty
 /// foreign (other-user or shared) namespace root? Split out of
 /// `discover_shared_folders` so the flag's semantics are pinned by unit
@@ -792,7 +952,13 @@ pub(crate) async fn discover_shared_folders(
                 // authoritative).
                 match conn.my_rights(&info.name, cfg.imap.command_timeout).await {
                     Ok(wire) => {
-                        rights = Some(MailboxRights::parse(&wire));
+                        let parsed = MailboxRights::parse(&wire);
+                        if !parsed.can_read() {
+                            // An enterprise user needs an explicit coverage gap for
+                            // a listed share excluded by ACL, not silent absence.
+                            skipped_scopes.push(unreadable_share_skip(&info.name, &owner));
+                        }
+                        rights = Some(parsed);
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -839,6 +1005,449 @@ pub(crate) async fn list_folders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Install the same shared-budget pool that a successful factory open
+    // records, with a hermetic connector for the old account's next checkout.
+    async fn reopen_fixture() -> (
+        ImapAccountFactory,
+        AccountId,
+        Arc<Pool>,
+        tokio::io::DuplexStream,
+        super::super::test_support::ScriptedDials,
+    ) {
+        reopen_fixture_with_cap(1).await
+    }
+
+    async fn reopen_fixture_with_cap(
+        cap: usize,
+    ) -> (
+        ImapAccountFactory,
+        AccountId,
+        Arc<Pool>,
+        tokio::io::DuplexStream,
+        super::super::test_support::ScriptedDials,
+    ) {
+        use crate::connection::test_support::{driver_pair_leased, preauth_greeting};
+        let mut cfg = ImapAccountConfig::new(
+            ImapConfig::plaintext("imap.invalid"),
+            Credentials::password("user", "pass"),
+            AuthPolicy::default().allow_cleartext_without_tls(),
+        );
+        cfg.pool_cap = cap;
+        cfg.imap.keepalive = None;
+        cfg.imap.command_timeout = std::time::Duration::from_secs(10);
+        let script = bifrost_net::test_support::ScriptedDispatch::new([]);
+        let net = bifrost_net::test_support::scripted_net(&script, Default::default());
+        let factory = ImapAccountFactory::new(cfg).with_net(net);
+        let id = AccountId("reopen".to_owned());
+        let net = factory.resolve_net(|| unreachable!());
+        let sessions = net.bandwidth_registry().session_budget(id.clone(), cap);
+        let leases = crate::connection::LeaseHandoff::new(vec![Box::new(
+            Arc::clone(&sessions).try_acquire_owned().unwrap(),
+        )]);
+        let greeting = preauth_greeting("IMAP4rev1");
+        let (conn, peer) = driver_pair_leased(&greeting, &leases).await;
+        let (connector, dials) = super::super::test_support::scripted_connector(vec![
+            b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n".to_vec(),
+        ]);
+        let pool = Arc::new(Pool::new_shared(
+            Arc::clone(&factory.cfg),
+            conn,
+            connector,
+            None,
+            net.bandwidth_registry().budget(id.clone()),
+            Arc::clone(&sessions),
+        ));
+        *net.bandwidth_registry()
+            .session_state::<PoolIncarnations>(id.clone(), &sessions)
+            .unwrap()
+            .pools
+            .lock()
+            .unwrap() = vec![Arc::downgrade(&pool)];
+        (factory, id, pool, peer, dials)
+    }
+
+    async fn answer_reopen_logout(peer: &mut tokio::io::DuplexStream) {
+        use crate::connection::test_support::{read_line, respond, tag_of};
+        let command = read_line(peer).await;
+        assert!(command.contains(" LOGOUT"));
+        respond(
+            peer,
+            &format!("* BYE closing\r\n{} OK logout\r\n", tag_of(&command)),
+        )
+        .await;
+    }
+
+    // A primed connection with discovery and replacement handled in memory.
+    async fn replaceable_connection(
+        budget: bifrost_net::BandwidthBudget,
+    ) -> Result<crate::ImapConnection, crate::Error> {
+        use crate::connection::test_support::{
+            driver_pair_metered, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget).await;
+        tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            assert!(command.contains(" LIST "));
+            respond(&mut peer, &format!("{} OK listed\r\n", tag_of(&command))).await;
+            answer_reopen_logout(&mut peer).await;
+        });
+        Ok(conn)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_open_does_not_block_spare_capacity_when_old_pool_drops() {
+        let (factory, id, pool, peer, _dials) = reopen_fixture_with_cap(3).await;
+        let net = factory.resolve_net(|| unreachable!());
+        let sessions = net.bandwidth_registry().session_budget(id.clone(), 3);
+        let state = net
+            .bandwidth_registry()
+            .session_state::<PoolIncarnations>(id.clone(), &sessions)
+            .unwrap();
+        let weak = Arc::downgrade(&pool);
+        let timeout = factory.cfg.imap.command_timeout;
+        let mut first = factory.open_concrete_using(
+            id.clone(),
+            || unreachable!(),
+            move |_, _, budget, _leases| {
+                Box::pin(async move {
+                    tokio::time::sleep(timeout * 3).await;
+                    replaceable_connection(budget).await
+                })
+            },
+        );
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        // The first open already owns a permit but has not registered a pool.
+        assert_eq!(sessions.available_permits(), 1);
+        drop(pool);
+        drop(peer);
+        assert!(weak.upgrade().is_none());
+        let mut second = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            move |_, _, budget, _leases| {
+                Box::pin(async move {
+                    // Stay pending beyond the lock timeout, while the first open
+                    // remains in connect. Available capacity must remain usable.
+                    tokio::time::sleep(timeout * 2).await;
+                    replaceable_connection(budget).await
+                })
+            },
+        );
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        tokio::time::advance(timeout * 2).await;
+        let (second, _) = second
+            .await
+            .expect("slow concurrent connect must not time out on coordination");
+        let (first, _) = first.await.unwrap();
+        let registrations = state.pools.lock().unwrap();
+        assert_eq!(registrations.len(), 2, "dead old pool must be pruned");
+        assert!(registrations[0].ptr_eq(&Arc::downgrade(&second.inner.pool)));
+        assert!(registrations[1].ptr_eq(&Arc::downgrade(&first.inner.pool)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn racing_opens_reclaim_pool_registered_during_capacity_wait() {
+        let (factory, id, pool, mut peer, _dials) = reopen_fixture().await;
+        let net = factory.resolve_net(|| unreachable!());
+        let sessions = net.bandwidth_registry().session_budget(id.clone(), 1);
+        let (release, ready) = tokio::sync::oneshot::channel::<()>();
+        let first = factory.open_concrete_using(
+            id.clone(),
+            || unreachable!(),
+            move |_, _, budget, _leases| {
+                Box::pin(async move {
+                    ready.await.unwrap();
+                    replaceable_connection(budget).await
+                })
+            },
+        );
+        let first = tokio::spawn(first);
+        answer_reopen_logout(&mut peer).await;
+        // Finish the retirement and enter the deliberately blocked connect.
+        tokio::task::yield_now().await;
+        assert_eq!(sessions.available_permits(), 0);
+        let mut second = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, budget, _leases| Box::pin(replaceable_connection(budget)),
+        );
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        release.send(()).unwrap();
+        let (first, _) = first.await.unwrap().unwrap();
+        let (second, _) = second
+            .await
+            .expect("registration must wake the capacity waiter");
+        assert_eq!(sessions.available_permits(), 0);
+        assert!(pool.parked_selection().is_empty());
+        assert!(first.inner.pool.parked_selection().is_empty());
+        assert_eq!(second.inner.pool.parked_selection().len(), 1);
+        assert!(!pool.is_closed());
+        assert!(!first.inner.pool.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reopen_connect_failure_at_cap_keeps_old_pool_usable() {
+        let (factory, id, pool, mut peer, mut dials) = reopen_fixture().await;
+        assert_eq!(pool.available_sessions(), 0);
+        let opening = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, _, _leases| {
+                Box::pin(async {
+                    Err(crate::Error::Transport {
+                        kind: crate::error::TransportFailure::Io(crate::error::IoFailure(
+                            Arc::new(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "replacement connect refused",
+                            )),
+                        )),
+                        attempt: Some(bifrost_types::TransmissionState::Unsent),
+                    })
+                })
+            },
+        );
+        let (result, ()) = tokio::join!(opening, answer_reopen_logout(&mut peer));
+        assert!(result.is_err());
+        assert!(!pool.is_closed());
+        assert!(pool.parked_selection().is_empty());
+        // The only parked session was retired. Success must come from a
+        // fresh dial, proving failed replacement released its reservation.
+        let script = async {
+            use crate::connection::test_support::{read_line, respond, tag_of};
+            let mut peer = dials.servers.recv().await.unwrap();
+            let auth = read_line(&mut peer).await;
+            assert!(auth.contains("AUTHENTICATE PLAIN"));
+            respond(
+                &mut peer,
+                &format!(
+                    "{} OK [CAPABILITY IMAP4rev1] authenticated\r\n",
+                    tag_of(&auth),
+                ),
+            )
+            .await;
+            peer
+        };
+        let (checked_out, _redial_peer) = tokio::join!(pool.checkout_any(), script);
+        let checked_out = checked_out.unwrap();
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(checked_out.connection().is_alive());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_factory_reclaims_parked_session_from_shared_net() {
+        let (original, id, pool, mut peer, _dials) = reopen_fixture().await;
+        let factory = ImapAccountFactory::new((*original.cfg).clone())
+            .with_net(original.resolve_net(|| unreachable!()));
+        drop(original);
+        let opening = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, budget, _leases| Box::pin(bandwidth_connection(budget)),
+        );
+        let result = tokio::time::timeout(factory.cfg.imap.command_timeout, async {
+            tokio::join!(opening, answer_reopen_logout(&mut peer)).0
+        })
+        .await
+        .expect("fresh factory must find the parked pool");
+        assert!(result.is_ok());
+        assert!(!pool.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reopen_reclaims_oldest_pool_even_when_latest_is_busy() {
+        use crate::connection::test_support::{driver_pair_leased, preauth_greeting};
+        for latest_busy in [true, false] {
+            let (factory, id, oldest, mut peer, _dials) = reopen_fixture_with_cap(2).await;
+            let net = factory.resolve_net(|| unreachable!());
+            let sessions = net.bandwidth_registry().session_budget(id.clone(), 2);
+            let leases = crate::connection::LeaseHandoff::new(vec![Box::new(
+                Arc::clone(&sessions).try_acquire_owned().unwrap(),
+            )]);
+            let greeting = preauth_greeting("IMAP4rev1");
+            let (conn, _latest_peer) = driver_pair_leased(&greeting, &leases).await;
+            let (connector, _latest_dials) =
+                super::super::test_support::scripted_connector(vec![greeting]);
+            let latest = Arc::new(Pool::new_shared(
+                Arc::clone(&factory.cfg),
+                conn,
+                connector,
+                None,
+                net.bandwidth_registry().budget(id.clone()),
+                Arc::clone(&sessions),
+            ));
+            let state = net
+                .bandwidth_registry()
+                .session_state::<PoolIncarnations>(id.clone(), &sessions)
+                .unwrap();
+            state.pools.lock().unwrap().push(Arc::downgrade(&latest));
+            let held = if latest_busy {
+                Some(latest.checkout_any().await.unwrap())
+            } else {
+                None
+            };
+            let start = tokio::time::Instant::now();
+            let opening = factory.open_concrete_using(
+                id,
+                || unreachable!(),
+                |_, _, budget, _| Box::pin(bandwidth_connection(budget)),
+            );
+            let result = tokio::time::timeout(factory.cfg.imap.command_timeout, async {
+                tokio::join!(opening, answer_reopen_logout(&mut peer)).0
+            })
+            .await
+            .expect("older parked capacity must be reclaimed before timeout");
+            assert!(result.is_ok());
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert!(oldest.parked_selection().is_empty());
+            assert!(!oldest.is_closed());
+            assert!(!latest.is_closed());
+            if let Some(held) = held {
+                assert!(held.connection().is_alive());
+            } else {
+                assert_eq!(latest.parked_selection().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_admission_returns_member_handed_off_before_repoll() {
+        let (factory, id, pool, _peer, _dials) = reopen_fixture().await;
+        let held = pool.checkout_any().await.unwrap();
+        let connection = std::ptr::from_ref(held.connection());
+        let mut opening = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, _, _| unreachable!("cancelled before dial"),
+        );
+        assert!(futures::poll!(opening.as_mut()).is_pending());
+        drop(held);
+        // The return has delivered into the reclaimer's channel, but the
+        // future has not polled it. Cancellation must put that member back.
+        drop(opening);
+        let checked_out = pool.checkout_any().await.unwrap();
+        assert!(std::ptr::eq(checked_out.connection(), connection));
+        assert!(checked_out.connection().is_alive());
+        assert!(!pool.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_wait_does_not_pin_dropped_pool_and_reopen_prunes_it() {
+        let (factory, id, pool, mut peer, _dials) = reopen_fixture().await;
+        let held = pool.checkout_any().await.unwrap();
+        let weak = Arc::downgrade(&pool);
+        let mut opening = factory.open_concrete_using(
+            id.clone(),
+            || unreachable!(),
+            |_, _, budget, _| Box::pin(bandwidth_connection(budget)),
+        );
+        assert!(futures::poll!(opening.as_mut()).is_pending());
+        drop(pool);
+        assert!(
+            weak.upgrade().is_none(),
+            "admission must not pin the pool registration"
+        );
+        // Returning a checkout while its pool owner disappears must still
+        // satisfy the in-flight reclaimer through the inner pool lifetime.
+        drop(held);
+        let (result, ()) = tokio::join!(opening, answer_reopen_logout(&mut peer));
+        let (replacement, _) = result.unwrap();
+        let net = factory.resolve_net(|| unreachable!());
+        let sessions = net.bandwidth_registry().session_budget(id.clone(), 1);
+        let state = net
+            .bandwidth_registry()
+            .session_state::<PoolIncarnations>(id.clone(), &sessions)
+            .unwrap();
+        let mut next = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, _, _| unreachable!("cancelled before dial"),
+        );
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        drop(next);
+        let registrations = state.pools.lock().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert!(registrations[0].ptr_eq(&Arc::downgrade(&replacement.inner.pool)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reopen_without_a_live_pool_bounds_session_admission() {
+        let (factory, id, pool, _peer, _dials) = reopen_fixture().await;
+        let net = factory.resolve_net(|| unreachable!());
+        let sessions = net.bandwidth_registry().session_budget(id.clone(), 1);
+        let state = net
+            .bandwidth_registry()
+            .session_state::<PoolIncarnations>(id.clone(), &sessions)
+            .unwrap();
+        // Model an unregistered transport tail holding the last permit.
+        state.pools.lock().unwrap().clear();
+        let opening = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            |_, _, _, _| unreachable!("no capacity to dial"),
+        );
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(factory.cfg.imap.command_timeout * 2, opening)
+            .await
+            .expect("admission must return its own timeout");
+        let error = result.err().expect("no capacity");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Timeout,)
+        );
+        assert_eq!(start.elapsed(), factory.cfg.imap.command_timeout);
+        assert!(!pool.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reopen_parked_session_at_cap_succeeds_before_old_pool_closes() {
+        let (factory, id, pool, mut peer, _dials) = reopen_fixture().await;
+        let factory = ImapAccountFactory::new((*factory.cfg).clone())
+            .with_net(factory.resolve_net(|| unreachable!()));
+        assert_eq!(pool.parked_selection().len(), 1);
+        assert_eq!(pool.available_sessions(), 0);
+        let old = Arc::clone(&pool);
+        let opening = factory.open_concrete_using(
+            id,
+            || unreachable!(),
+            move |_, _, budget, _leases| {
+                assert!(
+                    !old.is_closed(),
+                    "replacement must dial before old pool closes"
+                );
+                Box::pin(bandwidth_connection(budget))
+            },
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(opening, answer_reopen_logout(&mut peer))
+        })
+        .await
+        .expect("a fresh factory must reclaim the parked session");
+        let (replacement, skips) = result.unwrap();
+        assert!(skips.is_empty());
+        assert!(!pool.is_closed());
+        assert!(pool.parked_selection().is_empty());
+        let checked_out = replacement.inner.pool.checkout_any().await.unwrap();
+        assert!(checked_out.connection().is_alive());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reopen_held_session_times_out_without_closing_old_pool() {
+        let (factory, id, pool, _peer, _dials) = reopen_fixture().await;
+        let held = pool.checkout_any().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let result = factory
+            .open_concrete_using(
+                id,
+                || unreachable!(),
+                |_, _, _, _| unreachable!("no capacity to dial"),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), factory.cfg.imap.command_timeout);
+        assert!(!pool.is_closed());
+        assert!(held.connection().is_alive());
+    }
 
     #[test]
     fn push_capacity_is_carved_out_of_pool_cap() {
@@ -974,7 +1583,7 @@ mod tests {
                                 );
                                 net.clone()
                             },
-                            |_, _, budget| Box::pin(bandwidth_connection(budget)),
+                            |_, _, budget, _leases| Box::pin(bandwidth_connection(budget)),
                         )
                         .await
                         .unwrap();
@@ -1245,6 +1854,43 @@ mod tests {
             skipped.len(),
             1,
             "the sub-account's own skip must reach the composed lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_excluded_share_retains_a_classified_discovery_skip() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1 NAMESPACE ACL")).await;
+        let server = tokio::spawn(async move {
+            for response in [
+                "* NAMESPACE NIL NIL ((\"Shared/\" \"/\"))\r\n",
+                "* LIST () \"/\" \"Shared/Inbox\"\r\n",
+                "* MYRIGHTS Shared/Inbox l\r\n",
+            ] {
+                let command = read_line(&mut peer).await;
+                respond(
+                    &mut peer,
+                    &format!("{response}{} OK done\r\n", tag_of(&command)),
+                )
+                .await;
+            }
+        });
+        let discovery =
+            discover_shared_folders(&conn, &bandwidth_config(false), &conn.server_profile()).await;
+        server.await.unwrap();
+        assert_eq!(discovery.entries.len(), 1);
+        assert_eq!(discovery.skipped_scopes.len(), 1);
+        assert_eq!(
+            discovery.skipped_scopes[0].scope,
+            bifrost_types::ErrorScope::Cursor(super::super::folder_scope(
+                &crate::types::MailboxName::new("Shared/Inbox").unwrap()
+            ))
+        );
+        assert_eq!(
+            discovery.skipped_scopes[0].error.operation(),
+            Some(AccountOperation::Discover)
         );
     }
 

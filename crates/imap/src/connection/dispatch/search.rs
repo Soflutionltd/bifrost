@@ -44,7 +44,10 @@ impl<I: crate::types::search::SearchAddress> SearchConsumer<I> {
 
     fn expand(&self, response: &EsearchResponse) -> Result<SearchResult<I>, Error> {
         // An enterprise user must never act on sequence numbers interpreted
-        // as UIDs. ESEARCH's explicit wire unit must agree with the command.
+        // as UIDs. Absence of UID means sequence addressing on the wire;
+        // even a correlated reply cannot establish that a lenient server
+        // intended UIDs. Refuse it rather than open or mutate the wrong mail.
+        // ESEARCH's wire unit must agree with the command.
         if response.is_uid() != I::UID {
             return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
                 "ESEARCH addressing disagrees with the SEARCH command".into(),

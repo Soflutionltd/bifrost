@@ -12,6 +12,8 @@ use futures::stream::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
+type FactoryRefusals = Arc<std::sync::Mutex<HashMap<AccountId, crate::client::MethodRefusals>>>;
+
 type JmapMailAccount<T> = crate::account::Account<T, capability::Mail>;
 use crate::client::{Client, Credentials};
 use crate::core::capability;
@@ -44,6 +46,7 @@ pub struct JmapAccountFactoryBuilder {
     timeout: Option<Duration>,
     accept_invalid_certs: bool,
     reconnect_policy: ReconnectPolicy,
+    method_refusals: FactoryRefusals,
 }
 
 impl std::fmt::Debug for JmapAccountFactoryBuilder {
@@ -92,6 +95,23 @@ impl std::fmt::Debug for JmapCredentials {
 }
 
 impl JmapAccountFactory {
+    /// Forget refusal history when permanently removing an engine account.
+    /// Do not call during restart: unchanged rediscovery must still converge.
+    pub fn forget_account(&self, account_id: &AccountId) {
+        if let Some(history) = self
+            .config
+            .method_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(account_id)
+        {
+            history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
     pub fn new(url: impl Into<String>, credentials: JmapCredentials) -> Self {
         Self {
             config: JmapAccountFactoryBuilder::new(url, credentials),
@@ -117,6 +137,16 @@ impl JmapAccountFactory {
 }
 
 impl JmapAccountFactoryBuilder {
+    fn refusals_for(&self, account_id: AccountId) -> crate::client::MethodRefusals {
+        Arc::clone(
+            self.method_refusals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(account_id)
+                .or_default(),
+        )
+    }
+
     pub fn new(url: impl Into<String>, credentials: JmapCredentials) -> Self {
         Self {
             url: url.into(),
@@ -134,6 +164,7 @@ impl JmapAccountFactoryBuilder {
             timeout: None,
             accept_invalid_certs: false,
             reconnect_policy: ReconnectPolicy::default(),
+            method_refusals: Default::default(),
         }
     }
 
@@ -856,9 +887,10 @@ async fn connect(
     config: JmapAccountFactoryBuilder,
     account_id: AccountId,
 ) -> crate::Result<Client> {
+    let refusals = config.refusals_for(account_id.clone());
     let mut builder = Client::new()
         .credentials(config.credentials.into_client_credentials())
-        .net_account_id(account_id)
+        .net_account_id(account_id.clone())
         .accept_invalid_certs(config.accept_invalid_certs);
     if let Some(net) = config.net {
         builder = builder.net(net);
@@ -866,7 +898,10 @@ async fn connect(
     if let Some(timeout) = config.timeout {
         builder = builder.timeout(timeout);
     }
-    builder.connect(&config.url).await
+    let mut client = builder.connect(&config.url).await?;
+    client.method_refusals = refusals;
+    client.observe_refusal_capabilities();
+    Ok(client)
 }
 
 impl JmapCredentials {
@@ -1362,6 +1397,248 @@ mod tests {
         replies: impl IntoIterator<Item = ScriptedReply>,
     ) -> Client<ScriptedTransport> {
         scripted_client_with_session(session(), replies)
+    }
+
+    #[tokio::test]
+    async fn successful_method_clears_only_its_native_account_refusal() {
+        let client = scripted_client([
+            method_reply(vec![json!(["error", {"type": "unknownMethod"}, "s0"])]),
+            method_reply(vec![email_result("primary", "ok", "s0")]),
+            method_reply(vec![json!(["error", {"type": "unknownMethod"}, "s0"])]),
+        ]);
+        let mail = client.primary_account::<capability::Mail>().unwrap();
+        let other = ("other".to_string(), "Email/get");
+        client.method_refusals.lock().unwrap().insert(other.clone());
+        for attempt in 0..3 {
+            let mut request = mail.build();
+            let handle = request.call(EmailGet::new()).unwrap();
+            let mut response = request.send().await.unwrap();
+            if attempt == 1 {
+                response.get(&handle).unwrap();
+                assert!(
+                    !client
+                        .method_refusals
+                        .lock()
+                        .unwrap()
+                        .contains(&(mail.id().to_string(), "Email/get"))
+                );
+            } else {
+                let crate::Error::Method(error) = response.get(&handle).unwrap_err() else {
+                    panic!("expected method refusal");
+                };
+                assert!(!error.repeated_unknown_method);
+            }
+        }
+        assert!(client.method_refusals.lock().unwrap().contains(&other));
+    }
+
+    #[tokio::test]
+    async fn changed_capabilities_clear_refusals_but_unchanged_rediscovery_does_not() {
+        let config =
+            JmapAccountFactoryBuilder::new("https://example.test", JmapCredentials::bearer("test"));
+        let account_id = AccountId("upgrade".to_string());
+        for attempt in 0..4 {
+            let mut advertised = serde_json::to_value(session()).unwrap();
+            if attempt >= 2 {
+                advertised["accounts"]["primary"]["accountCapabilities"]["urn:example:upgrade"] =
+                    json!({});
+            }
+            let mut client = scripted_client_with_session(
+                serde_json::from_value(advertised).unwrap(),
+                [method_reply(vec![
+                    json!(["error", {"type": "unknownMethod"}, "s0"]),
+                ])],
+            );
+            client.method_refusals = config.refusals_for(account_id.clone());
+            client.observe_refusal_capabilities();
+            let mail = client.primary_account::<capability::Mail>().unwrap();
+            let mut request = mail.build();
+            let handle = request.call(EmailGet::new()).unwrap();
+            let mut response = request.send().await.unwrap();
+            let crate::Error::Method(error) = response.get(&handle).unwrap_err() else {
+                panic!("expected method refusal");
+            };
+            assert_eq!(error.repeated_unknown_method, attempt % 2 == 1);
+        }
+    }
+
+    #[test]
+    fn permanent_account_removal_and_factory_drop_prune_refusals() {
+        let factory =
+            JmapAccountFactory::new("https://example.test", JmapCredentials::bearer("test"));
+        let removed = AccountId("removed".to_string());
+        let retained = AccountId("retained".to_string());
+        let history = factory.config.refusals_for(removed.clone());
+        history
+            .lock()
+            .unwrap()
+            .insert(("primary".to_string(), "Email/get"));
+        let retained_history = factory.config.refusals_for(retained.clone());
+        retained_history
+            .lock()
+            .unwrap()
+            .insert(("primary".to_string(), "Email/get"));
+        factory.clone().forget_account(&removed);
+        assert!(history.lock().unwrap().is_empty());
+        let entries = factory.config.method_refusals.lock().unwrap();
+        assert!(!entries.contains_key(&removed));
+        assert!(entries.contains_key(&retained));
+        drop(entries);
+        let weak = Arc::downgrade(&retained_history);
+        drop(retained_history);
+        drop(factory);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_unknown_method_converges_across_fresh_clients() {
+        let config =
+            JmapAccountFactoryBuilder::new("https://example.test", JmapCredentials::bearer("test"));
+        let account_id = AccountId("test".to_string());
+        for attempt in 0..3 {
+            // Each open rediscovers the same capability advertisement, but
+            // creates a fresh protocol client, just as the production factory.
+            let mut client = scripted_client([method_reply(vec![json!([
+                "error", {"type": "unknownMethod"}, "s0"
+            ])])]);
+            client.method_refusals = config.clone().refusals_for(account_id.clone());
+            client.observe_refusal_capabilities();
+            let mail = client.primary_account::<capability::Mail>().unwrap();
+            let mut request = mail.build();
+            let handle = request.call(EmailGet::new()).unwrap();
+            let mut response = request.send().await.unwrap();
+            let native = response.get(&handle).unwrap_err();
+            let error = super::super::error::into_account_error(
+                native,
+                super::super::error::JmapErrorContext::new(
+                    bifrost_types::AccountOperation::SyncChanges,
+                ),
+            );
+            if attempt == 0 {
+                assert_eq!(
+                    error.recovery(),
+                    &bifrost_types::RecoveryClass::Engine(
+                        bifrost_types::EngineDirective::RestartAccount,
+                    )
+                );
+            } else {
+                assert_eq!(
+                    error.kind(),
+                    &bifrost_types::AccountErrorKind::Unsupported(
+                        bifrost_types::AccountOperation::SyncChanges,
+                    )
+                );
+                assert!(error.recovery().is_terminal());
+            }
+            assert!(
+                error
+                    .support_internal()
+                    .chain
+                    .iter()
+                    .any(|cause| cause.native_code == Some("unknownMethod"))
+            );
+            assert!(error.chain().iter().any(|cause| matches!(cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+            )));
+        }
+    }
+
+    /// Rediscovery keeps advertising the method, so only factory history
+    /// can stop the implicit response from requesting another account restart.
+    #[tokio::test]
+    async fn implicit_unknown_method_converges_and_shares_explicit_history() {
+        use crate::email::EmailSet;
+        use crate::email_submission::EmailSubmissionSet;
+
+        let config =
+            JmapAccountFactoryBuilder::new("https://example.test", JmapCredentials::bearer("test"));
+        let account_id = AccountId("test".to_string());
+        for attempt in 0..4 {
+            // Fresh clients model reopening after rediscovery. The final
+            // attempt uses an explicit Email/set to pin the shared history.
+            let replies = if attempt < 3 {
+                vec![
+                    json!(["EmailSubmission/set", {
+                        "accountId": "primary", "oldState": "s1", "newState": "s2"
+                    }, "s0"]),
+                    json!(["error", {"type": "unknownMethod"}, "s0"]),
+                ]
+            } else {
+                vec![json!(["error", {"type": "unknownMethod"}, "s0"])]
+            };
+            let mut advertised = serde_json::to_value(session()).unwrap();
+            advertised["capabilities"]["urn:ietf:params:jmap:submission"] = json!({});
+            advertised["accounts"]["primary"]["accountCapabilities"]["urn:ietf:params:jmap:submission"] =
+                json!({});
+            advertised["primaryAccounts"]["urn:ietf:params:jmap:submission"] = json!("primary");
+            let mut client = scripted_client_with_session(
+                serde_json::from_value(advertised).unwrap(),
+                [method_reply(replies)],
+            );
+            client.method_refusals = config.clone().refusals_for(account_id.clone());
+            client.observe_refusal_capabilities();
+            let mail = client.primary_account::<capability::Mail>().unwrap();
+            let mut request = mail.build();
+            let native = if attempt < 3 {
+                let submission = client.primary_account::<capability::Submission>().unwrap();
+                let mut request = submission.build();
+                let handle = request.call(EmailSubmissionSet::new()).unwrap();
+                let mut response = request.send().await.unwrap();
+                response.get(&handle).unwrap();
+                response.get_method::<EmailSet>(&handle).unwrap_err()
+            } else {
+                let handle = request.call(EmailSet::new()).unwrap();
+                let mut response = request.send().await.unwrap();
+                response.get(&handle).unwrap_err()
+            };
+            let error = super::super::error::into_account_error(
+                native,
+                super::super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Send),
+            );
+            if attempt == 0 {
+                assert_eq!(
+                    error.kind(),
+                    &bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::CapabilityChanged,
+                    )
+                );
+                assert_eq!(
+                    error.recovery(),
+                    &bifrost_types::RecoveryClass::Engine(
+                        bifrost_types::EngineDirective::RestartAccount,
+                    )
+                );
+            } else {
+                assert_eq!(
+                    error.kind(),
+                    &bifrost_types::AccountErrorKind::Unsupported(
+                        bifrost_types::AccountOperation::Send,
+                    )
+                );
+                assert!(error.recovery().is_terminal());
+            }
+            assert!(
+                error
+                    .support_internal()
+                    .chain
+                    .iter()
+                    .any(|cause| cause.native_code == Some("unknownMethod"))
+            );
+            assert!(error.chain().iter().any(|cause| matches!(cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+            )));
+            if attempt == 3 {
+                let history = client.method_refusals.lock().unwrap();
+                assert_eq!(
+                    history.len(),
+                    1,
+                    "implicit and explicit methods share one entry"
+                );
+                assert!(history.contains(&(mail.id().to_string(), "Email/set")));
+            }
+        }
     }
 
     #[tokio::test]

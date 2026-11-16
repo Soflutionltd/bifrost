@@ -185,6 +185,8 @@ async fn a_reset_between_partitions_stops_the_walk_it_invalidated() {
                 .expect("a checkpointed page carries its publication");
             assert!(event.checkpoint.is_some(), "a checkpointed page");
             let _ = page_tx.send(event.scope.cursor().expect("cursor event").clone());
+            // This reader only drains capacity while the test checks producer
+            // scope ownership. Reset may fence the ack; durability is irrelevant.
             let _ = reader_engine.ack(&reader_account, publication).await;
         }
     });

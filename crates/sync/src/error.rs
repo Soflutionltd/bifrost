@@ -139,6 +139,7 @@ pub enum AckRejection {
 /// Enterprise consumers need the distinction before claiming sync is durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[must_use = "inspect whether acknowledgement became durable or completion was withheld"]
 pub enum AckOutcome {
     /// Checkpoint-free repair delivery accepted; no checkpoint was offered.
     RepairAccepted,

@@ -88,11 +88,11 @@ async fn result_mutations_share_modseq_conflicts_and_committed_subsets() {
         let ids = [1, 2]
             .into_iter()
             .map(|uid| {
-                DecodedObjectId::canonical(
-                    folder.clone(),
-                    crate::types::UidValidity::new(7).expect("nonzero epoch"),
-                    crate::types::Uid::new(uid).expect("nonzero test UID"),
+                super::super::decode_object_id(
+                    &bifrost_types::ObjectId(format!("imap1:5:INBOX:7:{uid}")),
+                    AccountOperation::SetIsRead,
                 )
+                .unwrap()
             })
             .collect();
         let op = if delete {
@@ -126,6 +126,18 @@ async fn result_mutations_share_modseq_conflicts_and_committed_subsets() {
             })
         );
         assert_eq!(steps[0].targets().refs.len(), 1);
+        assert_eq!(
+            steps[0].targets().refs[0].scope,
+            ErrorScope::Message {
+                id: bifrost_types::ObjectId("imap1:5:INBOX:7:1".into())
+            },
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().primary().targets.refs[0].scope,
+            ErrorScope::Message {
+                id: bifrost_types::ObjectId("imap1:5:INBOX:7:2".into())
+            },
+        );
         assert_eq!(
             account
                 .folders
@@ -242,6 +254,12 @@ async fn partial_commit_copy_messages_second_folder_failure_keeps_first() {
     let account = ImapAccount::new(scripted_account_parts(conn, 1));
     let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
+        let first_folder = select
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
         respond(&mut server,&format!("* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",tag_of(&select))).await;
         let copy = read_line(&mut server).await;
         assert!(copy.contains("UID COPY"));
@@ -253,16 +271,16 @@ async fn partial_commit_copy_messages_second_folder_failure_keeps_first() {
             &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&select)),
         )
         .await;
-        server
+        (server, first_folder)
     });
     let ids = ["A", "B"]
         .into_iter()
         .map(|name| {
-            DecodedObjectId::canonical(
-                MailboxName::new(name).unwrap(),
-                crate::types::UidValidity::new(7).expect("nonzero epoch"),
-                crate::types::Uid::new(1).expect("valid protocol test value"),
+            super::super::decode_object_id(
+                &bifrost_types::ObjectId(format!("imap1:1:{name}:7:1")),
+                AccountOperation::AddToContainer,
             )
+            .unwrap()
         })
         .collect();
     let failure = match copy_messages(
@@ -276,11 +294,17 @@ async fn partial_commit_copy_messages_second_folder_failure_keeps_first() {
         Err(f) => f,
         Ok(_) => panic!("second folder refused"),
     };
+    let (_server, first_folder) = script.await.unwrap();
     let error = folder_progress_error(failure);
     assert_eq!(error.partial_commit().unwrap().steps().len(), 1);
+    assert_eq!(
+        error.partial_commit().unwrap().steps()[0].targets().refs[0].scope,
+        ErrorScope::Message {
+            id: bifrost_types::ObjectId(format!("imap1:1:{first_folder}:7:1"))
+        },
+    );
     assert_eq!(error.partial_commit().unwrap().primary().effect, None);
     assert!(error.recovery().requires_reconciliation());
-    let _server = script.await.unwrap();
 }
 
 async fn composed_failure(delete: bool) -> AccountError {

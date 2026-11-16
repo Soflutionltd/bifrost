@@ -497,35 +497,56 @@ fn render_message(
     Ok(URL_SAFE_NO_PAD.encode(&raw))
 }
 
+fn refusal(
+    operation: bifrost_types::AccountOperation,
+    reason: bifrost_types::UnsupportedReason,
+) -> AccountError {
+    unsupported(operation)
+        .into_builder()
+        .unsupported_reason(reason)
+        .try_build()
+        .expect("valid reason on unsupported refusal")
+}
+
 /// Gmail's REST API has no scheduled-send lever; a scheduled request is
 /// rejected `Unsupported(Send)` rather than silently sent now.
 fn scheduled_send_guard(request: &SendRequest) -> Option<AccountError> {
-    request
-        .scheduled
-        .is_some()
-        .then(|| unsupported(bifrost_types::AccountOperation::Send))
+    request.scheduled.is_some().then(|| {
+        refusal(
+            bifrost_types::AccountOperation::Send,
+            bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
+        )
+    })
 }
 
 pub(crate) fn cancel_scheduled_send_unsupported() -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async {
-        Err(unsupported(
+        Err(refusal(
             bifrost_types::AccountOperation::CancelScheduledSend,
+            bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
         ))
     })
 }
 
 pub(crate) fn reschedule_send_unsupported() -> AccountFuture<Result<ObjectId, AccountError>> {
-    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RescheduleSend)) })
+    Box::pin(async {
+        Err(refusal(
+            bifrost_types::AccountOperation::RescheduleSend,
+            bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
+        ))
+    })
 }
 
 /// Gmail has no delegate-send REST surface in scope; a `send_as`
 /// request is rejected `Unsupported(Send)` rather than silently sent
 /// from the authenticated user's own mailbox.
 fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
-    request
-        .send_as
-        .is_some()
-        .then(|| unsupported(bifrost_types::AccountOperation::Send))
+    request.send_as.is_some().then(|| {
+        refusal(
+            bifrost_types::AccountOperation::Send,
+            bifrost_types::UnsupportedReason::SendAsUnavailable,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -700,6 +721,10 @@ mod tests {
         let mut request = SendRequest::default();
         request.scheduled = Some(std::time::SystemTime::now() + Duration::from_secs(600));
         let err = scheduled_send_guard(&request).expect("scheduled request must be rejected");
+        assert_eq!(
+            err.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::ScheduledSendUnavailable)
+        );
         assert!(matches!(
             err.kind(),
             bifrost_types::AccountErrorKind::Unsupported(bifrost_types::AccountOperation::Send)
@@ -716,6 +741,10 @@ mod tests {
             "shared@contoso.com".to_string(),
         )));
         let err = send_as_guard(&request).expect("send_as request must be rejected");
+        assert_eq!(
+            err.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::SendAsUnavailable)
+        );
         assert!(matches!(
             err.kind(),
             bifrost_types::AccountErrorKind::Unsupported(bifrost_types::AccountOperation::Send)

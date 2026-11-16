@@ -911,6 +911,10 @@ their Account impls. Calendar DAV support is separate in
 
 ## Unsupported error construction
 
+Contact relocation with a caller-supplied version guard carries
+`UnsupportedReason::ConditionalRelocation`: the relocation path cannot preserve
+that precondition. It retains the existing Unsupported(ContactUpdate) refusal.
+
 Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::CardDav`, including for inherited

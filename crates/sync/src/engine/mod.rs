@@ -421,27 +421,26 @@ impl DetachingAccount {
         // have left.
         let writer_deadline = tokio::time::Instant::now() + timeout;
         if let Some(writer) = teardown_writer {
-            for scope in slot.coverage.take_backfill_discards() {
-                let recv = match tokio::time::timeout_at(
-                    writer_deadline,
-                    writer.enqueue_discard(scope.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(recv)) => recv,
-                    // The writer is already gone: nothing left to settle to.
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            account = ?account_id,
-                            scope = ?scope,
-                            "detach timeout reached before the writer accepted the discard \
-                             of a walk that lost pages; a later attach may resume past them"
-                        );
-                        break;
-                    }
-                };
+            for request in slot.coverage.take_backfill_discards() {
+                let scope = request.scope.clone();
+                let recv =
+                    match tokio::time::timeout_at(writer_deadline, writer.enqueue_discard(request))
+                        .await
+                    {
+                        Ok(Ok(recv)) => recv,
+                        // The writer is already gone: nothing left to settle to.
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "bifrost.sync.backfill",
+                                account = ?account_id,
+                                scope = ?scope,
+                                "detach timeout reached before the writer accepted the discard \
+                                 of a walk that lost pages; a later attach may resume past them"
+                            );
+                            break;
+                        }
+                    };
                 match tokio::time::timeout_at(writer_deadline, recv).await {
                     Ok(Ok(Err(error))) => {
                         tracing::warn!(

@@ -114,6 +114,10 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 return;
             }
             let incarnation_key = (scope.clone(), incarnation);
+            // Read before validating the registry snapshot. A reset between
+            // validation and this read must not lend an old scan entry its
+            // replacement's fence, especially for pre-retry deletion.
+            let fence_at_entry = coverage.scope_fence(&scope);
             // The subscriber wait above is indefinite, and the scan snapshot this
             // loop is iterating was taken before it. Re-check that the
             // incarnation is still the live one rather than walking a scope the
@@ -131,9 +135,12 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             ) = if let Some(parked) = parked {
                 if coverage.undelivered_watermark(&scope) != parked.undelivered_before {
                     scan.note_lost_pages(incarnation_key.clone());
-                    if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
-                        coverage.take_backfill_discard(&scope);
-                    }
+                    discard_backfill_progress(
+                        &writer_tx,
+                        &account_id,
+                        coverage.backfill_discard_for_walk(&scope, parked.fence_at_walk_start),
+                    )
+                    .await;
                     scan.record_attempt(incarnation_key, false);
                     continue;
                 }
@@ -153,7 +160,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 // The incarnation this walk belongs to, snapshotted at its
                 // START and carried into the completion marker, so a reset
                 // anywhere inside the walk is never adopted as its own.
-                let fence_at_walk_start = coverage.scope_fence(&scope);
+                let fence_at_walk_start = fence_at_entry;
                 // Planning and writer barrier reads do no wire work. They
                 // need no scheduler budget; partition admission below owns the
                 // start gate and rechecks this original walk fence after waits.
@@ -229,12 +236,14 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     // `Skip` - the lost pages never re-offered, for good. Idempotent,
                     // and safe to fence here precisely because the retry has minted
                     // no ids yet. It also SETTLES this scope's outstanding request -
-                    // but only once the writer has ACCEPTED it, or an abort at
-                    // `detach_timeout` between the two loses the request with nothing
-                    // left for teardown to drain.
-                    if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
-                        coverage.take_backfill_discard(&scope);
-                    }
+                    // in the writer after deletion succeeds. Keep the original
+                    // walk fence: a reset during planning revokes this decision.
+                    discard_backfill_progress(
+                        &writer_tx,
+                        &account_id,
+                        coverage.backfill_discard_for_walk(&scope, fence_at_walk_start),
+                    )
+                    .await;
                 }
                 // The stored checkpoint is read only when it can decide anything. A
                 // restart-from-scratch has already ruled it out as a resume position,
@@ -460,19 +469,15 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 // missing windows. Dropping the rows is the durable form of the
                 // same decision - they are resume hints, so the cost is re-work.
                 //
-                // Drained rather than sent directly: recording the loss already
-                // REQUESTED this, at the moment it happened, so that a detach
-                // landing before this line still leaves the rows gone. Taking the
-                // request here is what does the work in the ordinary case - and
-                // only THIS scope's, because this walk can answer for no other. A
-                // drain of every outstanding request would carry off one whose
-                // repair has already run and act on it arbitrarily later, against
-                // rows that scope may since have re-earned. Taken only once the
-                // writer has ACCEPTED it, for the reason on
-                // `discard_backfill_progress`.
-                if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
-                    coverage.take_backfill_discard(&scope);
-                }
+                // The writer settles only a current request after deletion.
+                // Carry this walk's fence even if a reset has already landed;
+                // adopting the replacement fence would delete its progress.
+                discard_backfill_progress(
+                    &writer_tx,
+                    &account_id,
+                    coverage.backfill_discard_for_walk(&scope, fence_at_walk_start),
+                )
+                .await;
             }
             let concluded = settle && walk_reached_someone;
             // The settle baseline is NOT passed in: `BackfillScan` holds the
@@ -494,8 +499,8 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
 /// and if the delete fails the in-memory note still forces the restart for the
 /// life of this attachment. Either way the failure direction is a resume that is
 /// too EARLY, never one that is too late.
-/// Returns whether the delete SUCCEEDED, which is the only thing that settles the
-/// request.
+/// The writer alone settles a current request after a successful delete. A stale
+/// no-op reply must never remove a replacement walk's outstanding loss request.
 ///
 /// Not "the writer accepted the send": a store error leaves the rows exactly
 /// where they were, and a request consumed by a delete that did not happen is a
@@ -505,12 +510,13 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
 /// still outstanding is simply retried by whoever gets there next.  Both
 /// failures leave the rows in place, so the answer to both is to keep the
 /// request.
-async fn discard_backfill_progress(
+pub(super) async fn discard_backfill_progress(
     writer: &WriterHandle,
     account_id: &AccountId,
-    scope: &CursorScope,
+    request: crate::cursor::coverage::BackfillDiscard,
 ) -> bool {
-    match writer.discard_backfill_progress(scope.clone()).await {
+    let scope = request.scope.clone();
+    match writer.discard_backfill_progress(request).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
             tracing::warn!(

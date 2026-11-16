@@ -1236,7 +1236,12 @@ and the accompanying warning is what tells the consumer to reconcile.
   the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`, on
   which the engine's reopen listener purges the scope's durable rows in
   full - change cursor and backfill rows, completion marker included
-  (`reset_scope_for_deletion`). The marker must go: the consumer
+  (`reset_scope_for_deletion`). The listener holds the reopen lock across
+  its retirement and writer reply, preventing a concurrent reattach from
+  installing replacement progress between those operations. Lifecycle deletion
+  is an ordered server fact, so it intentionally retires a cursor established
+  by an earlier queued create, rather than adopting an old walk's discard stamp.
+  The marker must go: the consumer
   plausibly purged the folder's data on `Deleted`, so a marker surviving
   into a folder recreated under the same id would skip the new
   incarnation's entire cold-start walk.
@@ -2006,6 +2011,50 @@ after the furthest acknowledged window, which sits past the hole. So
 `walk_from_scratch`; and because that note dies with the attachment while the
 rows do not, the scope's backfill rows are also dropped
 (`WriterRequest::DiscardBackfillProgress`, rows only: no cursor, no ledger).
+Detach carries each drained loss request's recording-time scope fence and
+coverage instance segment through asynchronous writer queue admission. The scope
+fence includes account-wide resets. Before changing completion state, retiring
+publications or deleting rows, the writer drops requests superseded by a reset
+or issued by another attachment. Draining never refreshes this stamp: a reset
+between loss recording and draining must also protect the replacement walk.
+Every orchestrator discard uses this same stamped request and writer check:
+loss noticed when resuming a parked walk, cleanup before a from-scratch retry,
+and loss detected at walk completion. At new walk entry the fence is read
+before revalidating the registry incarnation, closing the gap where an old scan
+entry could borrow a replacement's fence. The stamp carries the original walk's
+saved scope fence, including for a decision made after reset, plus the coverage
+instance segment. Queue admission never adopts a replacement fence. The private
+writer protocol requires a stamp, so no producer can opt out of the check.
+There is one settlement rule, implemented once in the writer's `discard_backfill`:
+a request is settled only when a CURRENT request's unbounded delete succeeds.
+Neither the orchestrator, nor a scope reset, nor an account clear settles; a
+reset moves the fence and so turns every earlier request stale instead. A stale
+success reply therefore cannot remove a replacement walk's newly recorded loss
+request.
+A current request still deletes resume rows; a sibling scope reset leaves it
+current. The lifecycle reservation keeps the old writer's drain or abort ahead
+of a same-account attach, and the instance check independently rejects foreign
+requests. A user refreshing or reattaching a mailbox expects its newly earned
+progress to survive an earlier walk's delayed loss cleanup.
+
+Other progress deletion producers have their own ownership boundaries. The
+marker acknowledgement path validates the receipt against reset and attachment
+fences before its publication-ceilinged discard; a newer minted backfill page
+suppresses row deletion even if already acknowledged. Reattach rollback deletes
+only cursor rows still provisional for that exact attempt: acknowledgement,
+live establishment, resume adoption and committed resets release or transfer
+ownership. Scoped restart, disable, establish-if-absent, schema recovery and
+post-cutover vanished-scope cleanup hold the reopen lock through writer replies
+and replacement establishment; attach-time schema clear runs before slot
+installation. These intentional topology transactions cannot queue a stale
+cleanup behind a concurrent replacement transaction.
+
+`engine/tests.rs` pins orchestrator queue admission across both scope and account
+resets, decisions noticed after reset, replacement acknowledgements and retained
+replacement loss requests. `engine/reattach_tests.rs` pins provider deletion's
+retirement behind the topology lock. These tests use explicit future polling and
+in-process writers, without timing assumptions.
+
 The discard FENCES the attempt that wrote the rows, the way a reset does and
 twice around its store awaits, or a late acknowledgement from a consumer still
 holding one of that walk's pages rebuilds the row. It fences the backfill lane
@@ -2033,8 +2082,8 @@ removes rows if any need removing.
 delete that succeeded.** `note_undelivered` records the scope in a request
 set, because every trigger that ran at walk end lived in the attachment that
 saw the loss and the orchestrator returns on shutdown from inside its
-partition loop. A walk takes its OWN scope's request at its end, the pre-retry
-discard takes it because it is the whole repair asked for, and `detach` drains
+partition loop. The writer settles only the walk's OWN scope at walk end or
+before its retry because that delete is the whole repair asked for; `detach` drains
 what is left while the writer is still alive. A failed delete leaves the
 request outstanding, and so does the writer's `WalkNotWhole` discard, which is
 ceilinged at the refused marker and therefore not the whole repair; the
@@ -3694,22 +3743,39 @@ ledger, including undiscovered scopes, then establishes every scope fresh.
 Corruption and downgrade conservatively take the same path because this signal
 cannot prove the provenance of retained ids. A failed ledger load or clear fails
 attach and closes the opened account; ordinary store errors propagate.
-`run_establish` also translates an unreadable
-row into a typed `AccountError` whose derived `RecoveryClass` is
-`Engine(SchemaIncompatible)`, but its callers do not feed that result
-back through `AccountSlot::recover` and `handle_account_error`, which
-dispatches to the schema-clear arm. Per-scope recovery retries and then
-terminates that scope. Replacement attach rejects the candidate
-connection, and automatic account restart retries the reopen. It leaves
-the durable row untouched because a replacement
-can abort while the installed account remains live. Clearing a
-preexisting cursor and its backfill completion would mutate that account's
-state, and reattach rollback has no safe restore path because consumer
-acknowledgements may persist newer rows. Rollback only deletes rows
-created by its own attempt. A consumer-driven reattach returns the
-failure. The account-wide schema clear loop is reached when a running
-worker sends a classified error through `AccountSlot::recover`, not
-from the `run_establish` result alone.
+`run_establish` also translates an unreadable row into a typed
+`AccountError` with `Engine(SchemaIncompatible)`. Live per-scope recovery routes
+that classification to the account clear immediately, instead of retrying the
+same unreadable row. A lifecycle Created restart reads and classifies a
+preexisting row before deleting it, including a scope absent from discovery at
+attach. Enterprise users expect all ids affected by the schema change to be
+reminted, rather than losing just one folder's evidence. A fresh establishment
+that still reports schema incompatibility after the clear terminates visibly;
+it cannot recursively reset the account forever.
+
+The serial supervisor receives directives while an active dispatch awaits and
+stamps each receipt with the current completed-reset count. A staging queue
+bounded by the reopen channel's capacity preserves FIFO order; the channel
+retains its own bound. A failure received after a clear commits gets the new
+count even while that dispatch is still re-establishing scopes. Schema
+directives already covered by a committed account clear only establish their
+still-owed, still-absent scopes. They do not clear the account again. Generation and
+lifecycle checks still reject requests for replaced accounts or deleted scopes.
+Per-scope reset fences also refuse change receipts minted by other attachments,
+including foreign ids above this process's numeric watermark. Other scopes and
+fresh publications remain eligible.
+
+An account clear does not settle outstanding backfill discard requests. It
+moves every scope's fence, so each earlier request is stale and the writer
+refuses it by its stamp; teardown cannot use an old request to delete the new
+walk's rows, whether the clear committed or failed. Settling here would also
+take a current request recorded after the clear's second pass.
+
+Replacement attach still rejects an unreadable row and leaves it untouched:
+the candidate can abort while the installed account remains live, and rollback
+cannot restore acknowledgements persisted meanwhile. Only rows created by that
+replacement attempt may be deleted by its rollback. A consumer-driven reattach
+returns the failure; automatic account restart applies its reopen retry budget.
 
 (These are engine `Error` enum variants, not `RecoveryClass`
 variants.)
@@ -3839,7 +3905,7 @@ instead of drifting.
 
 `LedgerEntry::last_error` and `BarrierIncident::evidence` hold the public
 `cursor::ErrorDigest`, also reachable through `SyncEngine::debt`. It retains
-kind, scope, operation, provider, protocol and the complete `DiagnosticInfo`
+kind, optional `UnsupportedReason`, scope, operation, provider, protocol and the complete `DiagnosticInfo`
 in durable storage, including text visibility. `SyncEngine::debt` returns an
 inspection snapshot with support-only text removed from both entries and
 barriers. `DischargeEvidence::ProvedIrrelevant { detail }` is also support-only:
@@ -3879,7 +3945,14 @@ Shared malformed-input and schema errors preserve sync's existing classification
 Version 14 appends PayloadTooLarge and PreconditionFailed request subkind tags
 2 and 3 under kind tag 6. Versions 3 through 13 remain readable with their old
 vocabulary and reject the new tags as malformed historical rows. The current
-readable window is 3 through 14; no ledger payload layout changed.
+readable window was 3 through 14; that revision did not change the layout.
+Version 15 adds an optional trailing table of `UnsupportedReason` values keyed
+by entry or barrier identity. Writers omit the table when every reason is
+unknown. Versions 3 through 14 still decode with unknown reasons and preserve
+their existing migration checks; the current readable window is 3 through 15.
+Unknown tags, duplicate reason records, missing referenced records and reasons
+attached to non-Unsupported kinds are rejected. Live telemetry and every support
+export tier also carry the optional structured reason.
 
 `DebtLedger::from_parts` is the only door into the private maps that is not
 `ingest`, and it is crate-private for the reason the fields are: no protocol
@@ -3941,6 +4014,19 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 }
 ```
+
+`get_backfill` implementations MUST select rows with
+`backfill_checkpoint_is_later`, including when maintaining a latest-row index.
+Selecting the greatest `items_done` violates the contract: those are honest
+counts, and completion can tie or have fewer items than a partial row. A proven
+completion outranks partial rows independently of counts. The writer remembers
+completion rows it has read or successfully written in this attachment. A later
+resume read that hides such a completion fails with `CheckpointStore` in every
+build, without an extra store read. This evidence is forgotten only after the
+writer successfully deletes backfill rows. Rejected or withheld acknowledgements
+that leave those rows intact, stale discard requests, and bounded discards that
+protect a newer walk retain the evidence. A cold attachment cannot detect an unobserved
+hidden row: the trait offers selection, not row enumeration.
 
 `put_change_cursor` and `put_backfill` are provided convenience methods and
 must not be overridden. `apply_transition` atomically advances a checkpoint
@@ -4041,6 +4127,8 @@ checkpoint advance. Human diagnostic text is not a discriminator.
 
 `SyncEngine::ack` returns `AckOutcome::Durable` or
 `AckOutcome::Withheld(CompletionRefusal::{OpenDebt, WalkNotWhole, Unvouchable})`.
+`AckOutcome` is `#[must_use]`: callers must inspect whether an ack became
+durable or completion was withheld before promising durability.
 Prior-attachment backfill rows are `Unvouchable`. A checkpoint-free repair ack
 is `RepairAccepted`: it acknowledges repair delivery without promising a
 checkpoint write. Repair resolution and acknowledgement can arrive in either
@@ -5048,9 +5136,13 @@ So change receivers see the end of stream first, then the control streams. No
 teardown step after that point publishes to consumers: a page or marker a
 draining worker sends is refused, its publication retired and its backfill
 loss noted, which with the sweep already inert is the same forfeiture as a
-receiver dropped at detach. Warnings raised during teardown go to tracing
-only. A user who detached an account expects its feed to end, not to keep
-receiving events from a mailbox they removed.
+receiver dropped at detach. This includes a page racing delivery close before
+control stop: closing delivery does not fence acknowledgements of already
+sent pages or prove retained resume rows stop before that unsent page.
+Retiring only its receipt cannot establish that proof. The discard deliberately favors
+replaying the scope over silently missing messages. Warnings raised during
+teardown go to tracing only. A user who detached an account expects its feed
+to end, not to keep receiving events from a mailbox they removed.
 
 Checkpoint-bearing inventory pages and completion markers recheck ownership
 through the same `PendingCoverage::with_scope_fence` send operation as
@@ -5179,3 +5271,62 @@ receiver delivery. Refusal still logs and sends nothing. Warning, termination,
 push status and checkpoint-free barrier callers intentionally discard the
 outcome: these advisory events cannot carry acknowledgement evidence and never
 advance a cursor or complete a barrier walk based on broadcast acceptance.
+
+## Direct-call scope recovery and inventory warning ordering
+
+Direct hydration and PIM calls dispatch `RestartScope` errors to the account
+supervisor with the generation of the incarnation that actually ran the call.
+They still return the original error, without replaying the operation. Streaming
+hydration dispatches item failures and terminations before yielding them; raw
+content streams dispatch terminations. Opening mail in an enterprise client
+should refresh a stale folder immediately, without waiting for its poll lane.
+Advice uses a non-blocking send and is omitted when the bounded reopen channel
+is full: the sync lane observes the same stale scope and can request recovery.
+Consumer calls and stream items therefore return their errors without waiting
+for supervisor capacity. Shutdown suppresses advice; replacement generations
+reject stale advice. Direct streams retain only a weak slot handle for this
+advice. Each item upgrades it for synchronous dispatch, so a consumer retaining
+an unpolled or completed stream after detach does not retain the attachment's
+channels or delivery resources.
+
+Waiving a barrier suppresses only its barrier warning. Non-barrier obligations
+on that same page still produce the ordinary incomplete-coverage warning and
+count only those remaining obligations. Operator acceptance of one region must
+not hide unrelated missing mail. Backfill and inventory fusion validate removal
+projection before judging a page's barriers, including crossing waived barriers:
+a page the engine cannot project must neither install a blocking incident nor
+cross an accepted incident for removals it could never deliver. Completion
+reports carry no removals and require no removal projection.
+
+IMAP replacement opens retire the factory's previous IMAP pool before acquiring
+shared physical-session capacity. This prevents reconnect at a one-session cap
+from waiting forever on its own parked connection. If the replacement fails,
+the previous IMAP pool remains closed; recovery must open again. Shared session
+leases continue counting failed-open and closing transport tails until driver
+exit. Enterprise reconnect must respect the provider's cap across incarnations.
+
+Backfill loss attribution shares the coverage lock with publication retirement
+and reset fences. A refused send records loss only if its publication was minted
+by this coverage owner and remains above the account, scope and backfill discard
+fences. Receiver retirement records loss before releasing that same lock.
+A delayed report from a pre-reset publication therefore cannot request deletion
+of the replacement walk's resume rows. Resets do not settle outstanding discard
+requests: moving the fence makes every earlier request stale, and the writer
+refuses it by its stamp wherever it is delivered. Users expect
+a refreshed folder's new progress to survive stale delivery notifications.
+
+The ledger reason extension omits unsupported reasons without a known encoding
+tag, preserving the entry or barrier with absent reason detail, as historical
+ledgers do. A diagnostic vocabulary addition must not panic checkpoint writing
+or discard the underlying recovery obligation.
+
+The v15 ledger reason table is canonical only when nonempty. Writers omit it
+when no encodable reason is present; decoders refuse an explicit zero count.
+Versions 3 through 14 had no reason table, so this restriction does not reject
+any historical encoder output.
+
+A successful unbounded backfill discard settles its outstanding loss request
+after the second publication retirement pass, before awaiting the final debt
+write. A publication lost during that write retains a replay request: enterprise
+users expect every missing page to be replayed, including losses during cleanup.
+Failed deletes and ceilinged discards leave requests outstanding.

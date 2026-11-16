@@ -420,6 +420,14 @@ pub(crate) enum CtagSource {
     Known(Option<String>),
 }
 
+fn guarded_relocation_error() -> AccountError {
+    unsupported_error(AccountOperation::ContactUpdate)
+        .into_builder()
+        .unsupported_reason(bifrost_types::UnsupportedReason::ConditionalRelocation)
+        .try_build()
+        .expect("valid guarded relocation refusal")
+}
+
 impl Account for CardDavAccount {
     bifrost_dav_core::dav_unsupported_account_methods!(CardDavDialect);
 
@@ -721,7 +729,7 @@ impl Account for CardDavAccount {
                 .map(|target| client.resolve_url(&target.0))
                 .filter(|target| !same_collection_url(target, &addressbook));
             if expected_etag.is_some() && relocation.is_some() {
-                return Err(unsupported_error(AccountOperation::ContactUpdate));
+                return Err(guarded_relocation_error());
             }
             let raw =
                 Self::fetch_contact_resource(&client, &contact, AccountOperation::ContactUpdate)
@@ -2939,4 +2947,18 @@ mod partial_commit_tests {
             Some(StepEffect::Copied)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn guarded_relocation_has_typed_reason() {
+    let error = guarded_relocation_error();
+    assert_eq!(
+        error.unsupported_reason(),
+        Some(bifrost_types::UnsupportedReason::ConditionalRelocation)
+    );
+    assert_eq!(
+        error.kind(),
+        &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+    );
 }

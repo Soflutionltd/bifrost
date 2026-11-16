@@ -1621,3 +1621,181 @@ async fn detach_closes_control_streams_with_a_retained_slot_and_control_clone() 
         Err(tokio::sync::broadcast::error::TryRecvError::Closed)
     ));
 }
+
+#[tokio::test]
+async fn a_created_scope_classifies_a_preexisting_row_before_deleting_it() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let sibling = CursorScope::Type(ObjectType::Contact);
+    let mut unreadable = common::cursor_for(&SCOPE, b"unreadable");
+    unreadable.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
+    fixture
+        .engine
+        .checkpoints
+        .put_change_cursor(&fixture.id, unreadable)
+        .await
+        .expect("seed");
+    fixture
+        .engine
+        .checkpoints
+        .put_change_cursor(&fixture.id, common::cursor_for(&sibling, b"old sibling"))
+        .await
+        .expect("seed sibling");
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    let epoch = ctx.cursors.lifecycle_epoch(&SCOPE);
+    let lock = ctx.reopen_lock.lock().await;
+    establish_if_absent(&ctx, SCOPE, epoch).await;
+    assert_eq!(
+        ctx.deferred_schema_reset.completed(),
+        ResetCount::for_test(1)
+    );
+    assert!(
+        fixture
+            .engine
+            .checkpoints
+            .get_change_cursor(&fixture.id, &sibling)
+            .await
+            .expect("read sibling")
+            .is_none()
+    );
+    assert!(ctx.cursors.snapshot(&SCOPE).is_some());
+    drop(lock);
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}
+
+#[tokio::test]
+async fn queued_schema_directives_share_one_account_reset() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let writer = fixture.writer();
+    let mut ctx = fixture.ctx(&writer);
+    ctx.observed_schema_reset = Some(ctx.deferred_schema_reset.completed());
+    let error = crate::engine_errors::cursor_decode_failure(
+        bifrost_types::AccountOperation::EstablishCursor,
+    );
+    handle_account_error(&ctx, None, error.clone()).await;
+    let sibling = CursorScope::Type(ObjectType::Contact);
+    fixture
+        .engine
+        .checkpoints
+        .put_change_cursor(&fixture.id, common::cursor_for(&sibling, b"post reset"))
+        .await
+        .expect("seed post-reset row");
+    handle_account_error(&ctx, None, error).await;
+    assert_eq!(
+        ctx.deferred_schema_reset.completed(),
+        ResetCount::for_test(1)
+    );
+    assert!(
+        fixture
+            .engine
+            .checkpoints
+            .get_change_cursor(&fixture.id, &sibling)
+            .await
+            .expect("read")
+            .is_some()
+    );
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}
+
+#[tokio::test]
+// The reset does not settle the old request; its pre-reset stamp is what makes
+// the detach drain's delivery of it a no-op against the new walk's rows.
+async fn account_reset_makes_old_discard_requests_harmless_at_detach() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    ctx.coverage.note_undelivered(&SCOPE, 1);
+    let lock = ctx.reopen_lock.lock().await;
+    handle_schema_incompatible(&ctx, HashMap::new()).await;
+    let checkpoint = bifrost_types::BackfillCheckpoint {
+        scope: SCOPE,
+        partition: crate::backfill::partitioner::completion_partition(),
+        progress_marker: None,
+        progress: bifrost_types::BackfillProgress {
+            items_done: 0,
+            ..Default::default()
+        },
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
+    };
+    fixture
+        .engine
+        .checkpoints
+        .put_backfill(&fixture.id, checkpoint.clone())
+        .await
+        .expect("new walk");
+    drop(lock);
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+    assert_eq!(
+        fixture
+            .engine
+            .checkpoints
+            .get_backfill(&fixture.id, &SCOPE)
+            .await
+            .expect("read"),
+        Some(checkpoint)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_scoped_establishment_escalates_schema_failure_without_scope_retries() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let mut unreadable = common::cursor_for(&SCOPE, b"unreadable");
+    unreadable.envelope_version = bifrost_types::TraitEnvelopeVersion::new(u32::MAX);
+    fixture
+        .engine
+        .checkpoints
+        .put_change_cursor(&fixture.id, unreadable)
+        .await
+        .expect("seed");
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    let lock = ctx.reopen_lock.lock().await;
+    let fence = ctx.coverage.scope_fence(&SCOPE);
+    re_establish_scope_with_backoff(&ctx, SCOPE, &ctx.control, fence).await;
+    assert_eq!(
+        ctx.deferred_schema_reset.completed(),
+        ResetCount::for_test(1)
+    );
+    assert!(ctx.cursors.snapshot(&SCOPE).is_some());
+    drop(lock);
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}
+
+#[tokio::test]
+async fn provider_deletion_waits_for_the_topology_transaction_before_retiring() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let guard = fixture.slot.reopen_lock.lock().await;
+    let fence = fixture.slot.coverage.scope_fence(&SCOPE);
+    let mut deletion = Box::pin(super::supervisor::dispatch(
+        &fixture.slot,
+        ReopenRequest::ScopeDeleted { scope: SCOPE },
+        fixture.slot.deferred_schema_reset.completed(),
+    ));
+    // A held reattach transaction must exclude both retirement and deletion.
+    // Poll explicitly so this fails if ScopeDeleted skips the reopen lock.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(deletion.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(fixture.slot.coverage.scope_fence(&SCOPE), fence);
+    drop(guard);
+    deletion.await;
+    assert_ne!(fixture.slot.coverage.scope_fence(&SCOPE), fence);
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}

@@ -108,25 +108,12 @@ pub(crate) fn open_raw_rfc822<T: BlobTransport>(
             }
         };
 
-        // Correlate on the id we submitted rather than taking the head of the
-        // echoed list. One id was requested, so positional trust happens to be
-        // safe today, but it is the pattern `reconcile_hydration` was written
-        // to eliminate: a server echoing an unrelated object would have ITS
-        // blobId downloaded and returned as this caller's message body. An
-        // uncorrelated response falls through to the NotFound below.
-        let blob_id = response
-            .into_list()
-            .into_iter()
-            .find(|email| email.id().is_some_and(|id| id.as_str() == native_message))
-            .and_then(|email| email.blob_id().cloned());
-        let Some(blob_id) = blob_id else {
-            // Email present but `blobId` is `None`: no transport error to
-            // convert, so classify the missing blob locally. `terminated_unsupported`
-            // would be wrong - the operation is supported; the
-            // whole-message blob is missing.
-            let err = super::error::raw_message_not_found(&message.0);
-            yield super::error::terminated(err);
-            return;
+        let blob_id = match raw_message_blob(&response, &native_message, &message.0) {
+            Ok(blob_id) => blob_id,
+            Err(error) => {
+                yield super::error::terminated(error);
+                return;
+            }
         };
 
         let blob = BlobRef::new(account_id, blob_id);
@@ -160,6 +147,34 @@ pub(crate) fn open_raw_rfc822<T: BlobTransport>(
             yield event;
         }
     })
+}
+
+// An Outlook user must not see an unrelated server object reported as a
+// vanished message, or receive that object's body. Only an explicit miss or
+// the requested Email without its whole-message blob takes the missing lane.
+fn raw_message_blob(
+    response: &crate::core::get::GetResponse<crate::email::Email>,
+    native_message: &str,
+    consumer_message: &str,
+) -> Result<BlobId, bifrost_types::AccountError> {
+    use crate::core::answer::IdAnswer;
+
+    match response.answer(&EmailId::new(native_message), |email| {
+        email.id().is_some_and(|id| id.as_str() == native_message)
+    }) {
+        IdAnswer::Ok(email) => email
+            .blob_id()
+            .cloned()
+            .ok_or_else(|| super::error::raw_message_not_found(consumer_message)),
+        IdAnswer::NotFound(_) => Err(super::error::raw_message_not_found(consumer_message)),
+        IdAnswer::Unanswered | IdAnswer::Refused(_) => Err(super::error::contract_violation(
+            AccountOperation::OpenRawRfc822,
+            Some(bifrost_types::ErrorScope::Message {
+                id: consumer_message.to_owned().into(),
+            }),
+            "Email/get did not answer the requested raw message",
+        )),
+    }
 }
 
 /// Turn a streamed blob response into engine batches without retaining the
@@ -298,6 +313,41 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn raw_message_reads_distinguish_missing_content_from_unrelated_answers() {
+        use bifrost_types::{AccountErrorKind, ProtocolErrorKind, ResourceKind};
+
+        for (list, not_found, expected) in [
+            (
+                serde_json::json!([{"id": "M1"}]),
+                serde_json::json!([]),
+                AccountErrorKind::NotFound(ResourceKind::Message),
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!(["M1"]),
+                AccountErrorKind::NotFound(ResourceKind::Message),
+            ),
+            (
+                serde_json::json!([{"id": "other", "blobId": "B2"}]),
+                serde_json::json!([]),
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!([]),
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            ),
+        ] {
+            let response = serde_json::from_value(serde_json::json!({
+                "accountId": "primary", "state": "s1", "list": list, "notFound": not_found
+            }))
+            .unwrap();
+            let error = super::raw_message_blob(&response, "M1", "M1").unwrap_err();
+            assert_eq!(error.kind(), &expected);
         }
     }
 

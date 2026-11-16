@@ -26,6 +26,8 @@ pub(crate) struct RecoveryContext<'a> {
     pub slot: &'a AccountSlot,
     pub writer: &'a WriterHandle,
     pub expected_generation: Option<crate::types::AccountGeneration>,
+    /// Reset count active while this directive queued for recovery.
+    pub observed_schema_reset: Option<ResetCount>,
 }
 
 impl std::ops::Deref for RecoveryContext<'_> {

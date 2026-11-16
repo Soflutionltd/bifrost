@@ -413,6 +413,7 @@ impl BarrierPolicy {
 /// failure, not a retry policy derived from a cause that was never observed.
 #[derive(Debug, Clone)]
 pub struct ErrorDigest {
+    pub unsupported_reason: Option<bifrost_types::UnsupportedReason>,
     pub kind: bifrost_types::AccountErrorKind,
     pub scope: Option<bifrost_types::ErrorScope>,
     pub operation: Option<bifrost_types::AccountOperation>,
@@ -424,6 +425,7 @@ pub struct ErrorDigest {
 impl From<&AccountError> for ErrorDigest {
     fn from(error: &AccountError) -> Self {
         Self {
+            unsupported_reason: error.unsupported_reason(),
             kind: error.kind().clone(),
             scope: error.scope().cloned(),
             operation: error.operation(),

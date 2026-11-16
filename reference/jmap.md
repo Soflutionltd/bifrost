@@ -234,7 +234,8 @@ sequence and unrelated handles are unaffected. RFC 8621 s7.5 does produce this
 shape: a successful `EmailSubmission/set` with `onSuccessUpdateEmail` or
 `onSuccessDestroyEmail` is followed by an implicit `Email/set` response under
 the submission call id. `Response::get_method` reads that response by its
-method type after the explicit submission result. In-place removal preserves
+method type after the explicit submission result, retaining the originating
+submission handle for account identity and shared refusal history. In-place removal preserves
 order; swapping the tail into the vacated slot reorders later lookups.
 
 Per-id accounting uses `core/answer.rs::IdAnswer<T>` across set, copy,
@@ -1556,8 +1557,10 @@ arrived) and, unless its primary cause already is one, the typed
   `Request(Malformed)` -> `ClientBug`.
 - `Method(requestTooLarge)` -> `Request(PayloadTooLarge)` -> terminal
   `ProviderRefused`. The typed native code and acknowledgement remain intact.
-- `Method(unknownMethod | unsupportedSort | unsupportedFilter)` ->
-  `Unsupported(operation)`.
+- `Method(unsupportedSort | unsupportedFilter)` -> `Unsupported(operation)`.
+- `Method(unknownMethod)` -> `SyncState(CapabilityChanged)` ->
+  `Engine(RestartAccount)` on its first refusal; subsequent refusals of that
+  native account/method door are terminal `Unsupported(operation)`.
 - `Method(accountNotFound | fromAccountNotFound | accountNotSupportedByMethod
   | fromAccountNotSupportedByMethod)` -> `SyncState(CapabilityChanged)` ->
   `Engine(RestartAccount)`. `Method(accountReadOnly)` ->
@@ -2155,3 +2158,54 @@ unchanged. Subprotocol mismatches omit the returned header text. Enterprise
 users expect support consent to protect credentials echoed by a peer.
 `JmapCredentials::Basic.password` is the zeroizing `bifrost_sasl::Secret`,
 imported through bifrost-net's public re-export, matching the encoded credential.
+
+## Response identity and local batching refusals
+
+A native id containing the reserved owner separator rejects the entire decoded
+response. It is not dropped as an individual row: that could silently complete
+an incomplete inventory or lose a write outcome. An enterprise Outlook user
+expects a visible failed read rather than missing mail or an unaccounted write.
+No cursor may advance from the rejected response. Legacy consumer ids and
+submitted-id echo ledgers retain their existing treatment.
+
+Raw RFC822 reads correlate Email/get with the requested message. A correlated
+Email without blobId and an explicit notFound remain NotFound(Message). A
+response with neither the requested Email nor its explicit notFound is
+Protocol(ContractViolation), including a response containing a different Email.
+An enterprise Outlook user must not see unrelated server data reported as a
+vanished message or receive that other message's body.
+
+The first method-level unknownMethod refusal requires SyncState(CapabilityChanged)
+and RestartAccount. Typed dispatched methods carry a capability contract; losing
+recognition of that method requires rediscovery. An enterprise Outlook user
+expects a previously available action to recover against current server
+capabilities. Initial local capability selection failures remain Unsupported;
+unsupported sort and filter shapes also retain their existing classifications.
+The factory retains refusal history per engine account and native account/method
+pair across fresh clients, factory clones, and session rediscovery. Further
+refusals of that door are terminal Unsupported(OperationUnavailable), even if
+the server still advertises its capability. A successfully decoded response clears only that native account/method entry,
+including implicit responses. Rediscovery compares session capability URI sets
+and each native account's capability URI set; a changed advertisement clears
+history, while unchanged rediscovery preserves the terminal-refusal guard.
+State tokens and capability configuration values alone do not reset history.
+Permanent account removal calls `JmapAccountFactory::forget_account`, which
+prunes the engine account's map entry across factory clones. Ordinary handle
+drop during restart preserves history. Dropping the last factory owner releases
+its map. `AccountFactory` exposes no permanent-removal notification, so consumers
+retaining a factory after detach must explicitly call `forget_account`.
+An enterprise Outlook user expects one reconnect attempt followed by a clear
+unsupported result rather than repeated reconnects. Other method doors retain
+their own discovery attempt. Implicit responses use the same history as explicit
+handles: an implicit Email/set refusal is keyed as Email/set in the submission
+handle's native account, never as EmailSubmission/set. This also applies to
+state-only extraction after a failed Email create or import resolution.
+The native unknownMethod cause and acknowledged
+transmission evidence survive both classifications.
+
+Exceeding maxCallsInRequest while assembling a library-owned batch is
+Internal(InvariantViolated), with InternalFailure recovery. The enterprise user
+cannot repair the library's call-budget accounting. A server limit refusal for
+a request admitted by the local budget retains its provider-refusal
+classification; request byte-size and upload-size refusals remain
+Request(PayloadTooLarge).

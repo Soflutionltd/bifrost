@@ -85,22 +85,13 @@ impl SaslClient {
         identity: &str,
         token: &str,
     ) -> Result<Self, SaslError> {
-        // An enterprise user expects malformed saved credentials to be refused
-        // locally, rather than silently changed into a different identity/token.
-        if identity.contains(['\x01', '\0', '\r', '\n'])
-            || token.contains(['\x01', '\0', '\r', '\n'])
-        {
-            return Err(SaslError::InvalidCredential(
-                "OAuth fields contain a frame delimiter".into(),
-            ));
-        }
         let (name, payload) = match mechanism {
             OAuthMechanism::Xoauth2 => {
-                (Mechanism::Xoauth2, crate::xoauth2_payload(identity, token))
+                (Mechanism::Xoauth2, crate::xoauth2_payload(identity, token)?)
             }
             OAuthMechanism::OAuthBearer => (
                 Mechanism::OAuthBearer,
-                crate::oauthbearer_payload(identity, token),
+                crate::oauthbearer_payload(identity, token)?,
             ),
         };
         Ok(Self::initial(name, payload, State::OAuthError(mechanism)))

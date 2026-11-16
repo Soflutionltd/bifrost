@@ -34,10 +34,12 @@ const DRAFT_FETCH_BUDGET: usize = 64 * 1024 * 1024;
 /// if a consumer wants the uniform surface to carry shared-mailbox send for
 /// IMAP-shaped accounts too.
 fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
-    request
-        .send_as
-        .is_some()
-        .then(|| super::error::unsupported(AccountOperation::Send))
+    request.send_as.is_some().then(|| {
+        super::error::unsupported_with_reason(
+            AccountOperation::Send,
+            bifrost_types::UnsupportedReason::SendAsUnavailable,
+        )
+    })
 }
 
 pub(crate) fn draft_create(
@@ -52,7 +54,12 @@ pub(crate) fn draft_create(
         let folder = account
             .folders
             .role_folder(FolderRole::Drafts)
-            .ok_or_else(|| super::error::unsupported(AccountOperation::DraftCreate))?;
+            .ok_or_else(|| {
+                super::error::unsupported_with_reason(
+                    AccountOperation::DraftCreate,
+                    bifrost_types::UnsupportedReason::MissingMailboxRole,
+                )
+            })?;
         let raw = draft_patch_to_rfc5322(&patch)?;
         let err = op_err(AccountOperation::DraftCreate);
         let conn = account.pool.checkout_any().await.map_err(err)?;
@@ -226,6 +233,7 @@ pub(super) fn draft_send_with_clock(
         };
 
         let decoded = decode_object_id(&ObjectId(draft.0.clone()), AccountOperation::DraftSend)?;
+        require_draft_folder(&account, &decoded, AccountOperation::DraftSend)?;
         let raw = fetch_full_message(&account, &decoded).await?;
         // Finalize: the saved `Date` is the save time; the message is ready
         // for delivery now. Both the transmitted body and the Sent copy
@@ -453,6 +461,38 @@ fn restamp_recipients(
         .collect()
 }
 
+// A draft action must never submit or expunge ordinary mail. An enterprise
+// Outlook user expects these actions to address Drafts. Use the same cheap
+// registry role knowledge as draft creation, including shared Drafts folders.
+fn require_draft_folder(
+    account: &ImapAccount,
+    id: &DecodedObjectId,
+    op: AccountOperation,
+) -> Result<(), AccountError> {
+    let entry = account.folders.get(&id.folder);
+    let attributes = entry
+        .as_deref()
+        .map(super::folder_registry::FolderEntry::attributes)
+        .unwrap_or_default();
+    let role = super::folder_registry::folder_role(
+        &attributes,
+        id.folder.as_str(),
+        entry
+            .as_deref()
+            .and_then(super::folder_registry::FolderEntry::delimiter),
+    );
+    if role == Some(FolderRole::Drafts)
+        || account.folders.role_folder(FolderRole::Drafts).as_ref() == Some(&id.folder)
+    {
+        Ok(())
+    } else {
+        Err(pim_malformed(
+            op,
+            "draft handle does not name a Drafts folder message",
+        ))
+    }
+}
+
 pub(crate) fn draft_discard(
     account: ImapAccount,
     draft: DraftHandle,
@@ -463,6 +503,7 @@ pub(crate) fn draft_discard(
             bifrost_types::Protocol::Imap,
         )?;
         let id = decode_object_id(&ObjectId(draft.0), AccountOperation::DraftDiscard)?;
+        require_draft_folder(&account, &id, AccountOperation::DraftDiscard)?;
         delete_messages(&account, vec![id], AccountOperation::DraftDiscard)
             .await
             .map(|_| ())

@@ -27,6 +27,10 @@ pub(crate) struct Id<T: ?Sized, const NATIVE: bool = true>(
 // Reject its reserved separator before any server observation can become a
 // routable identity. Persisted consumer ids still use the legacy decoder; an
 // Outlook user must never have malformed server data redirect a mail operation.
+// Reject the entire decoded response, not just the offending row: dropping
+// identities can silently complete an incomplete inventory or erase a write's
+// outcome. An Outlook user expects a visible failed read over missing mail or
+// an unaccounted write. Callers must not advance a cursor from that response.
 // State tokens are opaque positions, not native object/account identities.
 impl<'de, T: ?Sized, const NATIVE: bool> Deserialize<'de> for Id<T, NATIVE> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

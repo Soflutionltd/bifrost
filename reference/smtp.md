@@ -14,12 +14,23 @@ implicit TLS 465. Plaintext submission deliberately does not fall to the relay
 port 25: a user configuring a mail account against an internal non-TLS relay
 expects the submission service, and client networks commonly block outbound 25.
 
-Malformed connection URLs, missing hosts, unsupported schemes or TLS query
-values, missing URL passwords, invalid percent escapes or UTF-8, malformed
-certificates and identities, and TLS connector construction failures are local
+Malformed connection URLs, missing hosts, unsupported schemes or SMTP TLS
+query values, usernames without URL passwords, invalid percent escapes or UTF-8
+in decoded credentials or hello names, malformed certificates and identities,
+and TLS connector construction failures are local
 `InvalidInput` errors, translated as `Request(Malformed)`. They need repair by
 the user or administrator; an enterprise send queue must not retry a typo as a
-network outage. Runtime TLS handshakes remain transport errors. IMAP's builder
+network outage. `smtps` always selects implicit TLS. Both schemes reject unrecognized `tls`
+query values as `InvalidInput`: an enterprise administrator expects a security
+setting typo to be reported. Recognized values are `required` and
+`opportunistic`; with `smtps` both retain implicit TLS. Repeated `tls` query
+parameters are also `InvalidInput`, even when their values agree: an enterprise
+administrator expects ambiguous security configuration to be refused rather
+than silently choosing one value. Duplicate detection uses decoded query keys,
+so percent-encoding a key does not bypass it. `tls` is the only query parameter
+the parser consumes; unrecognized query parameters remain ignored.
+Runtime TLS handshakes
+remain transport errors. IMAP's builder
 conversion to its own `InvalidInput` is intentional: those builder calls only
 construct local TLS parameters and perform no network I/O.
 
@@ -140,19 +151,22 @@ reshape this surface is the owner's call - see the standing lessons in
 `AGENTS.md`.
 
 The second one is easy to miss because each half is documented by its MECHANISM
-rather than by its BOUND. The async half runs DNS, connect, TLS handshake,
-banner and EHLO under ONE shared `AsyncDeadline`, so async setup as a whole
-cannot exceed the configured timeout. The blocking half has no such thing, and
-is not merely looser - it is not bounded by that value at all:
+rather than by its BOUND. The async half runs DNS, connect, implicit TLS handshake,
+banner and initial EHLO under one shared `AsyncDeadline`. Later STARTTLS and
+AUTH run outside that deadline with per-operation budgets; OAuth token-source
+resolution has no SMTP timeout. Error teardown can also add its bounded wait.
+The configured timeout is therefore not a ceiling on the whole transport
+checkout. The blocking half has no shared setup deadline:
 address resolution gets the full value to itself (see below), `connect_timeout`
 applies the full value to EACH candidate address in turn, the implicit-TLS and
 `STARTTLS` handshakes each get the value per socket read or write (see "Async
 setup deadline"), and the banner and EHLO reads are bounded, per reply, by
 `SO_RCVTIMEO`. Every phase is bounded, but by its own budget and never by a
 shared one, so the worst case is the sum of the budgets, multiplied by the
-candidate-address count for connect and by the round trips for the handshake. A caller reading
-"timeout" as a ceiling on how long a transport may take to produce a usable
-connection is therefore right on the async half and wrong on the blocking one.
+candidate-address count for connect and by the round trips for the handshake.
+Neither runtime promises that "timeout" bounds the whole process of producing
+an authenticated connection; only the async initial connect and greeting phase
+has a shared deadline.
 The difference is structural rather than an oversight: a blocking connect has no
 cancellation point to hang a shared deadline on, and giving the blocking half
 one would mean a non-blocking socket and a poll loop, which is not what that
@@ -213,10 +227,11 @@ any configured timeout at or below a second failed every capped write after the
 first with `Timeout` / `DataBody` and every recipient `uncertain`.
 
 The timeout guarantee therefore reads: a write that makes no progress times out
-once ADMITTED, and admission itself waits at most about one second per live
-connection sharing the schedule, plus one (see "Bandwidth metering"). That
-admission wait is untimed under a per-operation timeout - it is the cap, not the
-peer.
+once ADMITTED. Admission waits for already issued reservations on the shared
+schedule, which can also belong to other pools or protocols. Retuning a finite
+cap preserves those reservations, so the current cap and this pool's connection
+count alone do not bound that wait (see "Bandwidth metering"). Admission is
+untimed under a per-operation timeout - it is the cap, not the peer.
 
 Waiting outside the timer is right for ONE of the two budgets, and the write
 loop matches on which. `PerOperation` is a bound on one write's dealings with
@@ -260,8 +275,8 @@ a clock, so it can be driven to completion with no I/O at all.
 The shape is a step function, not a straight-line routine, because the two
 adapters cannot share control flow - one blocks, one awaits. A machine is asked
 for its next `Op`; the adapter performs it and feeds back an `OpOutcome`
-(`Done`, `Reply(Response)`, or `Failed(Error)`). A negative reply is a
-`Reply`, never a `Failed`: telling a routine rejection apart from a transport
+(`Done`, `Token(Secret)`, `Reply(Response)`, or `Failed(Error)`). A negative
+reply is a `Reply`, never a `Failed`: telling a routine rejection apart from a transport
 failure is exactly the decision the core exists to make in one place.
 
 The shared effect interface admits outcomes for all operation kinds. A read
@@ -322,7 +337,7 @@ connection loss as a provider contract violation.
 The `Epilogue` type holds the two terminal sequences every machine shares. It
 carries the value the machine will finish with, so a boundary cannot start an
 abort or a reset and forget to return. RSET-and-keep is expressed there as ops -
-write `RSET`, read the reply, keep the connection on a positive
+write `RSET`, read the reply, keep the connection on a 2yz completion
 acknowledgement and abort otherwise - so no adapter knows the rule.
 
 Each adapter has a `drive` loop and an effect match. What stays adapter-side
@@ -378,8 +393,7 @@ post-TLS reply.
   none: `Shutdown::Both` on a blocking socket is a syscall that returns
   immediately, so that half already satisfies "teardown returns in bounded
   time". The rule holds on every teardown path; the two halves reach it by
-  different means, which is the one place they differ by design rather than by
-  omission. Pinned by
+  different means. Pinned by
   `abort_is_bounded_when_tls_style_shutdown_never_completes` (configured
   timeout) and
   `abort_is_bounded_by_the_teardown_cap_when_no_operation_timeout_is_set`
@@ -401,10 +415,14 @@ terminal projection; both private drivers return immediately on `Step::Finish`.
 Batch group-failure projection passes `Ok(())`, which cannot enter its
 error-result branch. Pooled wrappers install a connection (and an async permit)
 that only `Drop` takes; safe callers cannot dereference the wrapper during or
-after that drop. The async worker's two `OnceLock` cells each have one setter in
-the constructor. Ready bandwidth admission installs a grant, and polling the
+after that drop. The async pool installs `handle` and `worker_completion` once
+in the constructor when the worker is enabled. The pool's shutdown completion is initialized lazily by
+`get_or_init()` during shutdown, so concurrent and later callers share the same
+teardown work. Ready bandwidth admission installs a grant, and polling the
 peer only borrows the inner stream, leaving that grant available for completion.
-No server input or cancelled future can violate these ownership assertions.
+No server input or cancelled caller future can violate these ownership
+assertions. Shutdown separately asserts that its owned teardown task signals
+completion; if that task exits without signaling, awaiting completion panics.
 Pool checkout reports poisoned mutex state as an `Internal` error. Worker,
 recycle, shutdown and destructor paths recover the guarded ownership with
 `PoisonError::into_inner`; poison is not cleared, so recovered idle connections
@@ -423,9 +441,10 @@ LMTP final delivery-status loop holds `Broken` until every accepted recipient's 
 
 The direct and batch LMTP paths differ in one respect, preserved rather than
 unified when the drain moved into the core (`Op::CloseLmtpDrain { restore_ok }`):
-a direct LMTP send restores the stream to `Ok` after a clean drain, while an
-LMTP batch leaves it `Broken`. Neither connection is reusable in practice, since
-every drain retires it, so this is a difference in bookkeeping rather than in
+a direct LMTP send restores the stream to `Ok` after a clean drain without a
+421, while an LMTP batch leaves it `Broken`. A drain containing a 421 leaves
+the direct connection `Broken` too. Neither connection is reusable in practice,
+since every drain retires it, so this is a difference in bookkeeping rather than in
 behaviour - but it is a real difference and it is now visible in one place.
 
 Surplus bytes that have not yet crossed into the `BufReader` - still in the socket or a TLS record - cannot be observed without a read that would block against a well-behaved peer, and native-tls exposes no nonblocking peek that would make such a probe honest. So cleanliness is never positively established: every LMTP final-status drain sets a retirement flag (`should_retire()`), and the pool discards those connections at recycle instead of parking them. The cost is one reconnect per LMTP transaction; LMTP is local delivery, so that is cheaper than recycling a possibly desynchronized stream. SMTP connections are unaffected and still pool normally.
@@ -692,7 +711,7 @@ checkout a dead socket - and on the batch path, which is the account-level
 `send_smtp_batch`, that dead connection is pooled, so under
 `test_on_checkout(false)` the NEXT send writes `MAIL FROM` into it and fails
 `Unsent`. The check used to live only on the end-of-data arms, and a 421 to
-`MAIL FROM` parked the dying connection (smtp-CR8, 2026-09-07). Pinned by
+`MAIL FROM` parked the dying connection (2026-09-07). Pinned by
 `a_421_at_any_envelope_boundary_aborts_instead_of_parking` in the core tests
 and, at the end-of-data boundary,
 `a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection` and
@@ -773,7 +792,7 @@ Opt-in via explicit `send_raw_bdat` / `send_raw_bdat_with_options`. Defaults sti
 
 ## SIZE enforcement
 
-If the server advertises `SIZE=<bytes>`, message size is checked client-side before MAIL FROM, and the advertised value is included as `SIZE=<bytes>` on the wire. If EHLO repeats SIZE with multiple finite limits, the client enforces the smallest one, independent of hash iteration order. An unbounded `SIZE 0` entry does not relax a finite limit from another repeated entry.
+If the server advertises SIZE, message size is checked client-side against any finite limit before MAIL FROM. The inferred `SIZE=<bytes>` on MAIL FROM is the computed message size, not the server's limit; a caller-supplied SIZE is retained and validated instead. If EHLO repeats SIZE with multiple finite limits, the client enforces the smallest one, independent of hash iteration order. An unbounded `SIZE 0` entry does not relax a finite limit from another repeated entry.
 
 `SIZE 0` means "no declared maximum" per RFC 1870 section 3 and is stored as no limit. An unparseable limit is a hard `Parse` error on the EHLO reply rather than a silently dropped ceiling.
 
@@ -876,20 +895,22 @@ Unix-domain LMTP constructors are `#[cfg(unix)]` on sync and Tokio. Unix sockets
 
 The TLS backend matrix (rustls, boring-tls, rustls provider/verifier) has been removed. `CertificateStore::Default` always means the native-tls platform verifier.
 
-`TlsParameters` carries the connector, SNI hostname, and a `dangerous_*` set for accepting invalid certs / hostnames (test only).
+`TlsParameters` carries the connector and SNI hostname. Its builder exposes
+`dangerous_*` options for accepting invalid certificates or hostnames; these are
+public configuration options, not test-only APIs.
 
 ## Message builder
 
 `Message::builder()` produces a builder for typed headers (From, To, Cc, Bcc, Reply-To, Subject, Date, Message-Id, In-Reply-To, References, MIME-Version, Content-Type, ...). `reply_to_many(...)` for RFC 5322 address-list `Reply-To`.
 
-Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, RFC 2047 encoded-word otherwise. Avoids DKIM-breaking quoted-string rewrites at relays.
+Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, quotes and escapes ASCII names that need it, and uses RFC 2047 encoded words for names requiring encoding.
 
 Header folding is space-driven, so an unbreakable all-ASCII token (no spaces,
 hundreds of characters) is written verbatim and its line can exceed 78 octets:
-the crate deliberately misses the RFC 5322 Section 2.1.1 SHOULD-78 in that one
-shape and stays well inside the 998-octet MUST. Folding inside an atom would
-change the value, and RFC 2047 covers non-ASCII text only, so encoding an
-all-ASCII word to force a fold would be outside that mechanism's remit. Long
+the writer does not split such a token or enforce the RFC 5322 Section 2.1.1
+998-octet hard limit. A sufficiently long token can therefore exceed that limit
+as well as the recommended 78 octets. Folding inside an atom would change the
+value; callers must keep unbreakable tokens within the hard line limit. Long
 non-ASCII display names are unaffected - encoded words are individually short
 and the writer folds between them.
 
@@ -948,20 +969,17 @@ pass through normal cleanup, also releasing expired connections removed earlier
 in that pass. A stopped transport must not retain phantom live connections.
 Async setup already owns a semaphore permit with the same release-on-drop rule.
 
-Async recycle spawns bounded `abort()` teardown for broken or retired connections and for returns to a closed pool. The task retains the admission permit until teardown finishes, so replacement connections cannot exceed the live-connection bound. Abort closes the stream without sending QUIT.
-
 `PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. `max_size` bounds all live connections, checked out and idle, in both the blocking and async pools; checkout waits for a slot instead of dialing past the bound. Zero is rejected at checkout. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections without exceeding `max_size`. An idle timeout of zero disables expiration; a positive-`min_idle` worker checks for replacements once per second so a zero timeout cannot create a zero-delay loop. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.
 
-Async `Drop` performs no spawn and no I/O. A healthy checked-out connection is
-parked synchronously; a broken, retired, or shut-down connection is hard-dropped.
-Recycling therefore has no await point and no blocking call at all, which is why
-it is safe to run from `Drop`: there is no recycling future to be dropped before
-its first poll, and no close to block on an unresponsive peer. Explicit
-`shutdown()` owns graceful close work, runs closes concurrently, and each close
-is bounded by the connection's operation timeout or the teardown cap, whichever
-is smaller (see "Connection lifecycle"). The cap is what makes this a bound at
-all for a transport built with `timeout(None)`: `shutdown()` waits for the
-closes it starts, so one unresponsive TLS peer would otherwise hang it.
+Async `PooledConnection::drop` calls synchronous recycle: a healthy, non-retired
+connection is parked under the idle-set mutex and an availability waiter is
+notified. A broken or retired connection, or any connection returned to a closed
+pool, is instead moved with its admission permit into a spawned task. That task
+awaits bounded `abort()` teardown before releasing the permit, so a replacement
+cannot exceed the live-connection bound while teardown is pending. Recycling
+itself has no await point or network I/O; ownership moves into the task before
+its first poll. Abort closes the stream without sending QUIT, with the timeout
+bound described in "Connection lifecycle".
 
 Async shutdown stores one shared completion and runs idle-connection aborts and
 worker termination in an owned task. Dropping a shutdown caller does not cancel
@@ -1077,16 +1095,16 @@ lets batch recovery retry a transient refresh failure instead of asking the user
 for another password. Local auth classification reads typed error kinds; source
 Display text remains support diagnostics rather than a local auth discriminator.
 
-`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `ServerUnavailable`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
+`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `ServerUnavailable`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` distinguish missing extension support from exceeded advertised parameter limits (for example, missing FUTURERELEASE vs HOLDFOR over its maximum interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
 
 Internal pipeline errors carry value-side classification data:
 
 - `SmtpTransmissionState` (`Unsent` / `InFlight` / `Acknowledged`), attached via `with_attempt`.
-- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<Mechanism> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the session machine's selected authentication, which binds the `Mechanism` once per exchange, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for the genuinely pre-rung refusals: declining to pick a mechanism, refusing plaintext AUTH, an OAuth token-source failure, nonce generation. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
+- `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `Auth` alone carries a payload, `Auth { mechanism: Option<Mechanism> }`: the name sits on the variant rather than on `Error` so that stamping the auth phase forces a decision about which rung was in play, the same argument that puts `phase` on the value rather than on `SmtpErrorContext`. `Some` comes from the session machine's selected authentication, which binds the `Mechanism` once per exchange, so a `-PLUS` rung cannot desync from the AUTH line that framed it. `None` is for refusals before a mechanism is retained: declining to pick a mechanism, refusing plaintext AUTH, or nonce generation during SCRAM preparation. OAuth token resolution happens after selection, so the session stamps token-source failures with the selected mechanism. `or_phase` is set-if-absent with exactly one exception - an unnamed `Auth` stamp accepts the mechanism from a named one, because otherwise the inner `From<SaslError>` stamp would outrank the driver's named outer stamp and the SCRAM `e=` path would lose the name it had. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
 
 With `account-error`, OAuth token-source failures also carry bifrost-net's already-built `AccountError` projection through the low-level SMTP error. The SMTP translation boundary reapplies its actual SMTP or LMTP protocol and fixed send operation and idempotency context while preserving the source kind and cause chain. The token-source conversion passes no throttle scope because it has no SMTP transaction scope to name. SMTP reply classifications of `RateLimited` or `QuotaExhausted` explicitly carry `ThrottleScope::Account`. This keeps `AuthLost` and `RefreshTransient` distinct.
 
-`crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads command phase only from `error.phase()`, and classifies local failures by their explicit kind. Negotiation and channel-binding refusal use `Policy`, becoming `Authorization(PolicyBlocked)`; unsupported blocking token resolution and invalid credentials use `InvalidInput`, becoming `Request(Malformed)` regardless of AUTH phase. Unexpected PLAIN or excess LOGIN challenges and exhausted challenge budgets use `Parse`, becoming `Protocol(ParseFailed)`. An enterprise Outlook user expects policy repair for incompatible authentication settings, configuration repair for the wrong token-source transport, and a server protocol error for malformed challenges; none should demand a replacement password. Nonce entropy failures remain `LocalRuntime`, becoming `Internal(RuntimeFailure)`. Typed OAuth token-source projections pass through this boundary, so refresh failures stay retryable and terminal credential loss stays `AuthLost`. The auth lane is also where reply codes stop meaning what they mean elsewhere: `is_auth_lane` sends `504` and `504 5.5.4` to `Authorization(PolicyBlocked)` rather than to `Unsupported(Send)` or `Request(Malformed)`, since a server refusing a SASL mechanism has not said anything about whether it can send mail, and it refused before any credential crossed the wire, so `Authentication(_)` would send the user to re-enter credentials that were never presented. That is the same kind the local half of the condition already produced, so one condition now gets one answer whichever side noticed it. `454` and `4.7.0` on the same lane become `Authentication(RefreshTransient)`, which is RFC 4954's "temporary authentication failure" and the only kind meaning retry-but-refresh-first. Off the auth lane all four keep their RFC 5321 meanings. Where the phase carries a mechanism name, both auth lanes fold it into the `DiagnosticText::support_only` text; classification never reads it, and the support tier is not a preference but the only tier that can hold free-form text at all (`TelemetryView` carries none, pinned by `telemetry_has_no_free_form_text`). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
+`crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads command phase only from `error.phase()`, and classifies local failures by their explicit kind. Negotiation and channel-binding policy refusals use `Policy`, becoming `Authorization(PolicyBlocked)`; an unusable peer certificate during channel-binding extraction uses `Parse`, becoming `Protocol(ParseFailed)`; unsupported blocking token resolution and invalid credentials use `InvalidInput`, becoming `Request(Malformed)` regardless of AUTH phase. Unexpected PLAIN or excess LOGIN challenges and exhausted challenge budgets use `Parse`, becoming `Protocol(ParseFailed)`. An enterprise Outlook user expects policy repair for incompatible authentication settings, configuration repair for the wrong token-source transport, and a server protocol error for malformed challenges; none should demand a replacement password. Nonce entropy failures remain `LocalRuntime`, becoming `Internal(RuntimeFailure)`. Typed OAuth token-source projections pass through this boundary, so refresh failures stay retryable and terminal credential loss stays `AuthLost`. The auth lane is also where reply codes stop meaning what they mean elsewhere: `is_auth_lane` sends `504` and `504 5.5.4` to `Authorization(PolicyBlocked)` rather than to `Unsupported(Send)` or `Request(Malformed)`, since a server refusing a SASL mechanism has not said anything about whether it can send mail, and it refused before any credential crossed the wire, so `Authentication(_)` would send the user to re-enter credentials that were never presented. That is the same kind the local half of the condition already produced, so one condition now gets one answer whichever side noticed it. `454` and `4.7.0` on the same lane become `Authentication(RefreshTransient)`, which is RFC 4954's "temporary authentication failure" and the only kind meaning retry-but-refresh-first. Off the auth lane all four keep their RFC 5321 meanings. Where the phase carries a mechanism name, both auth lanes fold it into the `DiagnosticText::support_only` text; classification never reads it, and the support tier is not a preference but the only tier that can hold free-form text at all (`TelemetryView` carries none, pinned by `telemetry_has_no_free_form_text`). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
 
 Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. The `DATA` command itself is still pre-body: a failed `DATA` write or a lost reply to it is `Unsent` / `DataCommand` and resolves the same way (`SendPhase::DataIssued` counts as pre-body in `SendProgress::resolve`), because no message content was offered until the server's `354` started the body write. `InFlight` is reserved for failures from the body write onward (`DataBody`, `BdatBody`, `DataFinal`, `LmtpFinalStatus`).
 
@@ -1125,7 +1143,7 @@ Those lanes derive as a PERMANENT refusal: an SMTP 5xx is RFC 5321's permanent
 negative completion, and `bifrost-types`' `derive_server` reads the error's
 `protocol` field, which the SMTP translator stamps as SMTP or LMTP, so a
 554 at the terminator is `ProviderRefused` rather than the HTTP 5xx
-`Retry(SameRequest)` it derived before (smtp-CR10, 2026-09-07; see
+`Retry(SameRequest)` it derived before (2026-09-07; see
 `reference/error-model.md`, the Server row). After the body starts, LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
 
 ## Connection test harness
@@ -1187,23 +1205,25 @@ thing worth pinning.
 
 `test_support::Transcript` is the in-process scripted peer both connection
 drivers test against; it replaced the socket-listener tests, which were neither
-hermetic nor deterministic. `test_support` itself now binds no `TcpListener`
-and no `UnixListener`, spawns no threads and sleeps nowhere: the transport-level
-LMTP delivery pins (`lmtp_transport_returns_per_recipient_statuses` and its
+hermetic nor deterministic. `test_support` binds no `TcpListener`
+and no `UnixListener` and spawns no threads; timed async peers use Tokio timers
+under paused test time. The transport-level LMTP delivery pins (`lmtp_transport_returns_per_recipient_statuses` and its
 `tokio_` twin) run against a parked transcript connection, and the Unix-socket
 case pins the routing decision - builder wiring plus the TLS-over-Unix refusal
 raised inside `connection()` before any dial - since the kernel's socket is not
-the part a test can prove in-process. No test anywhere in the crate - unit or
-integration - binds a socket, spawns a listener thread or sleeps on the wall
-clock. The pre-AUTH refusal ladder is the last thing that did: the post-greeting
-authentication stage is factored into
+the part a test can prove in-process. `hermetic_transport_tests.rs` replaces
+the former ignored live-server transport tests with parked transcripts: blocking
+and Tokio message sends, blocking raw sends, and cloned blocking transports
+sending from two client threads before reuse on the main thread. The thread
+case uses a barrier and one pool slot, with no sleeps or sockets. The pre-AUTH refusal ladder uses
+transcripts: the post-greeting authentication stage is factored into
 `SmtpClient::authenticate_if_configured` (and its async twin) precisely so
 `plaintext_auth_is_refused_before_auth_command` can drive it against a
 transcript that scripts no AUTH step, where an AUTH command reaching the wire
 fails the write instead of producing the policy error. The escape-hatch mirror
 scripts the exact `AUTH PLAIN` line and the post-AUTH EHLO. A transcript is a
 greeting plus an ordered list of
-`expect(client_bytes, server_bytes)` steps. Three properties make it bite:
+`expect(client_bytes, server_bytes)` steps. These properties make it bite:
 
 - Each client write must match one scripted step byte-for-byte, so command
   batching shape (which commands share a write) is pinned, not just command
@@ -1286,15 +1306,15 @@ crates/smtp/src/
 │       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters
 │       ├── response.rs  - parser, enhanced status codes
-│       └── test_support.rs - in-process `Transcript` harness + mock servers
-└── error.rs             - Error, ErrorKind
+│       └── test_support.rs - in-process `Transcript` harness and timed peers
+└── error.rs             - message-builder Error (SMTP Error/ErrorKind live in transport/smtp/error.rs)
 ```
 
 ## SMTP-specific code style
 
 - `client::` is private; low-level connection/network stream types are crate-internal.
 - TLS uses native-tls unconditionally; rustls/boring features have been removed.
-- `#[non_exhaustive]` on `Error`, `ErrorKind`, DKIM enums, `CertificateStore`.
+- `#[non_exhaustive]` on message-builder `error::Error`, SMTP `ErrorKind`, DKIM enums, and `CertificateStore`; the opaque SMTP `Error` struct has private fields.
 - `AsyncTransport` requires `Sync` so borrowed methods return `Send` futures.
 - Async traits use native `impl Future + Send` return types; no `async-trait`.
 
@@ -1416,8 +1436,8 @@ OAuth credentials with no allowed advertised OAuth mechanism fail locally with
 a policy error in both drivers before certificate resolution or password
 selection. A token must never enter the password authentication ladder.
 
-`MessageError::TooManyFrom` remains public and is still produced by the message
-builder for multiple authors without Sender. Multiple authors with one Sender
+`error::Error::TooManyFrom` (locally aliased as `MessageError`) remains public
+and is still produced by the message builder for multiple authors without Sender. Multiple authors with one Sender
 are valid; header-derived envelope conversion instead returns `InvalidInput`
 for invalid author/Sender combinations.
 

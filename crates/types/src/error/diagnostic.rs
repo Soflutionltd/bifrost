@@ -93,6 +93,7 @@ pub enum DetailVisibility {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TelemetryView<'a> {
+    pub unsupported_reason: Option<super::kind::UnsupportedReason>,
     pub kind_discriminant: &'static str,
     pub message_key: &'static str,
     pub recovery_discriminant: &'static str,

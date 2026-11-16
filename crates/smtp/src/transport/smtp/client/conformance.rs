@@ -996,7 +996,7 @@ async fn oauth_token_resolution_uses_each_adapter_once_before_auth() {
             #[cfg(feature = "tokio")]
             Adapter::Async => ("current", 0, 1),
         };
-        let payload = bifrost_sasl::oauthbearer_payload("user", token);
+        let payload = bifrost_sasl::oauthbearer_payload("user", token).unwrap();
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
             .expect(

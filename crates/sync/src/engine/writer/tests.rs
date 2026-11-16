@@ -7,6 +7,7 @@ struct FlakyLedgerStore {
     fail_reads: std::sync::atomic::AtomicBool,
     fail_transitions: std::sync::atomic::AtomicBool,
     fail_writes: std::sync::atomic::AtomicBool,
+    wrong_backfill_selection: std::sync::atomic::AtomicBool,
 }
 
 impl CheckpointStore for FlakyLedgerStore {
@@ -54,7 +55,18 @@ impl CheckpointStore for FlakyLedgerStore {
                 + 'a,
         >,
     > {
-        self.inner.get_backfill(account, scope)
+        Box::pin(async move {
+            let mut selected = self.inner.get_backfill(account, scope).await?;
+            if self
+                .wrong_backfill_selection
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(checkpoint) = &mut selected
+            {
+                checkpoint.partition = bifrost_types::Partition(b"page:0:500".to_vec());
+                checkpoint.progress.items_done = 500;
+            }
+            Ok(selected)
+        })
     }
 
     fn put_ledger<'a>(
@@ -235,6 +247,7 @@ async fn seeded_store() -> Arc<FlakyLedgerStore> {
         fail_reads: std::sync::atomic::AtomicBool::new(false),
         fail_transitions: std::sync::atomic::AtomicBool::new(false),
         fail_writes: std::sync::atomic::AtomicBool::new(false),
+        wrong_backfill_selection: std::sync::atomic::AtomicBool::new(false),
     });
     let report = bifrost_types::InventoryCoverageReport::degraded(
         bifrost_types::CoverageDomain::full(email_scope()),
@@ -638,9 +651,16 @@ async fn failed_ack_proof_does_not_leak_into_an_unrelated_write() {
         .fail_transitions
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(
-        persist_ack_request(&account, &erased, &coverage, &mut ledger, &request)
-            .await
-            .is_err()
+        persist_ack_request(
+            &account,
+            &erased,
+            &coverage,
+            &mut ledger,
+            &request,
+            &mut HashSet::new()
+        )
+        .await
+        .is_err()
     );
     assert_eq!(ledger.open_debt().count(), 1);
     super::persist_ledger_only(&account, &erased, &ledger)
@@ -660,9 +680,16 @@ async fn failed_ack_proof_does_not_leak_into_an_unrelated_write() {
         .fail_transitions
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert!(
-        persist_ack_request(&account, &erased, &coverage, &mut ledger, &request)
-            .await
-            .is_ok()
+        persist_ack_request(
+            &account,
+            &erased,
+            &coverage,
+            &mut ledger,
+            &request,
+            &mut HashSet::new()
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(ledger.open_debt().count(), 0);
 }
@@ -733,4 +760,128 @@ async fn failed_repair_resolutions_do_not_leak_into_later_writes() {
 
     drop(tx);
     task.await.expect("writer exits");
+}
+
+#[test]
+fn resume_selection_must_not_hide_a_known_completion() {
+    let scope = email_scope();
+    let mut row = bifrost_types::BackfillCheckpoint {
+        scope: scope.clone(),
+        partition: bifrost_types::Partition(b"old partial".to_vec()),
+        progress_marker: None,
+        progress: bifrost_types::BackfillProgress {
+            items_done: 100,
+            ..Default::default()
+        },
+        envelope_version: bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
+    };
+    assert!(validate_backfill_selection(&scope, true, Some(&row)).is_err());
+    assert!(validate_backfill_selection(&scope, true, None).is_err());
+    assert!(validate_backfill_selection(&scope, false, Some(&row)).is_ok());
+    row.partition = crate::backfill::partitioner::completion_partition();
+    row.progress.items_done = 0;
+    assert!(validate_backfill_selection(&scope, true, Some(&row)).is_ok());
+}
+
+#[tokio::test]
+async fn writer_refuses_a_partial_resume_after_completion_and_forgets_it_on_reset() {
+    let store = seeded_store().await;
+    let (tx, task) = start_flaky_writer(Arc::clone(&store));
+    let writer = WriterHandle::new(tx);
+    let scope = email_scope();
+    writer
+        .persist_backfill(bifrost_types::BackfillCheckpoint {
+            scope: scope.clone(),
+            partition: crate::backfill::partitioner::completion_partition(),
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress::default(),
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                crate::cursor::ENGINE_VERSION,
+            ),
+        })
+        .await
+        .expect("complete");
+    store
+        .wrong_backfill_selection
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        writer.get_backfill(scope.clone()).await,
+        Err(Error::CheckpointStore(_))
+    ));
+    writer
+        .reset_account_for_schema_recovery()
+        .await
+        .expect("reset");
+    assert!(
+        writer
+            .get_backfill(scope)
+            .await
+            .expect("read after reset")
+            .is_none()
+    );
+    drop(writer);
+    task.await.expect("writer drained");
+}
+#[tokio::test]
+async fn refused_marker_ack_preserves_completion_selection_guard() {
+    for rejected in [false, true] {
+        let store = seeded_store().await;
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let writer = WriterHandle::new(tx.clone());
+        let scope = email_scope();
+        let checkpoint = bifrost_types::BackfillCheckpoint {
+            scope: scope.clone(),
+            partition: crate::backfill::partitioner::completion_partition(),
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress::default(),
+            envelope_version: bifrost_types::TraitEnvelopeVersion::new(
+                crate::cursor::ENGINE_VERSION,
+            ),
+        };
+        writer
+            .persist_backfill(checkpoint.clone())
+            .await
+            .expect("complete");
+        let publication = rejected.then(|| {
+            PendingCoverage::new().register(
+                Checkpoint::Change(change_cursor(b"different lane")),
+                crate::cursor::CoverageClaim::new(
+                    bifrost_types::InventoryCoverageReport::complete(
+                        bifrost_types::CoverageDomain::full(scope.clone()),
+                    ),
+                    crate::cursor::WalkGeneration::for_test(2),
+                ),
+            )
+        });
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::Ack(AckRequest {
+            scope: scope.clone(),
+            checkpoint: Checkpoint::Backfill(checkpoint),
+            publication,
+            complete: Some(done),
+        }))
+        .await
+        .expect("writer alive");
+        let outcome = wait.await.expect("ack answered");
+        if rejected {
+            assert!(outcome.is_err(), "mismatched receipt must be rejected");
+        } else {
+            assert!(matches!(
+                outcome,
+                Ok(AckOutcome::Withheld(CompletionRefusal::Unvouchable))
+            ));
+        }
+        store
+            .wrong_backfill_selection
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Both refusals leave the durable completion untouched. Forgetting its
+        // evidence would silently accept this partial row in the old order.
+        assert!(matches!(
+            writer.get_backfill(scope).await,
+            Err(Error::CheckpointStore(_))
+        ));
+        drop(writer);
+        drop(tx);
+        task.await.expect("writer drained");
+    }
 }

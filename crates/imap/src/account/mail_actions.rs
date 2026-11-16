@@ -5,7 +5,7 @@ use super::folder_registry::folder_role;
 use super::message_targets::{
     ThreadScope, group_by_folder, is_native_thread, resolve_thread_members, resolved_targets,
 };
-use super::{DecodedObjectId, ImapAccount, encode_object_id};
+use super::{DecodedObjectId, ImapAccount};
 use crate::types::{Flag, MailboxName};
 use bifrost_types::container::{ContainerId, FolderRole, MutationTarget};
 use bifrost_types::hydration::Importance;
@@ -16,10 +16,10 @@ use bifrost_types::{
 };
 
 /// One per-folder effect a direct PIM write committed.
+/// Preserve submitted source identities: an enterprise client correlates partial
+/// changes with the exact handles it supplied, including legacy spellings.
 pub(super) struct FolderEffect {
-    folder: MailboxName,
-    uids: super::UidSet,
-    uidvalidity: crate::types::UidValidity,
+    ids: Vec<bifrost_types::ObjectId>,
     effect: StepEffect,
     destination: Option<MailboxName>,
 }
@@ -52,18 +52,16 @@ impl From<AccountError> for FolderProgress {
 
 fn folder_effect_targets(effect: &FolderEffect) -> StepTargets {
     let mut refs: Vec<_> = effect
-        .uids
-        .identifiers()
-        .map(|uid| {
+        .ids
+        .iter()
+        .map(|id| {
             TargetRef::new(
                 if effect.destination.is_some() {
                     TargetRole::Source
                 } else {
                     TargetRole::Subject
                 },
-                ErrorScope::Message {
-                    id: encode_object_id(&effect.folder, effect.uidvalidity, uid),
-                },
+                ErrorScope::Message { id: id.clone() },
             )
         })
         .collect();
@@ -484,7 +482,12 @@ pub(crate) fn delete_thread(
             let trash = account
                 .folders
                 .role_folder(FolderRole::Trash)
-                .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
+                .ok_or_else(|| {
+                    super::error::unsupported_with_reason(
+                        AccountOperation::BulkMove,
+                        bifrost_types::UnsupportedReason::MissingMailboxRole,
+                    )
+                })?;
             return move_thread_inner(
                 &account,
                 thread,
@@ -498,7 +501,12 @@ pub(crate) fn delete_thread(
         let trash = account
             .folders
             .role_folder(FolderRole::Trash)
-            .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
+            .ok_or_else(|| {
+                super::error::unsupported_with_reason(
+                    AccountOperation::BulkMove,
+                    bifrost_types::UnsupportedReason::MissingMailboxRole,
+                )
+            })?;
         move_thread_inner(&account, thread, ContainerId(trash.account_id()), None)
             .await
             .map(|_| ())
@@ -602,9 +610,11 @@ async fn result_mutation(
             // landed but EXPUNGE failed. Never infer it from the error kind.
             for (epoch, uids) in &marked_deleted {
                 done.push(FolderEffect {
-                    folder: folder.clone(),
-                    uids: super::UidSet::from_numbers(uids.iter().copied()),
-                    uidvalidity: *epoch,
+                    ids: window
+                        .iter()
+                        .filter(|id| id.uidvalidity == *epoch && uids.contains(&id.uid.get()))
+                        .map(|id| id.id.clone())
+                        .collect(),
                     effect: StepEffect::MarkedDeleted,
                     destination: None,
                 });
@@ -646,9 +656,7 @@ async fn result_mutation(
                     None
                 };
                 let targets = folder_effect_targets(&FolderEffect {
-                    folder: folder.clone(),
-                    uids: super::UidSet::from_uids([id.uid]),
-                    uidvalidity: id.uidvalidity,
+                    ids: vec![id.id.clone()],
                     effect,
                     destination: destination.clone(),
                 });
@@ -666,20 +674,23 @@ async fn result_mutation(
             }
             // Preserve the selected epoch and aggregate one committed effect
             // per epoch/window, including successes beside a MODIFIED refusal.
-            let mut epochs: std::collections::BTreeMap<crate::types::UidValidity, Vec<u32>> =
-                Default::default();
+            let mut epochs: std::collections::BTreeMap<
+                crate::types::UidValidity,
+                Vec<bifrost_types::ObjectId>,
+            > = Default::default();
             for item in succeeded {
                 let id = window
                     .iter()
                     .find(|id| id.id.0 == item.0)
                     .expect("engine answers under submitted identity");
-                epochs.entry(id.uidvalidity).or_default().push(id.uid.get());
+                epochs
+                    .entry(id.uidvalidity)
+                    .or_default()
+                    .push(id.id.clone());
             }
-            for (uidvalidity, uids) in epochs {
+            for ids in epochs.into_values() {
                 done.push(FolderEffect {
-                    folder: folder.clone(),
-                    uids: super::UidSet::from_numbers(uids),
-                    uidvalidity,
+                    ids,
                     effect,
                     destination: destination.clone(),
                 });

@@ -314,6 +314,59 @@ pub(crate) struct Client<T: HttpTransport = ReqwestTransport> {
     /// with independent session state is a correctness bug, not an
     /// accounting detail.
     tally: Option<ByteTally>,
+    pub(crate) method_refusals: MethodRefusals,
+}
+
+/// Refusals survive unchanged rediscovery, but a changed advertisement or a
+/// successful method establishes fresh evidence of server support.
+pub(crate) type MethodRefusals = Arc<std::sync::Mutex<MethodRefusalState>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct MethodRefusalState {
+    methods: HashSet<(String, &'static str)>,
+    capabilities: Option<HashSet<(Option<String>, String)>>,
+}
+
+impl std::ops::Deref for MethodRefusalState {
+    type Target = HashSet<(String, &'static str)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.methods
+    }
+}
+
+impl std::ops::DerefMut for MethodRefusalState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.methods
+    }
+}
+
+impl MethodRefusalState {
+    fn observe_session(&mut self, session: &Session) {
+        let mut capabilities: HashSet<_> = session
+            .capabilities()
+            .map(|uri| (None, uri.clone()))
+            .collect();
+        for id in session.accounts() {
+            if let Some(account) = session.account(id.as_str()) {
+                capabilities.extend(
+                    account
+                        .capabilities()
+                        .map(|uri| (Some(id.to_string()), uri.clone())),
+                );
+            }
+        }
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|previous| previous != &capabilities)
+        {
+            // Outlook users expect upgraded server capabilities to be usable.
+            // An unchanged advertisement must retain the restart-loop guard.
+            self.methods.clear();
+        }
+        self.capabilities = Some(capabilities);
+    }
 }
 
 /// Inbound payload bytes attributed to one engine batch.
@@ -346,6 +399,7 @@ impl<T: HttpTransport> Clone for Client<T> {
         Self {
             inner: Arc::clone(&self.inner),
             tally: self.tally.clone(),
+            method_refusals: Arc::clone(&self.method_refusals),
         }
     }
 }
@@ -479,6 +533,7 @@ impl ClientBuilder {
 
         Ok(Client {
             tally: None,
+            method_refusals: MethodRefusals::default(),
             inner: Arc::new(ClientInner {
                 session_cell: SessionCell {
                     state: std::sync::Mutex::new(state),
@@ -1618,6 +1673,7 @@ impl<T: HttpTransport> Client<T> {
         transport.set_upload_concurrency(state.session().upload_concurrency());
         Ok(Client {
             tally: None,
+            method_refusals: MethodRefusals::default(),
             inner: Arc::new(ClientInner {
                 session_cell: SessionCell {
                     state: std::sync::Mutex::new(state),
@@ -1744,6 +1800,14 @@ impl<T: HttpTransport> Client<T> {
     /// with the `Session` itself; a partial swap would leave requests
     /// routed by a session no caller can observe.
     ///
+    pub(crate) fn observe_refusal_capabilities(&self) {
+        let session = self.session();
+        self.method_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_session(&session);
+    }
+
     /// Currently unwired: session divergence is handled by the lifecycle path,
     /// which wakes on a watch channel rather than polling. Kept and disclosed
     /// in `reference/jmap.md` rather than deleted - an audit finding it
@@ -1770,6 +1834,10 @@ impl<T: HttpTransport> Client<T> {
             .state
             .lock()
             .expect("session mutex poisoned");
+        self.method_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_session(state.session());
         *installed = state;
         self.inner.transport.set_api_concurrency(api_limit);
         self.inner.transport.set_upload_concurrency(upload_limit);
@@ -1817,6 +1885,7 @@ impl<T: HttpTransport> Client<T> {
         Self {
             inner: Arc::clone(&self.inner),
             tally: Some(tally.clone()),
+            method_refusals: Arc::clone(&self.method_refusals),
         }
     }
 

@@ -25,12 +25,96 @@ pub(crate) async fn establish_if_absent(
     scope: CursorScope,
     epoch: crate::cursor::LifecycleEpoch,
 ) -> RecoveryFollowUp {
+    establish_if_absent_inner(ctx, scope, epoch, true).await
+}
+
+pub(super) async fn establish_if_absent_after_schema_reset(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    epoch: crate::cursor::LifecycleEpoch,
+) -> RecoveryFollowUp {
+    establish_if_absent_inner(ctx, scope, epoch, false).await
+}
+
+async fn establish_if_absent_inner(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    epoch: crate::cursor::LifecycleEpoch,
+    allow_schema_reset: bool,
+) -> RecoveryFollowUp {
     if ctx.cursors.lifecycle_epoch(&scope) != epoch || ctx.cursors.snapshot(&scope).is_some() {
         return RecoveryFollowUp::None;
     }
     let Some(activity) = begin_scope_repair(ctx, &scope) else {
         return RecoveryFollowUp::ParkScope { scope, epoch };
     };
+    // A returning folder can still own a row absent from attach discovery.
+    // Read and classify it before deletion: an unreadable identity requires an
+    // account migration, including sibling completion markers, for the user to
+    // see all reminted objects.
+    let mut read_backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
+    let mut read_attempt = 0;
+    let stored = loop {
+        let stored = ctx.writer.get_change_cursor(scope.clone(), None).await;
+        if matches!(&stored, Err(error) if !matches!(error, Error::SchemaIncompatible))
+            && read_attempt + 1 < REOPEN_RETRY_BUDGET.0
+        {
+            read_attempt += 1;
+            let delay = read_backoff.record_failure(crate::backoff::jitter_seed());
+            if !sleep_unless_shutdown(delay, &ctx.shutdown).await {
+                return RecoveryFollowUp::None;
+            }
+            continue;
+        }
+        break stored;
+    };
+    let schema_error = match stored {
+        Err(Error::SchemaIncompatible) => Some(crate::engine_errors::cursor_decode_failure(
+            bifrost_types::AccountOperation::EstablishCursor,
+        )),
+        Ok(Some(cursor)) => crate::engine_errors::classify_envelope(
+            &cursor,
+            crate::engine_errors::CursorOrigin::Stored,
+            bifrost_types::AccountOperation::EstablishCursor,
+            &scope,
+        )
+        .err(),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(target: "bifrost.sync.changes", account = ?ctx.account_id,
+                scope = ?scope, error = %error, "cannot classify stored scope before restart");
+            // A running store failure must not immediately requeue itself in
+            // the pause-only parked lane and spin without a retry delay.
+            broadcast_terminated(
+                &ctx.delivery,
+                EventScope::Cursor(scope.clone()),
+                crate::engine_errors::establish_failure_error(
+                    scope,
+                    bifrost_types::AccountOperation::EstablishCursor,
+                ),
+            );
+            return RecoveryFollowUp::None;
+        }
+    };
+    if let Some(error) = schema_error {
+        if !allow_schema_reset {
+            broadcast_terminated(
+                &ctx.delivery,
+                EventScope::Cursor(scope.clone()),
+                crate::engine_errors::recovery_exhaustion_error(
+                    error,
+                    scope,
+                    bifrost_types::AccountOperation::EstablishCursor,
+                ),
+            );
+            return RecoveryFollowUp::None;
+        }
+        return Box::pin(super::schema::handle_schema_incompatible(
+            ctx,
+            HashMap::from([(scope, epoch)]),
+        ))
+        .await;
+    }
     if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
@@ -45,7 +129,7 @@ pub(crate) async fn establish_if_absent(
         return RecoveryFollowUp::None;
     }
     let admitted = ctx.control.admitted_by(&activity);
-    re_establish_scope_with_backoff(ctx, scope, &admitted, walk_fence).await;
+    re_establish_scope_inner(ctx, scope, &admitted, walk_fence, allow_schema_reset).await;
     RecoveryFollowUp::None
 }
 
@@ -176,6 +260,25 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
     control: &SyncControl,
     walk_fence: crate::cursor::ScopeFence,
 ) {
+    re_establish_scope_inner(ctx, scope, control, walk_fence, true).await;
+}
+
+pub(super) async fn re_establish_scope_after_schema_reset(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    control: &SyncControl,
+    walk_fence: crate::cursor::ScopeFence,
+) {
+    re_establish_scope_inner(ctx, scope, control, walk_fence, false).await;
+}
+
+async fn re_establish_scope_inner(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    control: &SyncControl,
+    walk_fence: crate::cursor::ScopeFence,
+    allow_schema_reset: bool,
+) {
     let mut backoff = crate::backoff::ReconnectBackoff::new(REOPEN_BACKOFF);
     let mut last_account_error: Option<AccountError> = None;
     let mut pacing = RepairPacing::default();
@@ -247,6 +350,25 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
                 ) {
                     RecoveryPlan::Engine(EngineDirective::DisableScope(quarantined)) => {
                         disable_scope(ctx, quarantined, err.clone()).await;
+                        return;
+                    }
+                    RecoveryPlan::Engine(EngineDirective::SchemaIncompatible) => {
+                        if !allow_schema_reset {
+                            // A fresh establishment rejected after the account
+                            // clear cannot be repaired by recursively clearing it.
+                            last_account_error = Some(err);
+                            break;
+                        }
+                        // This is an account migration, not another attempt at
+                        // the same unreadable per-scope row. Box the recursive
+                        // establishment edge; the account clear precedes it.
+                        let epoch = ctx.cursors.lifecycle_epoch(&scope);
+                        let followup = Box::pin(super::schema::handle_schema_incompatible(
+                            ctx,
+                            HashMap::from([(scope, epoch)]),
+                        ))
+                        .await;
+                        ctx.park_followup(followup);
                         return;
                     }
                     RecoveryPlan::Terminal(_) => {

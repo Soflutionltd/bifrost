@@ -188,12 +188,15 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
+        // Batches are assembled inside this library. An Outlook user cannot
+        // repair our failure to honor the session's advertised call budget.
         crate::Error::RequestCallLimit { max } => build(
-            PrimaryCause::Request(RequestCause::PayloadTooLarge {
-                detail: DiagnosticText::support_only(format!(
-                    "JMAP request exceeds maxCallsInRequest ({max})"
-                )),
-            }),
+            PrimaryCause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(DiagnosticText::support_only(format!(
+                    "JMAP batch exceeds maxCallsInRequest ({max})"
+                ))),
+            )),
             &ctx,
         )
         .try_build()
@@ -1598,6 +1601,21 @@ fn state_expiry_error(wire: JmapMethod, ctx: &JmapErrorContext) -> (PrimaryCause
 }
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
+    if method.repeated_unknown_method {
+        return unsupported_error(
+            ctx.operation,
+            ctx.scope(),
+            bifrost_types::UnsupportedReason::OperationUnavailable,
+            "server repeatedly refused a typed method after capability rediscovery",
+        )
+        .into_builder()
+        .push_cause(Cause::Wire(WireCause::Jmap(JmapMethod::UnknownMethod)))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
+        .try_build()
+        .expect("valid terminal method refusal");
+    }
     let method_type = method.error_type();
     let (primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
@@ -1615,10 +1633,11 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             },
             JmapMethod::ServerPartialFail,
         ),
+        // A typed method was dispatched under its capability contract. If
+        // the server no longer recognizes it, an Outlook user expects the
+        // account to rediscover support rather than permanently lose the action.
         MethodErrorType::UnknownMethod => (
-            PrimaryCause::Request(RequestCause::Unsupported {
-                operation: ctx.operation,
-            }),
+            PrimaryCause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::UnknownMethod,
         ),
         MethodErrorType::InvalidArguments => (
@@ -2726,14 +2745,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_method_maps_to_unsupported_operation() {
+    fn unknown_method_requires_capability_rediscovery() {
         let err = into_account_error(
             method_error("unknownMethod"),
             JmapErrorContext::new(AccountOperation::Search),
         );
         assert_eq!(
             err.kind(),
-            &AccountErrorKind::Unsupported(AccountOperation::Search)
+            &AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged)
+        );
+        assert_eq!(
+            err.recovery(),
+            &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartAccount)
         );
     }
 
@@ -3866,9 +3889,21 @@ mod refusal_contract_tests {
     use bifrost_types::RecoveryClass;
 
     #[test]
+    fn local_call_budget_overflow_is_an_internal_fault() {
+        let error = into_account_error(
+            crate::Error::RequestCallLimit { max: 1 },
+            JmapErrorContext::new(AccountOperation::Send),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
+    }
+
+    #[test]
     fn local_frame_and_upload_limits_are_payload_refusals() {
         for input in [
-            crate::Error::RequestCallLimit { max: 1 },
             crate::Error::RequestSizeLimit { max: 1, size: 2 },
             crate::Error::UploadSizeLimit { max: 1, size: 2 },
         ] {

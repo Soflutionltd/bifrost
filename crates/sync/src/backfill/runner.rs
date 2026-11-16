@@ -385,6 +385,17 @@ impl BackfillRunner {
                         filter_inventory_supersedes(&batch.items, &batch.removed, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
+                    // Validate removal projection before persisting a barrier. An
+                    // enterprise user must not be blocked on a page whose
+                    // removals the engine could never deliver. Projection is
+                    // scope-only, so one removal validates the entire page.
+                    if let Err(error) =
+                        crate::inventory_walk::removals(&scope, kept_removed.first().copied())
+                    {
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
+                        return Err(Error::Account(error));
+                    }
                     let verdict = walk.judge(&batch.coverage, publisher, generation).await?;
                     if verdict == PageVerdict::Stop {
                         match publisher.publish_inventory(

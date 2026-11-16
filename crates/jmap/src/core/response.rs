@@ -50,23 +50,20 @@ impl Response {
         &mut self,
         handle: &CallHandle<M>,
     ) -> crate::Result<M::Response> {
-        self.get_expected::<M>(
-            &handle.call_id,
-            handle.answer_context.method,
-            handle.answer_context,
-        )
+        self.get_expected::<M>(handle, handle.answer_context)
     }
 
     /// Extract a response for a method whose call id is known but which
     /// was not explicitly added to the request. RFC 8621's implicit
-    /// `Email/set` response uses the `EmailSubmission/set` call id.
+    /// `Email/set` response uses the `EmailSubmission/set` call id. Retain
+    /// that call's account identity and factory-owned refusal history, but
+    /// classify refusals under the implicit method's own name.
     pub(crate) fn get_method<M: JmapMethod>(
         &mut self,
-        call_id: &str,
+        handle: &CallHandle<impl JmapMethod>,
     ) -> crate::Result<M::Response> {
         self.get_expected::<M>(
-            call_id,
-            M::NAME,
+            handle,
             super::answer::AnswerContext {
                 method: M::NAME,
                 guarded: false,
@@ -77,15 +74,16 @@ impl Response {
 
     fn get_expected<M: JmapMethod>(
         &mut self,
-        call_id: &str,
-        expected_method: &'static str,
+        handle: &CallHandle<impl JmapMethod>,
         context: super::answer::AnswerContext,
     ) -> crate::Result<M::Response> {
+        let call_id = &handle.call_id;
+        let expected_method = context.method;
         let pos = self
             .raw
             .iter()
             .position(|(_, _, id)| id == call_id)
-            .ok_or_else(|| crate::Error::CallNotFound(call_id.to_string()))?;
+            .ok_or_else(|| crate::Error::CallNotFound(call_id.clone()))?;
 
         let (method_name, result, call_id) = self.raw.remove(pos);
 
@@ -101,9 +99,29 @@ impl Response {
                 let mut response = serde_json::from_str(raw.get())
                     .map_err(|source| crate::Error::ResultDecode { call_id, source })?;
                 M::stamp_response(&mut response, context);
+                handle
+                    .method_refusals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&(handle.account_id.clone(), expected_method));
                 Ok(response)
             }
-            RawCallResult::Error(e) => Err(e.into()),
+            RawCallResult::Error(mut error) => {
+                if matches!(
+                    error.error_type(),
+                    super::error::MethodErrorType::UnknownMethod
+                ) {
+                    // Outlook users expect one reconnect, then a clear refusal,
+                    // even when discovery keeps advertising the broken door.
+                    // Explicit and implicit responses share this one history.
+                    error.repeated_unknown_method = !handle
+                        .method_refusals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert((handle.account_id.clone(), expected_method));
+                }
+                Err(error.into())
+            }
         }
     }
 

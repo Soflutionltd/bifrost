@@ -650,10 +650,13 @@ async fn a_consumer_that_holds_pages_unread_stalls_the_backfill_producer() {
     // a promise about the consumer's own durability, made on whatever schedule
     // the consumer likes; the ring pressure it would have relieved was already
     // relieved by the read.
-    engine
-        .ack(&account_id, page.2)
-        .await
-        .expect("the ack persists");
+    assert_eq!(
+        engine
+            .ack(&account_id, page.2)
+            .await
+            .expect("the ack persists"),
+        bifrost_sync::AckOutcome::Durable,
+    );
     assert_eq!(
         settled_partition_count(&stub).await,
         after_one_read,
@@ -787,16 +790,19 @@ async fn no_backfill_page_is_lost_or_duplicated_under_the_bound() {
             // unbounded producer has to be given the chance to run away before
             // "it did not" means anything.
             tokio::time::sleep(Duration::from_millis(5)).await;
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 break;
             }
@@ -1150,6 +1156,9 @@ async fn ack_page_or_fenced(engine: &SyncEngine, account_id: &AccountId, event: 
                 .expect("acknowledgeable publication"),
         )
         .await;
+    if let Ok(outcome) = &outcome {
+        assert_eq!(*outcome, bifrost_sync::AckOutcome::Durable);
+    }
     if let Err(error) = outcome {
         assert!(
             matches!(
@@ -1253,16 +1262,19 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
         if backfill_checkpoint(&event).is_none() {
             continue;
         }
-        engine
-            .ack(
-                &account_id,
-                event
-                    .ack_token()
-                    .cloned()
-                    .expect("acknowledgeable publication"),
-            )
-            .await
-            .expect("the ack persists");
+        assert_eq!(
+            engine
+                .ack(
+                    &account_id,
+                    event
+                        .ack_token()
+                        .cloned()
+                        .expect("acknowledgeable publication"),
+                )
+                .await
+                .expect("the ack persists"),
+            bifrost_sync::AckOutcome::Durable,
+        );
     }
 
     // B joins BEHIND that page and carries the walk from here, acknowledging
@@ -1290,16 +1302,19 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
                     event.ack_token().cloned(),
                 );
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await
@@ -1315,10 +1330,13 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
     // numbered below it and really did receive it.
     drop(first);
     // And B acknowledges the marker it was legitimately given.
-    engine
-        .ack(&account_id, marker.2.expect("acknowledgeable publication"))
-        .await
-        .expect("the consumer's acknowledgement is honoured; only the marker is withheld");
+    assert_eq!(
+        engine
+            .ack(&account_id, marker.2.expect("acknowledgeable publication"))
+            .await
+            .expect("the consumer's acknowledgement is honoured; only the marker is withheld"),
+        bifrost_sync::AckOutcome::Withheld(bifrost_sync::CompletionRefusal::WalkNotWhole),
+    );
 
     assert!(
         !completion_recorded(&store, &account_id, &scope).await,
@@ -1420,16 +1438,19 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
         if backfill_checkpoint(&event).is_some() {
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     }
 
@@ -1453,16 +1474,19 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
                     event.ack_token().cloned(),
                 );
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await
@@ -1472,10 +1496,13 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
     // The loss lands after the publication, and B acknowledges the marker in good
     // faith. The writer refuses it - and that refusal has to travel.
     drop(first);
-    engine
-        .ack(&account_id, marker.2.expect("acknowledgeable publication"))
-        .await
-        .expect("the consumer's acknowledgement is honoured");
+    assert_eq!(
+        engine
+            .ack(&account_id, marker.2.expect("acknowledgeable publication"))
+            .await
+            .expect("the consumer's acknowledgement is honoured"),
+        bifrost_sync::AckOutcome::Withheld(bifrost_sync::CompletionRefusal::WalkNotWhole),
+    );
     assert!(
         !completion_recorded(&store, &account_id, &scope).await,
         "the marker must not be durable"
@@ -1527,16 +1554,19 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 return;
             }
@@ -1981,14 +2011,17 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
         None,
     )
     .await;
-    engine
-        .ack(
-            &account_id,
-            bifrost_sync::decode_ack_token(&token_bytes, &[7; 32])
-                .expect("restore the persisted acknowledgement"),
-        )
-        .await
-        .expect("the consumer's replayed acknowledgement is honoured");
+    assert_eq!(
+        engine
+            .ack(
+                &account_id,
+                bifrost_sync::decode_ack_token(&token_bytes, &[7; 32])
+                    .expect("restore the persisted acknowledgement"),
+            )
+            .await
+            .expect("the consumer's replayed acknowledgement is honoured"),
+        bifrost_sync::AckOutcome::Withheld(bifrost_sync::CompletionRefusal::Unvouchable),
+    );
     let mut third = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
@@ -2079,16 +2112,19 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
         if backfill_checkpoint(&event).is_some() {
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     }
 
@@ -2105,16 +2141,19 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
                 continue;
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 return;
             }
@@ -2359,16 +2398,19 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
                 continue;
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 return;
             }
@@ -2606,16 +2648,19 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
         .expect("the engine's sync permit is obtainable");
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
         if backfill_checkpoint(&event).is_some() {
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     }
 
@@ -2633,16 +2678,19 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
                 continue;
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 return;
             }
@@ -2777,16 +2825,19 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
                 // whatever it is now.
                 return;
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await;
@@ -2818,16 +2869,19 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
             };
             let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 return;
             }
@@ -2895,16 +2949,19 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
                 continue;
             }
             pages += 1;
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await
@@ -2934,16 +2991,19 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
             if checkpoint.partition.0 == b"complete:v2" {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await;
@@ -3005,16 +3065,19 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
             if backfill_checkpoint(&event).is_none() {
                 continue;
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             acked += 1;
         }
     })
@@ -3034,16 +3097,19 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
     // departure below really does sweep nothing.
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), first.recv()).await {
         if backfill_checkpoint(&event).is_some() {
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     }
     let walked_before_the_gap = stub.walked_partitions().len();
@@ -3168,16 +3234,19 @@ async fn a_completed_walk_does_not_strand_the_accounts_admission() {
             if checkpoint.partition.0 == b"complete:v2" {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
         }
     })
     .await;
@@ -3363,16 +3432,19 @@ async fn an_eagerly_acknowledging_consumer_never_strands_lane_capacity() {
             let completion = checkpoint.partition.0 == b"complete:v2";
             pages += 1;
             seen.extend(batch_ids(&event));
-            engine
-                .ack(
-                    &account_id,
-                    event
-                        .ack_token()
-                        .cloned()
-                        .expect("acknowledgeable publication"),
-                )
-                .await
-                .expect("the ack persists");
+            assert_eq!(
+                engine
+                    .ack(
+                        &account_id,
+                        event
+                            .ack_token()
+                            .cloned()
+                            .expect("acknowledgeable publication"),
+                    )
+                    .await
+                    .expect("the ack persists"),
+                bifrost_sync::AckOutcome::Durable,
+            );
             if completion {
                 break;
             }

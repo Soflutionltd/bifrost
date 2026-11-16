@@ -1316,16 +1316,24 @@ Graph scopes. The payload IS the sync state:
 `last_full_scan_at` throttle clock, a `live_ids` deletion baseline, and a
 `live_versions` change-key baseline.
 `public_folder_changes_stream`: incremental `find_items` since the
-watermark (emit `Updated` + `Folder` and `Mailbox(content)` `Added` scope
-changes, matching the inventory pass's dual membership), then a deletion
+watermark (emit `Updated` plus a `Folder` `Added` scope change), then a deletion
 reconcile throttled to `FULL_SCAN_INTERVAL_SECS` (3600). Every complete full scan reconciles the admitted mail projection: a retained
 id with a changed key emits `Updated`; a previously admitted item now absent
 or non-mail emits `Destroyed`; a newly admitted mail item emits the object
-and both memberships even below the watermark. An excluded item disappearing
+and its folder membership even below the watermark. An excluded item disappearing
 emits nothing. Incomplete walks cannot advance or reconcile this baseline. The EWS item shape carries read state, flag status,
 and categories through the same canonical token hash used by REST inventory.
 Incremental admissions, timestamped or not, join the capped id and version
 baseline before checkpointing, so a later scan does not re-emit them.
+Public-folder change memberships name only the polled folder, covered by its
+`CursorScope::Folder`. Inventory and membership discovery retain the content
+mailbox's `Owner` annotation; it describes ownership rather than a container.
+Only an Account cursor covers Owner, and Graph exposes collection cursors.
+The engine forwards change batches without filtering uncovered memberships,
+but an uncovered membership has no entry in its cursor routing index; a
+membership-specific invalidation would select no cursor. An enterprise Outlook
+user expects a public-folder change to refresh the folder that owns it, so
+Owner annotations are not emitted as independent scope changes.
 `live_ids` is hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000); above
 it the snapshot empties and the folder degrades to additions-only with one
 scoped `Warning`. `DateTimeReceived` is not a modification signal, so an
@@ -2949,6 +2957,11 @@ released through the ledger, and webhook effects are installed or undone by
 account-owned tasks. Providers never perform failure backoff or route directives.
 
 ## Unsupported error construction
+
+Push registration refused for missing push configuration or webhook endpoint
+carries `UnsupportedReason::ConfigurationUnavailable`. Unmappable push scopes
+carry `CursorScope`, including when a failed scope is promoted to the whole-call
+error. Existing scope correlation and recovery remain unchanged.
 
 Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.

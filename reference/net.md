@@ -1972,3 +1972,43 @@ This vocabulary does not replace SMTP's connector parameters or opportunistic
 upgrade policy.
 
 Ordinary Error Display omits arbitrary constructor messages and foreign sources, except local Network/Tls text. Generic account translation likewise omits foreign sources and encoding, header, URL and redirect prose; typed categories and transmission evidence remain.
+
+## Account session admission across incarnations
+
+`BandwidthRegistry::session_budget` supplies a separate physical-session
+semaphore keyed by account id. Factories sharing a Net registry share that
+budget across opens. The first live owner fixes its capacity (at least one);
+changing configuration requires every old owner and transport tail to exit.
+Weak registry entries do not pin budgets, but owned session permits do.
+Callers cancel their own waiters and must never close the shared semaphore.
+
+The IMAP factory acquires capacity before connecting its primed session and
+hands the permit to the driver at spawn, before keepalive or authentication.
+Failed and cancelled opens therefore retain capacity for any surviving driver
+tail. Subsequent pool dials use the same semaphore. Pool close cancels only its
+own waiters; it cannot poison the next incarnation's admission. Reconnect
+reserves its permit before retiring anything: a spare permit directly, else by
+having a live pool retire one parked or returned member, oldest pool first,
+so parked sessions in any overlapping incarnation can unblock replacement.
+Only one member is claimed and retired; checked-out and push sessions remain
+untouched. Admission times out without closing pools, which keep serving if
+replacement fails. `reference/imap.md` describes the bounded admission path. Enterprise users expect reconnect to honor the provider's
+session limit too.
+
+`BandwidthRegistry::session_state` associates typed protocol coordination state
+with the same account id and live semaphore. IMAP stores its admission mutex,
+separately locked ordered weak pool list and registration notification there,
+allowing distinct factories to reclaim parked sessions from the same budget.
+Admission coordination ends at permit handoff, before connect and discovery.
+Registration can proceed during another admission's capacity wait and wakes it
+to consider the newly available pool. Dropped pool registrations are
+pruned on the next open; in-flight reclaim waiters retain only pool internals,
+so they cannot pin the registered pool owner. State must not own the semaphore
+or an object owning it: entries retain state strongly, and are pruned after the
+weak semaphore expires on a later session-budget lookup. IMAP bounds both its
+coordination-lock wait and final permit wait by the command timeout, reporting
+a retryable Unsent transport timeout when capacity cannot be recovered.
+
+`session_state` returns `SessionStateError` when the supplied semaphore is not
+registered for that account in this registry. Refusal leaves coordination state
+unchanged; callers translate it at their protocol error boundary.

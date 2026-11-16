@@ -221,6 +221,55 @@ fn an_unreachable_page_is_retired_and_records_the_walk_loss() {
     );
 }
 
+/// Exercise both refusal callers through registration and the guarded send.
+/// Moving loss attribution into the send callback would re-enter the ledger's
+/// synchronous mutex and hang this test.
+#[test]
+fn closed_delivery_records_page_and_marker_loss_without_reentering_coverage() {
+    for marker in [false, true] {
+        let h = delivery_harness(4);
+        let _receiver = h.subscribe();
+        h.delivery.close();
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        drop(writer_rx);
+        let publisher = PagePublisher::new(
+            Arc::clone(&h.delivery),
+            h.control.clone(),
+            writer_tx,
+            CancellationToken::new(),
+        );
+        let scope = CursorScope::Account;
+        let fence = h.coverage.scope_fence(&scope);
+        let before = h.coverage.undelivered_watermark(&scope);
+        let checkpoint = Delivery::backfill_page("refused");
+        let event = MultiplexerEvent {
+            scope: EventScope::Cursor(scope.clone()),
+            event: Arc::new(SyncEvent::Done(Some(checkpoint.clone()))),
+            checkpoint: Some(checkpoint),
+            publication: None,
+        };
+        let reached = if marker {
+            publisher.publish_marker(event, before, fence)
+        } else {
+            publisher
+                .publish_page(
+                    event,
+                    crate::cursor::CoverageClaim::new(
+                        bifrost_types::InventoryCoverageReport::complete(
+                            bifrost_types::CoverageDomain::full(scope.clone()),
+                        ),
+                        h.coverage.next_generation(),
+                    ),
+                    fence,
+                )
+                .expect("current fence")
+        };
+        assert!(!reached);
+        assert_eq!(h.coverage.pending_checkpoints(), 0);
+        assert_ne!(h.coverage.undelivered_watermark(&scope), before);
+    }
+}
+
 /// Projection is caller-controlled iteration, so it can deterministically
 /// reset after the old implementation's early fence read and before its send.
 /// That implementation publishes and leaves a stale batch in the receiver.
@@ -964,4 +1013,53 @@ fn registered_pages_and_markers_are_not_sent_after_invalidation() {
             ));
         }
     }
+}
+
+// Registration and sending are separate synchronous operations. Stage a live
+// publication in that gap rather than relying on thread scheduling.
+#[test]
+fn a_superseded_change_inventory_page_is_still_sent() {
+    let h = delivery_harness(4);
+    let mut receiver = h.subscribe();
+    let scope = CursorScope::Account;
+    let fence = h.coverage.scope_fence(&scope);
+    let checkpoint = account_change_checkpoint(b"inventory");
+    let claim = || crate::cursor::CoverageClaim {
+        reports: Vec::new(),
+        generation: h.coverage.next_generation(),
+    };
+    let inventory = h
+        .control
+        .publish_checkpoint_if_fence(checkpoint.clone(), claim(), fence)
+        .expect("inventory registered");
+    let live = h
+        .control
+        .publish_checkpoint_if_fence(account_change_checkpoint(b"live"), claim(), fence)
+        .expect("live publication supersedes inventory");
+    assert_ne!(inventory, live);
+    assert_eq!(h.coverage.pending_checkpoints(), 1);
+    let event = MultiplexerEvent {
+        scope: EventScope::Cursor(scope.clone()),
+        event: Arc::new(SyncEvent::Batch(bifrost_types::Batch {
+            items: crate::inventory_walk::created(&[bifrost_types::ObjectId("page-item".into())])
+                .collect(),
+            page_boundary: bifrost_types::PageBoundary::Final,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: Some(checkpoint.clone()),
+        })),
+        checkpoint: Some(checkpoint.clone()),
+        publication: Some(inventory.clone()),
+    };
+    assert_eq!(
+        h.delivery
+            .publish_inventory_if_fence(event, &h.coverage, &scope, fence),
+        Some(true)
+    );
+    let received = receiver
+        .try_recv()
+        .expect("superseded inventory still delivered");
+    assert!(matches!(received.event.as_ref(), SyncEvent::Batch(batch) if batch.items.len() == 1));
+    assert_eq!(received.checkpoint, Some(checkpoint));
+    assert_eq!(received.ack_token(), Some(&inventory));
 }

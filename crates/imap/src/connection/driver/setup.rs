@@ -30,20 +30,8 @@ pub(in crate::connection) async fn setup_then_drive(
     let mut state = state::ProtocolState::new();
     state.set_tls_active(setup.tls_mode.uses_implicit_tls());
     let mut tags = tag::TagGenerator::new();
-    // One absolute deadline and one cumulative peer allowance span greeting,
-    // CAPABILITY, STARTTLS and its refresh. Outlook users expect a stalled dial
-    // to return for retry, with evidence of any setup command already written.
-    reader.set_peer_timeout(Some(setup.timeout));
     let baseline = reader.written();
-    let result = tokio::time::timeout(
-        setup.timeout,
-        initialize(&mut reader, &mut state, &mut tags, &mut events, setup),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(Error::timeout()
-            .with_attempt(super::wire_send::write_failure_evidence(&reader, baseline)))
-    });
+    let result = initialize(&mut reader, &mut state, &mut tags, &mut events, setup).await;
     if let Err(error) = result {
         let error = if error.attempt().is_none() {
             error.with_attempt(super::wire_send::write_failure_evidence(&reader, baseline))
@@ -70,9 +58,23 @@ async fn initialize(
     events: &mut DriverEventSink,
     setup: Setup,
 ) -> Result<(), Error> {
-    let greeting = reader
-        .read_greeting()
-        .await
+    // Enterprise users expect a slow but progressing setup to retain each
+    // phase's allowance. Each phase remains bounded, including admission;
+    // cancellation still destroys the driver and its owned transport.
+    macro_rules! phase {
+        ($budget:expr, $work:expr) => {{
+            let budget = $budget;
+            reader.set_peer_timeout(Some(budget));
+            let baseline = reader.written();
+            tokio::time::timeout(budget, $work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::timeout()
+                        .with_attempt(super::wire_send::write_failure_evidence(reader, baseline)))
+                })
+        }};
+    }
+    let greeting = phase!(setup.timeout, reader.read_greeting())
         .map_err(|error| error.with_attempt(bifrost_types::TransmissionState::Unsent))?;
     let Response::Greeting(greeting) = greeting else {
         return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
@@ -86,22 +88,29 @@ async fn initialize(
         ensure_starttls_session(state)?;
     }
     if state.capabilities().is_empty() {
-        super::upgrade::required_capability_refresh(reader, state, tags, events).await?;
+        phase!(
+            setup.timeout,
+            super::upgrade::required_capability_refresh(reader, state, tags, events)
+        )?;
     }
     if setup.tls_mode.uses_starttls() {
         ensure_starttls_available(state)?;
         lifecycle::validate_tls_server_name(&setup.host)?;
-        super::upgrade::run_starttls_upgrade(
-            reader,
-            state,
-            tags,
-            events,
-            setup.tls_connector,
-            setup.host,
-            setup.tls_active,
-            &CommitGate::committed(),
-        )
-        .await?;
+        // The atomic upgrade always runs three phases: STARTTLS, handshake,
+        // then CAPABILITY. Keep their combined allowance across the stream swap.
+        phase!(
+            setup.timeout.saturating_mul(3),
+            super::upgrade::run_starttls_upgrade(
+                reader,
+                state,
+                tags,
+                events,
+                setup.tls_connector,
+                setup.host,
+                setup.tls_active,
+                &CommitGate::committed(),
+            )
+        )?;
     }
     Ok(())
 }

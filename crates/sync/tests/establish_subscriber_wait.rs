@@ -68,10 +68,13 @@ async fn deferred_inventory_waits_again_when_its_first_subscriber_leaves() {
         loop {
             let event = receiver.recv().await.expect("publication");
             if event.checkpoint.is_some() {
-                engine
-                    .ack(&id, event.ack_token().cloned().expect("ack token"))
-                    .await
-                    .expect("ack");
+                assert_eq!(
+                    engine
+                        .ack(&id, event.ack_token().cloned().expect("ack token"))
+                        .await
+                        .expect("ack"),
+                    bifrost_sync::AckOutcome::Durable,
+                );
                 break;
             }
         }

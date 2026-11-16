@@ -143,8 +143,10 @@ pub(crate) enum WriterRequest {
     /// and re-emitting acknowledged pages is idempotent. There is no completion
     /// marker to lose here either: it was withheld by the same condition that
     /// sends this.
+    /// The stamped request is the only carrier of the scope, so the scope and
+    /// the stamp checked against it can never disagree.
     DiscardBackfillProgress {
-        scope: CursorScope,
+        request: crate::cursor::coverage::BackfillDiscard,
         done: oneshot::Sender<Result<(), Error>>,
     },
     /// Clear every durable row of the account, completion markers included,
@@ -284,9 +286,9 @@ impl std::fmt::Debug for WriterRequest {
                 .debug_struct("PersistBackfill")
                 .field("scope", &checkpoint.scope)
                 .finish(),
-            Self::DiscardBackfillProgress { scope, .. } => f
+            Self::DiscardBackfillProgress { request, .. } => f
                 .debug_struct("DiscardBackfillProgress")
-                .field("scope", scope)
+                .field("scope", &request.scope)
                 .finish(),
             Self::ResetAccountForSchemaRecovery { .. } => {
                 f.write_str("ResetAccountForSchemaRecovery")

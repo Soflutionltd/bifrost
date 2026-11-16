@@ -314,7 +314,7 @@ fn a_search_page_refuses_cursors_and_limits_it_cannot_honour() {
 }
 
 #[test]
-fn the_search_cursor_encoding_is_frozen() {
+fn the_search_position_encoding_is_frozen() {
     let position = SearchPosition {
         folder: MailboxName::new("INBOX").unwrap(),
         uidvalidity: crate::types::UidValidity::new(7).expect("nonzero epoch"),
@@ -566,4 +566,225 @@ fn flatten_thread_deep_chain_preserves_preorder() {
     flatten_thread(&root, &mut uids);
     assert!(uids.into_iter().eq(1..=50_001));
     drop(root);
+}
+
+#[test]
+fn search_continuations_bind_filter_provider_query_and_surface_but_not_limit() {
+    let folder = MailboxName::new("INBOX").unwrap();
+    let mut request = SearchRequest::filter(SearchFilter::Subject("quarterly".into()));
+    request.provider_query = Some("UNSEEN".into());
+    request.limit = Some(1);
+    let mut pager = SearchPager::new(&request, None, AccountOperation::SearchMessages).unwrap();
+    pager
+        .accept(
+            &folder,
+            crate::types::UidValidity::new(7).unwrap(),
+            vec![(1, 1), (2, 2)],
+            |uid| uid,
+        )
+        .unwrap();
+    request.page_cursor = pager.finish().next_cursor;
+    assert!(request.page_cursor.is_some());
+    request.limit = Some(20);
+    assert!(SearchPager::<u32>::new(&request, None, AccountOperation::SearchMessages).is_ok());
+    let mut changed = request.clone();
+    changed.filter = Some(SearchFilter::Subject("annual".into()));
+    assert!(SearchPager::<u32>::new(&changed, None, AccountOperation::SearchMessages).is_err());
+    changed = request.clone();
+    changed.provider_query = Some("SEEN".into());
+    assert!(SearchPager::<u32>::new(&changed, None, AccountOperation::SearchMessages).is_err());
+    assert!(SearchPager::<u32>::new(&request, None, AccountOperation::Search).is_err());
+}
+
+#[test]
+fn unbound_search_positions_are_refused_cleanly() {
+    let position = SearchPosition {
+        folder: MailboxName::new("INBOX").unwrap(),
+        uidvalidity: crate::types::UidValidity::new(7).unwrap(),
+        key: crate::types::Uid::new(9).unwrap(),
+    };
+    let mut request = SearchRequest::default();
+    request.page_cursor = Some(position.encode().into());
+    let error = SearchPager::<u32>::new(&request, None, AccountOperation::SearchMessages)
+        .err()
+        .expect("an unbound cursor must restart");
+    assert!(matches!(
+        error.chain().outermost(),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("page_cursor"),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn search_quarantines_folder_failures_without_claiming_a_complete_total() {
+    use bifrost_types::{AccountErrorBuilder, PrimaryCause, ResourceKind};
+    let folder = MailboxName::new("Shared").unwrap();
+    let gone = AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::NotFound {
+        what: ResourceKind::Mailbox,
+        id: Some(folder.account_id()),
+    }))
+    .operation(AccountOperation::SearchMessages)
+    .try_build()
+    .unwrap();
+    let denied = super::super::error::test_support::personal_permission_denied();
+    let scope = super::super::folder_scope(&folder);
+    let revoked = denied.clone().revoke_foreign_scope(
+        scope.clone(),
+        Some(&bifrost_types::PrincipalId("owner".into())),
+    );
+    for error in [gone, denied, revoked] {
+        let mut pager = SearchPager::new(
+            &SearchRequest::default(),
+            None,
+            AccountOperation::SearchMessages,
+        )
+        .unwrap();
+        pager.skip_or_fail(&folder, error.clone()).unwrap();
+        pager
+            .accept(
+                &MailboxName::new("Z").unwrap(),
+                crate::types::UidValidity::new(1).unwrap(),
+                vec![(1, 1)],
+                |uid| uid,
+            )
+            .unwrap();
+        let page = pager.finish();
+        assert_eq!(page.items, [1]);
+        assert_eq!(page.estimated_total, None);
+        assert_eq!(page.skipped_scopes.len(), 1);
+        assert_eq!(
+            page.skipped_scopes[0].scope,
+            bifrost_types::ErrorScope::Cursor(scope.clone())
+        );
+        assert_eq!(page.skipped_scopes[0].error.kind(), error.kind());
+    }
+}
+
+#[test]
+fn search_does_not_quarantine_account_or_query_failures() {
+    use super::super::error::test_support;
+    let folder = MailboxName::new("INBOX").unwrap();
+    for error in [
+        test_support::discovery_transport(AccountOperation::SearchMessages),
+        test_support::expired_auth(),
+        pim_malformed(AccountOperation::SearchMessages, "bad query"),
+        super::super::error::unsupported(AccountOperation::SearchMessages),
+        search_cursor_voided(AccountOperation::SearchMessages, &folder),
+    ] {
+        let mut pager = SearchPager::<u32>::new(
+            &SearchRequest::default(),
+            None,
+            AccountOperation::SearchMessages,
+        )
+        .unwrap();
+        assert!(pager.skip_or_fail(&folder, error).is_err());
+    }
+}
+
+#[test]
+fn discovery_gaps_join_folder_failures_once_and_respect_mail_restrictions() {
+    use bifrost_types::ErrorScope;
+    let folder = MailboxName::new("Shared/Inbox").unwrap();
+    let error = super::super::error::test_support::personal_permission_denied();
+    let skips = vec![
+        SkippedScope {
+            scope: ErrorScope::Namespace {
+                prefix: "Shared/".into(),
+            },
+            error: error.clone(),
+        },
+        SkippedScope {
+            scope: ErrorScope::Cursor(super::super::folder_scope(&folder)),
+            error: error.clone(),
+        },
+        SkippedScope {
+            scope: ErrorScope::ContactCollection,
+            error: error.clone(),
+        },
+    ];
+    for op in [AccountOperation::Search, AccountOperation::SearchMessages] {
+        let mut pager = SearchPager::<u32>::new(&SearchRequest::default(), None, op).unwrap();
+        pager.include_discovery_skips(&skips, None);
+        pager.include_discovery_skips(&skips, None);
+        pager.skip_or_fail(&folder, error.clone()).unwrap();
+        let page = pager.finish();
+        assert_eq!(page.skipped_scopes.len(), 2);
+        assert_eq!(page.estimated_total, None);
+        let inbox = MailboxName::new("INBOX").unwrap();
+        let mut pager =
+            SearchPager::<u32>::new(&SearchRequest::default(), Some(&inbox), op).unwrap();
+        pager.include_discovery_skips(&skips, Some(&inbox));
+        assert!(pager.finish().skipped_scopes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn search_pages_expose_open_discovery_gaps_on_both_surfaces() {
+    use super::super::test_support::scripted_account_parts;
+    use crate::connection::test_support::{driver_pair, preauth_greeting};
+    let (conn, _peer) = driver_pair(&preauth_greeting("IMAP4rev1 THREAD=REFERENCES")).await;
+    let mut parts = scripted_account_parts(conn, 1);
+    parts.capabilities.pim_methods.search = true;
+    parts.capabilities.pim_methods.search_messages = true;
+    parts.discovery_skips.push(SkippedScope {
+        scope: bifrost_types::ErrorScope::Account,
+        error: super::super::error::test_support::discovery_transport(AccountOperation::Discover),
+    });
+    let account = ImapAccount::new(parts);
+    let messages = search_messages(account.clone(), SearchRequest::default())
+        .await
+        .unwrap();
+    let threads = search(account, SearchRequest::default()).await.unwrap();
+    assert_eq!(messages.skipped_scopes.len(), 1);
+    assert_eq!(threads.skipped_scopes.len(), 1);
+    assert_eq!(messages.estimated_total, None);
+    assert_eq!(threads.estimated_total, None);
+}
+
+#[test]
+fn runtime_search_skips_survive_every_continuation_and_deduplicate_discovery() {
+    for op in [AccountOperation::Search, AccountOperation::SearchMessages] {
+        for kind in 0..=2 {
+            let folder = MailboxName::new("A/shared").unwrap();
+            let healthy = MailboxName::new("Z").unwrap();
+            let skip = restored_runtime_skip(&folder, kind, op);
+            let mut request = SearchRequest::default();
+            request.limit = Some(1);
+            let mut pager = SearchPager::new(&request, None, op).unwrap();
+            pager.skip_or_fail(&folder, skip.error.clone()).unwrap();
+            let epoch = crate::types::UidValidity::new(7).unwrap();
+            pager
+                .accept(&healthy, epoch, vec![(1, 1), (2, 2), (3, 3)], |uid| uid)
+                .unwrap();
+            let mut page = pager.finish();
+            for expected in [2, 3] {
+                request.page_cursor = page.next_cursor.take();
+                assert!(request.page_cursor.is_some());
+                let mut pager = SearchPager::new(&request, None, op).unwrap();
+                // The quarantine lies before the resumed folder and will never
+                // be visited again. Cursor state alone must disclose the gap.
+                assert_eq!(
+                    pager
+                        .folders(vec![folder.clone(), healthy.clone()])
+                        .as_slice(),
+                    std::slice::from_ref(&healthy)
+                );
+                if expected == 3 {
+                    pager.include_discovery_skips(std::slice::from_ref(&skip), None);
+                }
+                pager
+                    .accept(&healthy, epoch, vec![(1, 1), (2, 2), (3, 3)], |uid| uid)
+                    .unwrap();
+                page = pager.finish();
+                assert_eq!(page.items, [expected]);
+                assert_eq!(page.skipped_scopes.len(), 1);
+                assert_eq!(page.skipped_scopes[0].scope, skip.scope);
+                assert_eq!(page.skipped_scopes[0].error.kind(), skip.error.kind());
+                assert_eq!(page.estimated_total, None);
+            }
+            assert!(page.next_cursor.is_none());
+        }
+    }
 }

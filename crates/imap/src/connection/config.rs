@@ -93,14 +93,11 @@ impl ImapConfig {
         policy: &crate::types::AuthPolicy,
         meter_sink: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+        leases: &super::LeaseHandoff,
     ) -> Result<(ImapConnection, crate::types::AuthOutcome), Error> {
-        let conn = ImapConnection::connect_config_metered(
-            self,
-            meter_sink,
-            bandwidth_budget,
-            &super::LeaseHandoff::none(),
-        )
-        .await?;
+        let conn =
+            ImapConnection::connect_config_metered(self, meter_sink, bandwidth_budget, leases)
+                .await?;
         let outcome = conn
             .authenticate_best(credentials, policy, self.command_timeout)
             .await?;

@@ -239,11 +239,11 @@ type EmailStateTransition = (
 /// id the server keys its answer by, never a foreign-encoded id.
 fn take_implicit_email_set(
     response: &mut crate::core::response::Response,
-    call_id: &str,
+    handle: &crate::core::request::CallHandle<EmailSubmissionSet>,
     email: &EmailId,
     on_success: OnSuccess,
 ) -> (Option<EmailStateTransition>, ImplicitOutcome) {
-    let mut result = match response.get_method::<EmailSet>(call_id) {
+    let mut result = match response.get_method::<EmailSet>(handle) {
         Ok(result) => result,
         Err(error) => {
             let refused = matches!(
@@ -558,7 +558,7 @@ pub(crate) fn send_message<T: HttpTransport>(
             Ok(email_id) => {
                 let (state, outcome) = take_implicit_email_set(
                     &mut response,
-                    &submission_handle.call_id,
+                    &submission_handle,
                     email_id,
                     on_success,
                 );
@@ -566,7 +566,7 @@ pub(crate) fn send_message<T: HttpTransport>(
             }
             Err(_) => (
                 response
-                    .get_method::<EmailSet>(&submission_handle.call_id)
+                    .get_method::<EmailSet>(&submission_handle)
                     .ok()
                     .and_then(|result| {
                         state_cache::set_transition(result.old_state(), result.new_state())
@@ -737,7 +737,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             Ok(email_id) => {
                 let (state, outcome) = take_implicit_email_set(
                     &mut response,
-                    &submission_handle.call_id,
+                    &submission_handle,
                     email_id,
                     on_success,
                 );
@@ -745,7 +745,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             }
             Err(_) => (
                 response
-                    .get_method::<EmailSet>(&submission_handle.call_id)
+                    .get_method::<EmailSet>(&submission_handle)
                     .ok()
                     .and_then(|result| {
                         state_cache::set_transition(result.old_state(), result.new_state())
@@ -865,7 +865,7 @@ pub(crate) fn draft_send<T: HttpTransport>(
         // the stale state will be reconciled by the next conditional mutation.
         let (implicit_state, implicit) = take_implicit_email_set(
             &mut response,
-            &submission_handle.call_id,
+            &submission_handle,
             &draft_id,
             OnSuccess::File,
         );

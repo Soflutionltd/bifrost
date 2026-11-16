@@ -11,7 +11,21 @@ impl Writer {
         let account_id = self.account_id.clone();
         let store = Arc::clone(&self.store);
 
-        let _ = done.send(store.get_backfill(&account_id, &scope).await);
+        let result = store
+            .get_backfill(&account_id, &scope)
+            .await
+            .and_then(|selected| {
+                validate_backfill_selection(
+                    &scope,
+                    self.completed_backfills.contains(&scope),
+                    selected.as_ref(),
+                )?;
+                if selected.as_ref().is_some_and(proves_backfill_completion) {
+                    self.completed_backfills.insert(scope);
+                }
+                Ok(selected)
+            });
+        let _ = done.send(result);
     }
     pub(super) async fn persist_backfill(
         &mut self,
@@ -22,6 +36,8 @@ impl Writer {
         let store = Arc::clone(&self.store);
         let ledger = self.ledger.as_mut().expect("ledger loaded before dispatch");
 
+        let complete_scope =
+            proves_backfill_completion(&checkpoint).then(|| checkpoint.scope.clone());
         let result = store
             .apply_transition(
                 &account_id,
@@ -31,13 +47,26 @@ impl Writer {
                 },
             )
             .await;
+        if result.is_ok()
+            && let Some(scope) = complete_scope
+        {
+            self.completed_backfills.insert(scope);
+        }
         let _ = done.send(result);
     }
     pub(super) async fn discard_backfill_progress(
         &mut self,
-        scope: CursorScope,
+        request: crate::cursor::coverage::BackfillDiscard,
         done: oneshot::Sender<Result<(), Error>>,
     ) {
+        // A producer can wait for queue admission while a reset replaces the walk.
+        // A user expects that replacement's earned progress to survive an old
+        // loss. Refuse stale requests before touching completion state or debt.
+        if !self.coverage.backfill_discard_is_current(&request) {
+            let _ = done.send(Ok(()));
+            return;
+        }
+        let scope = request.scope;
         let account_id = self.account_id.clone();
         let store = Arc::clone(&self.store);
         let coverage = Arc::clone(&self.coverage);
@@ -64,8 +93,16 @@ impl Writer {
         // publication inside it.
         // Unbounded: the orchestrator sends this BEFORE its retry mints
         // anything, so there is nothing newer to protect.
-        let discarded =
-            discard_backfill(&account_id, &store, &coverage, ledger, &scope, None).await;
+        let discarded = discard_backfill(
+            &account_id,
+            &store,
+            &coverage,
+            ledger,
+            &scope,
+            None,
+            &mut self.completed_backfills,
+        )
+        .await;
         let _ = done.send(discarded);
     }
     pub(super) async fn reset_account_for_schema_recovery(
@@ -98,6 +135,7 @@ impl Writer {
         // clear left them in place, and a delayed `ReattachAbort` must
         // still find its ownership to delete them.
         if cleared.is_ok() {
+            self.completed_backfills.clear();
             provisional.clear();
         }
         // Pass 2 closes the window the clear's await opened: anything
@@ -129,6 +167,11 @@ impl Writer {
                 "account reset could not persist the debt of the publications it retired"
             );
         }
+        // No discard request is settled here. Pass 1 moved every scope's
+        // fence, so a request recorded before it is stale and the stamp check
+        // in `discard_backfill_progress` refuses it wherever it is delivered,
+        // detach drain included. Taking requests here would also take a
+        // current one recorded after pass 2, leaving a real loss unrepaired.
         let _ = done.send(cleared.and(second));
     }
     pub(super) async fn reset_scope(
@@ -171,6 +214,7 @@ impl Writer {
             persist_ledger_only(&account_id, &store, ledger).await?;
             if delete_backfill {
                 store.delete_backfill(&account_id, &scope).await?;
+                self.completed_backfills.remove(&scope);
             }
             store.delete_change_cursor(&account_id, &scope).await?;
             Ok(())
@@ -215,6 +259,9 @@ impl Writer {
                 );
             }
         }
+        // No discard request is settled here either: the reset moved this
+        // scope's fence, so every earlier request is stale and refused by its
+        // stamp. The single settlement point is `discard_backfill`.
         let _ = done.send(result);
     }
 }
@@ -234,6 +281,7 @@ pub(super) async fn discard_backfill(
     ledger: &mut crate::cursor::DebtLedger,
     scope: &CursorScope,
     through: Option<&crate::cursor::AckToken>,
+    completed_backfills: &mut HashSet<CursorScope>,
 ) -> Result<(), Error> {
     // The BACKFILL half only. Fencing the whole scope refused a replacement
     // consumer's acknowledgement of live batches it had really received, with an
@@ -271,11 +319,19 @@ pub(super) async fn discard_backfill(
             );
             return Ok(());
         }
-        store.delete_backfill(account_id, scope).await
+        store.delete_backfill(account_id, scope).await?;
+        // Only a successful delete invalidates observed completion. A refused
+        // receipt or a bounded discard protecting a newer walk must preserve it:
+        // users still expect a bad resume selection to fail rather than lose mail.
+        completed_backfills.remove(scope);
+        Ok(())
     }
     .await;
-    // Second pass, closing the window the delete just opened.
-    debt = coverage.invalidate_scope_backfill(scope, through);
+    // Retire and settle atomically before the final ledger await. Loss recording
+    // takes the same coverage lock, so a new loss after this retirement retains
+    // its replay request even on another executor thread. Failed deletes and
+    // bounded discards must keep their requests for a later unbounded retry.
+    debt = coverage.finish_backfill_discard(scope, through, result.is_ok());
     if !debt.reports.is_empty() {
         let now = jiff::Timestamp::now().as_second();
         for report in &debt.reports {
@@ -292,19 +348,6 @@ pub(super) async fn discard_backfill(
                 "could not persist debt published while a backfill discard was in flight"
             );
         }
-    }
-    // The request is settled only by a delete that SUCCEEDED, and only by an
-    // UNBOUNDED discard.
-    //
-    // Success, because a store error leaves the rows exactly where they were: a
-    // request consumed by a delete that did not happen is a repair nobody will
-    // attempt again, and the teardown drain finds nothing to retry. Unbounded,
-    // because a ceilinged discard retires only the attempt at or below the
-    // refused marker while its delete takes every row - so a delayed W1 marker
-    // acknowledgement arriving during W2 would clear W2's request while leaving
-    // W2's own loss unrepaired.
-    if through.is_none() && result.is_ok() {
-        coverage.take_backfill_discard(scope);
     }
     result
 }

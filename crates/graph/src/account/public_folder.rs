@@ -18,9 +18,8 @@
 //! `Added` / `Updated` / `Destroyed` emit, and when the watermark /
 //! deletion baseline / cursor checkpoint may advance, across the five
 //! conditions below. EWS has no created/updated split, so an appearing
-//! item is emitted as `Updated` plus the two `Added` `ScopeChange`
-//! memberships (`emit_item_added`); "emit Added" below means exactly
-//! that triple.
+//! item is emitted as `Updated` plus an `Added` `ScopeChange` for its
+//! folder (`emit_item_added`); "emit Added" below means exactly that pair.
 //!
 //! Two structural invariants gate everything:
 //!
@@ -671,35 +670,23 @@ fn unhandled_classes_warning(folder_id: &str, unhandled: &[String]) -> Option<Wa
     ))
 }
 
-/// Push the change triple for an appearing item: an `Updated`
-/// `ObjectChange` (EWS gives no created/updated split, matching Graph
-/// delta's convention) plus the two `ScopeChange` `Added` memberships the
-/// inventory pass assigns - the `Folder` scope and the content-mailbox
-/// owner tag (the A5a pattern the engine's covering rule cannot
-/// synthesize).
+/// Emit an appearing item and its routing membership. EWS gives no
+/// created/updated split, matching Graph delta's upsert convention.
 ///
-/// The emitted id is folder-qualified, identical to what the inventory
-/// projection mints for the same item, so a changed item hydrates through
-/// the EWS arm exactly like a backfilled one.
-fn emit_item_added(
-    changes: &mut Vec<Change>,
-    item_id: &str,
-    folder: &FolderId,
-    owner: &PrincipalId,
-) {
+/// Only the folder membership belongs to this cursor. The content-mailbox
+/// owner remains an inventory/discovery annotation: emitting it as a change
+/// would leave it uncovered by the folder cursor. Outlook users expect each
+/// public-folder change to route back to the folder that can refresh it.
+/// The folder-qualified id also routes hydration through EWS.
+fn emit_item_added(changes: &mut Vec<Change>, item_id: &str, folder: &FolderId) {
     let id = super::foreign::encode_public_item_id(folder, item_id);
     changes.push(Change::ObjectChange(ObjectChange {
         id: id.clone(),
         kind: ObjectChangeKind::Updated,
     }));
     changes.push(Change::ScopeChange(ScopeChange {
-        id: id.clone(),
-        membership: MembershipScope::Folder(folder.clone()),
-        kind: ScopeChangeKind::Added,
-    }));
-    changes.push(Change::ScopeChange(ScopeChange {
         id,
-        membership: MembershipScope::Owner(owner.clone()),
+        membership: MembershipScope::Folder(folder.clone()),
         kind: ScopeChangeKind::Added,
     }));
 }
@@ -1297,7 +1284,6 @@ fn reduce_public_folder_poll(
     let scan = scan.cloned().map(admit_mail);
 
     let folder = FolderId(pf.folder_id.clone());
-    let owner = PrincipalId(pf.routing.anchor_mailbox.clone());
     let mut changes: Vec<Change> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
     // Ids emitted this poll, so the deletion-scan additions pass does not
@@ -1323,7 +1309,7 @@ fn reduce_public_folder_poll(
     );
     for id in &incremental_ids {
         emitted.insert(id.clone());
-        emit_item_added(&mut changes, id, &folder, &owner);
+        emit_item_added(&mut changes, id, &folder);
     }
     pf.watermark = advance_watermark(pf.watermark.take(), &poll.items);
     pf.boundary_ids = boundary_ids_at(pf.watermark.as_deref(), &poll.items);
@@ -1388,7 +1374,7 @@ fn reduce_public_folder_poll(
             !pf.degraded || pf.watermark.is_none(),
         ) {
             emitted.insert(added.clone());
-            emit_item_added(&mut changes, &added, &folder, &owner);
+            emit_item_added(&mut changes, &added, &folder);
         }
         // The full scan is authoritative for the baseline (it already
         // includes this cycle's incremental emissions), so reassign from the
@@ -1614,6 +1600,38 @@ mod tests {
     use super::super::cursor::GraphCursorKind;
     use super::*;
 
+    #[test]
+    fn public_folder_change_memberships_are_covered_by_the_poll_cursor() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let scope = CursorScope::Folder(folder.clone());
+        let unrelated = CursorScope::Folder(FolderId("other".to_string()));
+        let rows = walk(vec![item("arrival", None, false)], &[], true);
+        let empty = walk(Vec::new(), &[], true);
+        // Exercise both incremental admission and an arrival found only by
+        // the deletion scan. Both must route to the poll's own folder.
+        for (poll, scan) in [(&rows, None), (&empty, Some(&rows))] {
+            let (changes, _, _) = unbox_apply(reduce_public_folder_poll(
+                cursor(None, None, &[]),
+                poll,
+                scan,
+                1,
+            ));
+            assert_eq!(count_object_change(&changes, "arrival", false), 1);
+            let mut memberships = 0;
+            for change in &changes {
+                if let Change::ScopeChange(change) = change {
+                    assert!(scope.covers(&change.membership));
+                    assert!(!unrelated.covers(&change.membership));
+                    assert_eq!(change.membership, MembershipScope::Folder(folder.clone()));
+                    assert_eq!(change.id, emitted_id("arrival"));
+                    assert_eq!(change.kind, ScopeChangeKind::Added);
+                    memberships += 1;
+                }
+            }
+            assert_eq!(memberships, 1);
+        }
+    }
+
     #[tokio::test]
     async fn nc2a_inventory_baseline_contains_only_returned_mail() {
         use futures::StreamExt;
@@ -1730,8 +1748,8 @@ mod tests {
         assert_eq!(count_object_change(&changes, "changing", false), 1);
         assert_eq!(
             changes.len(),
-            3,
-            "object plus folder and mailbox memberships"
+            2,
+            "object plus its routing folder membership"
         );
         assert_eq!(admitted.live_ids, vec!["changing"]);
         assert_eq!(admitted.live_versions.len(), 1);
@@ -2831,7 +2849,7 @@ mod tests {
             Some(&rows),
             1,
         ));
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 2);
         assert_eq!(count_object_change(&changes, "post", false), 1);
         assert_eq!(warnings.len(), 1);
         assert_eq!(pf.warned_classes, vec!["IPM.Contact"]);
@@ -2849,7 +2867,7 @@ mod tests {
         let mail = item("arrival", Some("2026-02-01T00:00:00Z"), false);
         let poll = walk(vec![mail.clone()], &[], true);
         let (changes, _, pf) = unbox_apply(reduce_public_folder_poll(pf, &poll, None, 2));
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 2);
         let scan = walk(vec![mail], &[], true);
         let (changes, _, _) = unbox_apply(reduce_public_folder_poll(
             pf,

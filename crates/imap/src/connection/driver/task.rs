@@ -107,6 +107,7 @@ impl LeaseHandoff {
         Self(Arc::new(std::sync::Mutex::new(values)))
     }
 
+    #[cfg(test)]
     pub(crate) fn none() -> Self {
         Self::new(Vec::new())
     }

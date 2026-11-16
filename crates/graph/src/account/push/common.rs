@@ -24,6 +24,7 @@ pub(crate) struct PushEndpoint {
 pub(super) fn unsupported_push_error() -> AccountError {
     AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
         .into_builder()
+        .unsupported_reason(bifrost_types::UnsupportedReason::ConfigurationUnavailable)
         .context(GraphErrorContext::graph(AccountOperation::PushSubscribe).identity())
         .try_build()
         .expect("valid account error classification")
@@ -35,6 +36,7 @@ pub(super) fn unsupported_push_error() -> AccountError {
 pub(super) fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
     AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
         .into_builder()
+        .unsupported_reason(bifrost_types::UnsupportedReason::CursorScope)
         .context(GraphErrorContext::graph(AccountOperation::PushSubscribe).identity())
         .scope(ErrorScope::Cursor(scope))
         .try_build()

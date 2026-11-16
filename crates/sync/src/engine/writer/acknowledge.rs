@@ -26,7 +26,15 @@ impl Writer {
         // from its checkpoint, and released a live sibling publication's
         // capacity on the strength of an acknowledgement the ledger had just
         // refused.
-        let result = persist_ack_request(&account_id, &store, &coverage, ledger, &req).await;
+        let result = persist_ack_request(
+            &account_id,
+            &store,
+            &coverage,
+            ledger,
+            &req,
+            &mut self.completed_backfills,
+        )
+        .await;
         match result {
             Ok(AckPersistOutcome::Withheld(reason)) => {
                 // The completion sentinel was deliberately NOT written: the
@@ -47,6 +55,11 @@ impl Writer {
                 }
             }
             Ok(AckPersistOutcome::Durable) => {
+                if let Checkpoint::Backfill(checkpoint) = &req.checkpoint
+                    && proves_backfill_completion(checkpoint)
+                {
+                    self.completed_backfills.insert(req.scope.clone());
+                }
                 // Only a durable change cursor promotes the provisional row.
                 // Rejected, withheld and failed writes leave it abort-owned;
                 // a backfill write does not commit the change cursor at all.
@@ -267,6 +280,7 @@ pub(super) async fn persist_ack_request(
     coverage: &PendingCoverage,
     ledger: &mut crate::cursor::DebtLedger,
     req: &AckRequest,
+    completed_backfills: &mut HashSet<CursorScope>,
 ) -> Result<AckPersistOutcome, AckFailure> {
     if let Checkpoint::Change(cursor) = &req.checkpoint {
         cursor
@@ -413,6 +427,7 @@ pub(super) async fn persist_ack_request(
                 ledger,
                 &b.scope,
                 req.publication.as_ref(),
+                completed_backfills,
             )
             .await
             .map_err(AckFailure::Store)?;

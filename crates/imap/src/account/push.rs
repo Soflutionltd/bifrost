@@ -405,6 +405,7 @@ pub(crate) fn push_stream(
             };
             let uidvalidity = selected.uid_validity;
             let mut first = true;
+            let mut covered = Vec::new();
             loop {
                 let watched = { let scopes = account.push.scopes.lock().expect("push scopes lock poisoned"); subscribed_idle_folders(&scopes.by_handle) };
                 let notify = tokio::select! { () = stop.stopped() => break 'assignment, () = account.shutdown.cancelled() => break 'assignment, result = register_notify(&conn, &folder, &watched, account.push.supports_notify, account.command_timeout()) => result };
@@ -424,6 +425,16 @@ pub(crate) fn push_stream(
                     }
                 };
                 if let Some(event) = signal_notify_coverage_loss(&account.push, registered) { yield event; }
+                if !first && registered {
+                    // Outlook users expect changes made before a new folder's
+                    // NOTIFY acknowledgement to appear too. Invalidate only
+                    // after registration closes that gap, never before it.
+                    for added in watched.iter().filter(|f| *f != &folder && !covered.contains(*f)) {
+                        yield invalidated(HintPayload::SpecificCursorScope(folder_scope(added)));
+                    }
+                }
+                covered = if registered { watched.clone() } else { Vec::new() };
+
                 if first {
                     if waited {
                         for event in signal_coverage_established(&folder, &watched, registered) { yield event; }

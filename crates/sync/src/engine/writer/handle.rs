@@ -112,11 +112,11 @@ impl WriterHandle {
 
     pub(crate) async fn enqueue_discard(
         &self,
-        scope: CursorScope,
+        request: crate::cursor::coverage::BackfillDiscard,
     ) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
         let (done, recv) = oneshot::channel();
         self.tx
-            .send(WriterRequest::DiscardBackfillProgress { scope, done })
+            .send(WriterRequest::DiscardBackfillProgress { request, done })
             .await
             .map_err(|_| Error::ShuttingDown)?;
         Ok(recv)
@@ -137,10 +137,12 @@ impl WriterHandle {
 
     pub(crate) async fn discard_backfill_progress(
         &self,
-        scope: CursorScope,
+        request: crate::cursor::coverage::BackfillDiscard,
     ) -> Result<Result<(), Error>, Error> {
-        self.request(|done| WriterRequest::DiscardBackfillProgress { scope, done })
+        self.enqueue_discard(request)
+            .await?
             .await
+            .map_err(|_| Error::ShuttingDown)
     }
 
     /// Persist standalone backfill progress without making a coverage claim.

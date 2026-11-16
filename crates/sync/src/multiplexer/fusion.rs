@@ -253,6 +253,17 @@ impl InventoryFusion {
                             .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Ok(FusionOutcome::Terminated(error));
                     }
+                    // Validate before either recording or crossing a barrier.
+                    // Users must not be blocked on removals we cannot deliver,
+                    // nor have a waived incident crossed for a rejected page.
+                    // Projection depends only on scope, so one id suffices.
+                    if let Err(error) =
+                        crate::inventory_walk::removals(&scope, batch.removed.first())
+                    {
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
+                        return Ok(FusionOutcome::Terminated(error));
+                    }
                     // A barrier TAINTS THE WALK. Refusing only this one
                     // checkpoint is not enough: the next page's checkpoint, or
                     // the terminal delta link, would simply leap over the same
@@ -949,6 +960,69 @@ mod tests {
                 recovery: bifrost_types::RegionRecovery::barrier(),
             }],
         )
+    }
+
+    #[tokio::test]
+    async fn type_removals_are_delivered_before_stopping_at_a_barrier() {
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        let writer = tokio::spawn(async move {
+            let mut mutations = 0;
+            while let Some(request) = requests.recv().await {
+                match request {
+                    crate::engine::writer::WriterRequest::CrossWaivedBarriers { done, .. } => {
+                        mutations += 1;
+                        let _ = done.send(Ok(false));
+                    }
+                    crate::engine::writer::WriterRequest::RecordBarrier { done, .. } => {
+                        mutations += 1;
+                        let _ = done.send(Ok(()));
+                    }
+                    _ => panic!("unexpected writer request"),
+                }
+            }
+            mutations
+        });
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        let mut coverage = barrier_coverage();
+        coverage.domain = bifrost_types::CoverageDomain::full(scope.clone());
+        let batch = bifrost_types::InventoryBatch {
+            items: Vec::new(),
+            removed: vec![bifrost_types::ObjectId("gone".into())],
+            page_boundary: bifrost_types::PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: bifrost_types::PageCheckpoint::Withheld(None),
+            coverage,
+        };
+        let (mut fusion, delivery, mut observer, _views) = guarded_fusion();
+        fusion.publisher.writer = crate::engine::writer::WriterHandle::new(tx);
+        let mut receiver = delivery.subscribe(None, Arc::clone(&fusion.publisher.coverage));
+        let outcome = fusion
+            .run_stream(
+                scope.clone(),
+                Box::pin(futures::stream::iter([
+                    bifrost_types::InventoryEvent::Batch(batch),
+                ])),
+            )
+            .await
+            .expect("barrier stops the walk");
+        assert!(matches!(outcome, FusionOutcome::NoCursor));
+        let event = receiver.try_recv().expect("removal batch");
+        let SyncEvent::Batch(batch) = event.event.as_ref() else {
+            panic!("expected removal batch");
+        };
+        assert!(matches!(batch.items.as_slice(),
+            [bifrost_types::Change::ObjectChange(change)]
+                if change.id.0 == "gone" && change.kind == bifrost_types::ObjectChangeKind::Destroyed));
+        assert!(observer.try_recv().is_ok());
+        assert!(fusion.cursors.snapshot(&scope).is_none());
+        assert_eq!(fusion.publisher.coverage.pending_checkpoints(), 0);
+        drop(fusion);
+        assert_eq!(
+            writer.await.expect("writer"),
+            2,
+            "the supported removal page must check and record its barrier"
+        );
     }
 
     fn fusion_with_writer(

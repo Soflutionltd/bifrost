@@ -505,6 +505,7 @@ impl<'a> TelemetryView<'a> {
             recovery_fields(error.recovery());
 
         Self {
+            unsupported_reason: error.unsupported_reason(),
             kind_discriminant: account_kind_discriminant(error.kind()),
             message_key: error.message_key(),
             recovery_discriminant: recovery_discriminant(error.recovery()),
@@ -683,6 +684,7 @@ mod tests {
                 "throttle_scope",
                 "trace_id",
                 "transmission_state",
+                "unsupported_reason",
             ]
         );
         assert_eq!(object["request_id"], serde_json::Value::Null);
@@ -691,6 +693,32 @@ mod tests {
         let encoded = serialized.to_string();
         assert!(!encoded.contains("raw provider body"));
         assert!(!encoded.contains("request id with spaces"));
+    }
+
+    #[test]
+    fn unsupported_reason_survives_all_export_tiers() {
+        let error = AccountError::unsupported(crate::AccountOperation::Send, crate::Protocol::Jmap)
+            .into_builder()
+            .unsupported_reason(crate::UnsupportedReason::SubmissionUnavailable)
+            .try_build()
+            .expect("valid refusal");
+        let expected = Some(crate::UnsupportedReason::SubmissionUnavailable);
+        assert_eq!(error.telemetry_fields().unsupported_reason, expected);
+        assert_eq!(error.support_minimal().unsupported_reason, expected);
+        assert_eq!(
+            error.support_consented().telemetry.unsupported_reason,
+            expected
+        );
+        assert_eq!(
+            error
+                .support_internal()
+                .consented
+                .telemetry
+                .unsupported_reason,
+            expected
+        );
+        let exported = serde_json::to_value(error.telemetry_fields()).expect("serialize");
+        assert_eq!(exported["unsupported_reason"], "SubmissionUnavailable");
     }
 
     #[test]

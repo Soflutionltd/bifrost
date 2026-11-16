@@ -515,3 +515,60 @@ async fn the_charge_holders_name_the_receiver_that_has_not_read() {
         "a fully read page holds nothing and names nobody"
     );
 }
+
+/// Model a refusal delayed between the guarded send and loss attribution.
+/// The publication can already be retired, so membership alone cannot tell
+/// whether its loss still belongs to the walk that owns the durable rows.
+#[test]
+fn delayed_publication_loss_cannot_cross_a_reset_or_discard_fence() {
+    for reset in 0..3 {
+        let h = harness();
+        let scope = scope_a();
+        let old = h.publish(&page(&scope, "old", 1), 1);
+        h.coverage.acknowledge_publication(old.clone());
+        match reset {
+            0 => {
+                h.coverage.invalidate_account();
+            }
+            1 => {
+                h.coverage.invalidate_scope(&scope);
+            }
+            _ => {
+                h.coverage.invalidate_scope_backfill(&scope, None);
+            }
+        }
+        let current = h.publish(&page(&scope, "new", 2), 1);
+        let before = h.coverage.undelivered_watermark(&scope);
+        h.coverage.note_undelivered_publication(&old);
+        assert_eq!(h.coverage.undelivered_watermark(&scope), before);
+        assert!(h.coverage.take_backfill_discards().is_empty());
+        assert_eq!(h.coverage.backfill_in_flight(), 1);
+
+        // A current loss must still request replay, even after its registration
+        // has gone. Detach consumes this same request set before writer exit.
+        h.coverage.acknowledge_publication(current.clone());
+        h.coverage.note_undelivered_publication(&current);
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope),
+            before.after_loss(1)
+        );
+        assert_eq!(
+            h.coverage
+                .take_backfill_discards()
+                .into_iter()
+                .map(|request| request.scope)
+                .collect::<Vec<_>>(),
+            vec![scope]
+        );
+    }
+}
+
+#[test]
+fn a_sibling_scope_reset_does_not_suppress_current_publication_loss() {
+    let h = harness();
+    let id = h.publish(&page(&scope_a(), "current", 1), 1);
+    h.coverage.invalidate_scope(&scope_b());
+    h.coverage.note_undelivered_publication(&id);
+    assert!(h.coverage.take_backfill_discard(&scope_a()));
+    assert!(!h.coverage.take_backfill_discard(&scope_b()));
+}

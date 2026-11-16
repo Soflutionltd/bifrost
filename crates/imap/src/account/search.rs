@@ -7,7 +7,7 @@ use super::{
 };
 use crate::types::{MailboxName, SearchCriteria, ThreadNode};
 use bifrost_types::ids::{ObjectId, ThreadId};
-use bifrost_types::page::Page;
+use bifrost_types::page::{Page, SkippedScope};
 use bifrost_types::search::{SearchFilter, SearchRequest};
 use bifrost_types::{AccountError, AccountFuture, AccountOperation, LabelId, Protocol};
 use jiff::Timestamp;
@@ -25,42 +25,52 @@ pub(crate) fn search(
             .gate(AccountOperation::Search, Protocol::Imap)?;
         let plan = search_plan(&account.dav_scopes, &request, AccountOperation::Search)?;
         let mut pager = SearchPager::new(&request, plan.folder.as_ref(), AccountOperation::Search)?;
+        pager.include_discovery_skips(&account.discovery_skips, plan.folder.as_ref());
         for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
             if pager.is_full() {
                 break;
             }
             let err = folder_err(&account, &folder, AccountOperation::Search);
+            // Checkout can authenticate a fresh session: its failures are
+            // account-level even when a provider reports permission denial.
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
-            let selected = account
-                .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
-                .await
-                .map_err(err)?;
-            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
-            pager.check_epoch(&folder, uidvalidity)?;
-            let roots = conn
-                .connection()
-                .uid_thread(
-                    "REFERENCES",
-                    "UTF-8",
-                    &plan.criteria,
-                    account.command_timeout(),
-                )
-                .await
-                .map_err(err)?;
-            // A thread's position is its lowest member UID: member sets are
-            // disjoint, so the minima order the folder's threads totally,
-            // and an expunge elsewhere cannot move an untouched thread.
-            let mut threads = Vec::new();
-            for root in roots {
-                let mut uids = Vec::new();
-                flatten_thread(&root, &mut uids);
-                if let Some(&key) = uids.iter().min() {
-                    threads.push((key, uids));
+            let outcome = async {
+                let selected = account
+                    .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+                    .await
+                    .map_err(err)?;
+                let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
+                pager.check_epoch(&folder, uidvalidity)?;
+                let roots = conn
+                    .connection()
+                    .uid_thread(
+                        "REFERENCES",
+                        "UTF-8",
+                        &plan.criteria,
+                        account.command_timeout(),
+                    )
+                    .await
+                    .map_err(err)?;
+                // A thread's position is its lowest member UID: member sets are
+                // disjoint, so the minima order the folder's threads totally,
+                // and an expunge elsewhere cannot move an untouched thread.
+                let mut threads = Vec::new();
+                for root in roots {
+                    let mut uids = Vec::new();
+                    flatten_thread(&root, &mut uids);
+                    if let Some(&key) = uids.iter().min() {
+                        threads.push((key, uids));
+                    }
                 }
+                pager.accept(&folder, uidvalidity, threads, |uids| {
+                    encode_thread_id(&folder, uidvalidity, &super::UidSet::from_numbers(uids))
+                })?;
+                Ok(())
             }
-            pager.accept(&folder, uidvalidity, threads, |uids| {
-                encode_thread_id(&folder, uidvalidity, &super::UidSet::from_numbers(uids))
-            })?;
+            .await;
+            if let Err(error) = outcome {
+                pager.skip_or_fail(&folder, error)?;
+            }
         }
         Ok(pager.finish())
     })
@@ -85,31 +95,41 @@ pub(crate) fn search_messages(
             plan.folder.as_ref(),
             AccountOperation::SearchMessages,
         )?;
+        pager.include_discovery_skips(&account.discovery_skips, plan.folder.as_ref());
         for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
             if pager.is_full() {
                 break;
             }
             let err = folder_err(&account, &folder, AccountOperation::SearchMessages);
+            // Checkout can authenticate a fresh session: its failures are
+            // account-level even when a provider reports permission denial.
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
-            let selected = account
-                .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
-                .await
-                .map_err(err)?;
-            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
-            pager.check_epoch(&folder, uidvalidity)?;
-            let result = conn
-                .connection()
-                .uid_search(&plan.criteria, account.command_timeout())
-                .await
-                .map_err(err)?;
-            let uids = result.ids.into_iter().map(|uid| (uid, uid)).collect();
-            pager.accept(&folder, uidvalidity, uids, |uid| {
-                encode_object_id(
-                    &folder,
-                    uidvalidity,
-                    crate::types::Uid::new(uid).expect("wire UID is nonzero"),
-                )
-            })?;
+            let outcome = async {
+                let selected = account
+                    .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+                    .await
+                    .map_err(err)?;
+                let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
+                pager.check_epoch(&folder, uidvalidity)?;
+                let result = conn
+                    .connection()
+                    .uid_search(&plan.criteria, account.command_timeout())
+                    .await
+                    .map_err(err)?;
+                let uids = result.ids.into_iter().map(|uid| (uid, uid)).collect();
+                pager.accept(&folder, uidvalidity, uids, |uid| {
+                    encode_object_id(
+                        &folder,
+                        uidvalidity,
+                        crate::types::Uid::new(uid).expect("wire UID is nonzero"),
+                    )
+                })?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = outcome {
+                pager.skip_or_fail(&folder, error)?;
+            }
         }
         Ok(pager.finish())
     })
@@ -463,6 +483,96 @@ impl SearchPosition {
     }
 }
 
+// Version 3 retains runtime coverage gaps as well as the query and position.
+// Only folder identity and classification travel in the cursor; diagnostics
+// remain on the page that observed the failure.
+fn cursor_field(bytes: &mut Vec<u8>, value: &[u8]) {
+    bytes.extend_from_slice(format!("{}:", value.len()).as_bytes());
+    bytes.extend_from_slice(value);
+}
+
+fn take_cursor_field<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let colon = bytes.iter().position(|byte| *byte == b':')?;
+    let len = std::str::from_utf8(&bytes[..colon])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let rest = bytes.get(colon + 1..)?;
+    let field = rest.get(..len)?;
+    *bytes = rest.get(len..)?;
+    Some(field)
+}
+
+fn encode_bound_position(
+    position: &SearchPosition,
+    binding: &[u8],
+    skips: &[(MailboxName, u8)],
+) -> Vec<u8> {
+    let mut bytes = b"imapsearch3:".to_vec();
+    cursor_field(&mut bytes, binding);
+    cursor_field(&mut bytes, &position.encode());
+    for (folder, kind) in skips {
+        let mut identity = position.clone();
+        identity.folder = folder.clone();
+        cursor_field(&mut bytes, &identity.encode());
+        bytes.push(*kind);
+    }
+    bytes
+}
+
+fn decode_bound_position(
+    bytes: &[u8],
+    binding: &[u8],
+    op: AccountOperation,
+) -> Result<(SearchPosition, Vec<(MailboxName, u8)>), AccountError> {
+    let invalid = || search_page_cursor_error(op, "IMAP page cursor does not match this search");
+    let mut rest = bytes.strip_prefix(b"imapsearch3:").ok_or_else(invalid)?;
+    if take_cursor_field(&mut rest) != Some(binding) {
+        return Err(invalid());
+    }
+    let position = SearchPosition::decode(take_cursor_field(&mut rest).ok_or_else(invalid)?, op)?;
+    let mut skips = Vec::new();
+    while !rest.is_empty() {
+        let folder =
+            SearchPosition::decode(take_cursor_field(&mut rest).ok_or_else(invalid)?, op)?.folder;
+        let kind = *rest
+            .first()
+            .filter(|kind| **kind <= 2)
+            .ok_or_else(invalid)?;
+        rest = &rest[1..];
+        if !skips.iter().any(|(known, _)| known == &folder) {
+            skips.push((folder, kind));
+        }
+    }
+    Ok((position, skips))
+}
+
+fn restored_runtime_skip(folder: &MailboxName, kind: u8, op: AccountOperation) -> SkippedScope {
+    use bifrost_types::{
+        AccessCause, AccountErrorBuilder, PrimaryCause, RequestCause, ResourceKind, StateCause,
+    };
+    let scope = super::folder_scope(folder);
+    let cause = match kind {
+        0 => PrimaryCause::Access(AccessCause::PermissionDenied { resource: None }),
+        1 => PrimaryCause::Request(RequestCause::NotFound {
+            what: ResourceKind::Mailbox,
+            id: Some(folder.account_id()),
+        }),
+        _ => PrimaryCause::State(StateCause::ScopeRevoked {
+            scope: scope.clone(),
+        }),
+    };
+    SkippedScope {
+        scope: bifrost_types::ErrorScope::Cursor(scope.clone()),
+        error: AccountErrorBuilder::new(cause)
+            .operation(op)
+            .protocol(Protocol::Imap)
+            .scope(bifrost_types::ErrorScope::Cursor(scope))
+            .try_build()
+            .expect("valid retained search skip"),
+    }
+}
+
 /// Pages a multi-folder search by position, not by offset.
 ///
 /// IMAP has no server-side result state a page cursor could pin, so every
@@ -486,6 +596,9 @@ struct SearchPager<T> {
     limit: usize,
     collected: Vec<(SearchPosition, T)>,
     op: AccountOperation,
+    binding: Vec<u8>,
+    skipped_scopes: Vec<SkippedScope>,
+    runtime_skips: Vec<(MailboxName, u8)>,
 }
 
 impl<T> SearchPager<T> {
@@ -494,11 +607,26 @@ impl<T> SearchPager<T> {
         restriction: Option<&MailboxName>,
         op: AccountOperation,
     ) -> Result<Self, AccountError> {
-        let resume = request
+        // Enterprise users expect changing a query to start a new walk, never
+        // to inherit a position from unrelated results. Limit is presentation
+        // only; filter, provider query and result surface define the request.
+        // Debug here is a private, versioned structural representation, not
+        // wire syntax. A representation change safely refuses older cursors.
+        let binding =
+            format!("{:?}|{:?}|{:?}", request.filter, request.provider_query, op).into_bytes();
+        let continuation = request
             .page_cursor
             .as_deref()
-            .map(|bytes| SearchPosition::decode(bytes, op))
+            .map(|bytes| decode_bound_position(bytes, &binding, op))
             .transpose()?;
+        let (resume, runtime_skips) = continuation.map_or_else(
+            || (None, Vec::new()),
+            |(position, skips)| (Some(position), skips),
+        );
+        let skipped_scopes = runtime_skips
+            .iter()
+            .map(|(folder, kind)| restored_runtime_skip(folder, *kind, op))
+            .collect();
         if let (Some(resume), Some(restriction)) = (&resume, restriction)
             && resume.folder.cmp_account_order(restriction) != std::cmp::Ordering::Equal
         {
@@ -518,7 +646,45 @@ impl<T> SearchPager<T> {
             limit: usize::try_from(limit).unwrap_or(usize::MAX),
             collected: Vec::new(),
             op,
+            binding,
+            skipped_scopes,
+            runtime_skips,
         })
+    }
+
+    // Every page must disclose incomplete mail coverage, even when the gap
+    // precedes its cursor. DAV collection gaps do not affect mail search.
+    fn include_discovery_skips(
+        &mut self,
+        skips: &[SkippedScope],
+        restriction: Option<&MailboxName>,
+    ) {
+        use bifrost_types::ErrorScope;
+        for skip in skips {
+            let relevant = match &skip.scope {
+                ErrorScope::Account => true,
+                ErrorScope::Namespace { prefix } => {
+                    restriction.is_none_or(|folder| folder.as_str().starts_with(prefix))
+                }
+                ErrorScope::Cursor(bifrost_types::CursorScope::Folder(folder)) => {
+                    restriction.is_none_or(|name| name.account_id() == folder.0)
+                }
+                _ => false,
+            };
+            if relevant {
+                self.record_skip(skip.clone());
+            }
+        }
+    }
+
+    fn record_skip(&mut self, skip: SkippedScope) {
+        if !self
+            .skipped_scopes
+            .iter()
+            .any(|known| known.scope == skip.scope)
+        {
+            self.skipped_scopes.push(skip);
+        }
     }
 
     /// The folders still ahead of the cursor, in walk order. `all` must
@@ -588,16 +754,49 @@ impl<T> SearchPager<T> {
         Ok(())
     }
 
+    fn skip_or_fail(
+        &mut self,
+        folder: &MailboxName,
+        error: AccountError,
+    ) -> Result<(), AccountError> {
+        use bifrost_types::{AccessErrorKind, AccountErrorKind, ResourceKind, SyncStateErrorKind};
+        // A revoked or vanished folder must not hide healthy mail from an
+        // enterprise user. Account-wide and ambiguous failures still abort so
+        // loss of connectivity never appears as an empty search result.
+        if !matches!(
+            error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+                | AccountErrorKind::NotFound(ResourceKind::Mailbox)
+                | AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ) {
+            return Err(error);
+        }
+        // A later page may resume beyond this folder. Enterprise users reading
+        // only that page must still see that the walk omitted some mail.
+        let kind = match error.kind() {
+            AccountErrorKind::Authorization(_) => 0,
+            AccountErrorKind::NotFound(_) => 1,
+            _ => 2,
+        };
+        if !self.runtime_skips.iter().any(|(known, _)| known == folder) {
+            self.runtime_skips.push((folder.clone(), kind));
+        }
+        self.record_skip(SkippedScope {
+            scope: bifrost_types::ErrorScope::Cursor(super::folder_scope(folder)),
+            error,
+        });
+        Ok(())
+    }
+
     fn finish(mut self) -> Page<T> {
         let (next_cursor, estimated_total) = if self.collected.len() > self.limit {
             // The lookahead item stays ahead of the cursor for the next call.
             self.collected.truncate(self.limit);
-            let last = self
-                .collected
-                .last()
-                .map(|(position, _)| position.encode().into());
+            let last = self.collected.last().map(|(position, _)| {
+                encode_bound_position(position, &self.binding, &self.runtime_skips).into()
+            });
             (last, None)
-        } else if self.resume.is_none() {
+        } else if self.resume.is_none() && self.skipped_scopes.is_empty() {
             // This call enumerated the whole result from the start.
             (
                 None,
@@ -612,7 +811,7 @@ impl<T> SearchPager<T> {
             next_cursor,
             estimated_total,
             failed_ids: Vec::new(),
-            skipped_scopes: Vec::new(),
+            skipped_scopes: self.skipped_scopes,
         }
     }
 }

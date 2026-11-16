@@ -11,10 +11,17 @@ pub(crate) fn from_connection_url<R>(connection_url: &str) -> Result<Builder<Smt
     // These are local configuration faults. Retrying them like network outages
     // would leave an enterprise user's send queue stuck until manual repair.
     let connection_url = Url::parse(connection_url).map_err(error::invalid_input)?;
-    let tls: Option<String> = connection_url
-        .query_pairs()
-        .find(|(k, _)| k == "tls")
-        .map(|(_, v)| v.to_string());
+    let mut tls = None;
+    for (key, value) in connection_url.query_pairs() {
+        if key == "tls" {
+            // An administrator expects ambiguous security settings to be
+            // refused, even when the repeated values happen to agree.
+            if tls.is_some() {
+                return Err(error::invalid_input("duplicate tls parameter"));
+            }
+            tls = Some(value.into_owned());
+        }
+    }
 
     let host = connection_url
         .host_str()
@@ -48,7 +55,9 @@ pub(crate) fn from_connection_url<R>(connection_url: &str) -> Result<Builder<Smt
                 )))
                 .tls(Tls::Opportunistic(TlsParameters::new(host.into())?));
         }
-        ("smtps", _) => {
+        // Implicit TLS stays selected, but an administrator must still learn
+        // about a misspelled security setting rather than have it ignored.
+        ("smtps", None | Some("required" | "opportunistic")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(default_port(
                     crate::transport::smtp::Dialect::Smtp,
@@ -107,4 +116,70 @@ pub(crate) fn from_connection_url<R>(connection_url: &str) -> Result<Builder<Smt
     }
 
     Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{SmtpTransport, Tls};
+
+    #[test]
+    fn both_schemes_refuse_duplicate_tls_parameters() {
+        for scheme in ["smtp", "smtps"] {
+            for query in [
+                "tls=required&tls=wrong",
+                "tls=required&tls=opportunistic",
+                "tls=opportunistic&tls=required",
+                "tls=required&tls=required",
+                "tls=required&tls=",
+                "tls=required&tls",
+                "tls=required&ignored=value&%74ls=required",
+                "%74ls=opportunistic&tls=required",
+            ] {
+                let url = format!("{scheme}://relay.example?{query}");
+                assert!(
+                    SmtpTransport::from_url(&url)
+                        .unwrap_err()
+                        .is_invalid_input(),
+                    "{url}"
+                );
+                #[cfg(feature = "tokio")]
+                assert!(
+                    super::super::AsyncSmtpTransport::from_url(&url)
+                        .unwrap_err()
+                        .is_invalid_input(),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_schemes_refuse_unrecognized_tls_values() {
+        for scheme in ["smtp", "smtps"] {
+            for value in ["wrong", "", "REQUIRED", "false"] {
+                let url = format!("{scheme}://relay.example?tls={value}");
+                assert!(
+                    SmtpTransport::from_url(&url)
+                        .unwrap_err()
+                        .is_invalid_input()
+                );
+                #[cfg(feature = "tokio")]
+                assert!(
+                    super::super::AsyncSmtpTransport::from_url(&url)
+                        .unwrap_err()
+                        .is_invalid_input()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recognized_smtps_tls_values_retain_implicit_tls() {
+        for query in ["", "?tls=required", "?tls=opportunistic"] {
+            let builder =
+                SmtpTransport::from_url(&format!("smtps://relay.example{query}")).unwrap();
+            assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+            assert_eq!(builder.info.port, 465);
+        }
+    }
 }

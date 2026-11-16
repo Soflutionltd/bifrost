@@ -582,10 +582,13 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
         "the writer was still alive to finish the store write: the straggler spent \
          the worker deadline, not the writer's drain budget"
     );
-    acking
-        .await
-        .expect("the acknowledging task does not panic")
-        .expect("the acknowledgement was persisted, not abandoned with the writer");
+    assert_eq!(
+        acking
+            .await
+            .expect("the acknowledging task does not panic")
+            .expect("the acknowledgement was persisted, not abandoned with the writer"),
+        bifrost_sync::AckOutcome::Durable,
+    );
 
     let persisted = store
         .get_change_cursor(&account_id, &CursorScope::Account)

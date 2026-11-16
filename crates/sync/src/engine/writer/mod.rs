@@ -77,10 +77,31 @@ pub(crate) async fn ack_writer(
         repairs: RepairPairing::default(),
         ledger: None,
         pending_debt: Vec::new(),
+        completed_backfills: HashSet::new(),
     };
     while let Some(request) = rx.recv().await {
         writer.dispatch(request).await;
     }
+}
+
+fn proves_backfill_completion(checkpoint: &BackfillCheckpoint) -> bool {
+    crate::backfill::partitioner::BackfillKey::decode(&checkpoint.partition)
+        .proves_completion(checkpoint.progress.items_done)
+}
+
+fn validate_backfill_selection(
+    scope: &CursorScope,
+    known_complete: bool,
+    selected: Option<&BackfillCheckpoint>,
+) -> Result<(), Error> {
+    if selected.is_some_and(|checkpoint| checkpoint.scope != *scope)
+        || known_complete && !selected.is_some_and(proves_backfill_completion)
+    {
+        return Err(Error::CheckpointStore(
+            "backfill resume selection contradicts a durable completion; use backfill_checkpoint_is_later".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The sole custodian of an attachment's durable ledger and row ownership.
@@ -92,6 +113,9 @@ struct Writer {
     provisional: ProvisionalRows,
     repairs: RepairPairing,
     ledger: Option<crate::cursor::DebtLedger>,
+    // Positive evidence only, forgotten after rows are successfully deleted. Lets a
+    // resume read detect a broken store ordering without another store read.
+    completed_backfills: HashSet<CursorScope>,
     // Retain debt even if loading or writing the authoritative ledger fails.
     pending_debt: Vec<(
         bifrost_types::InventoryCoverageReport,
@@ -181,8 +205,8 @@ impl Writer {
             WriterRequest::PersistBackfill { checkpoint, done } => {
                 self.persist_backfill(checkpoint, done).await;
             }
-            WriterRequest::DiscardBackfillProgress { scope, done } => {
-                self.discard_backfill_progress(scope, done).await;
+            WriterRequest::DiscardBackfillProgress { request, done } => {
+                self.discard_backfill_progress(request, done).await;
             }
             WriterRequest::ResetAccountForSchemaRecovery { done } => {
                 self.reset_account_for_schema_recovery(done).await;

@@ -52,6 +52,10 @@ async fn an_unresolvable_scope_is_reported_and_not_covered_by_the_handle() {
     );
     let failed = result.outcomes().failed();
     assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].error.unsupported_reason(),
+        Some(bifrost_types::UnsupportedReason::CursorScope)
+    );
     assert!(matches!(
         failed[0].error.kind(),
         AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
