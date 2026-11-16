@@ -97,7 +97,7 @@ impl CalDavClient {
                 &net,
                 account_id,
                 &config.base_url,
-                config.credentials.to_shared(),
+                config.credentials.clone(),
                 DAV,
             ),
         }
@@ -114,7 +114,7 @@ impl CalDavClient {
             dav: DavDispatch::with_account_net(
                 net,
                 base_url,
-                crate::CalDavCredentials::bearer("token").to_shared(),
+                crate::CalDavCredentials::bearer("token"),
                 DAV,
             ),
         }

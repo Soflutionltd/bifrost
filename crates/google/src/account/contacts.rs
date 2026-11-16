@@ -1501,11 +1501,12 @@ mod tests {
             Some(bifrost_types::WireCause::GooglePeople(_))
         )));
         assert!(
-            error
+            !error
                 .support_consented()
                 .support_text
                 .iter()
-                .any(|text| text.contains("photo denied"))
+                .any(|text| text.contains("photo denied")),
+            "partial-commit decoration must not export provider prose"
         );
         assert_eq!(
             error.partial_commit().unwrap().steps()[0].effect(),

@@ -688,10 +688,12 @@ consent-tier export off `AccountError`:
 Consent grants access to diagnostic detail, never credentials. Shared HTTP
 response diagnostics retain status, header names/counts and captured body byte
 counts, but omit body text and arbitrary response header values at every tier.
-The generic HTTP mapper exports validated provider correlation ids through
-request_id and trace_id, including telemetry. Request headers are x-request-id,
-request-id, x-ms-request-id, x-goog-request-id and x-guploader-uploadid in priority
-order. Trace headers are traceparent, then x-cloud-trace-context (prefix before
+Every HTTP mapper (generic net, Google, Graph, JMAP) exports validated provider
+correlation ids through request_id and trace_id, including telemetry, and
+validates them only through the public `bifrost_net::account_error` helpers
+(`correlation_id` is the single shape check). Request headers are x-request-id,
+request-id, x-ms-request-id, x-goog-request-id, x-google-request-id and
+x-guploader-uploadid in priority order. Trace headers are traceparent, then x-cloud-trace-context (prefix before
 slash). Traceparent requires four lowercase hex fields of lengths 2/32/16/2,
 a version other than ff and nonzero trace and parent ids. Other values require
 1 to 256 ASCII alphanumeric or `-_./;=` bytes, no whitespace, and no

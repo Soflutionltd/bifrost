@@ -19,7 +19,7 @@ fn dispatch<D: Dialect>(
     DavDispatch::with_account_net(
         scripted_dav_net(script),
         BASE,
-        DavCredentials::Basic {
+        DavCredentials::Password {
             username: "user".into(),
             password: "pass".into(),
         },

@@ -225,38 +225,6 @@ line-audited" note. It bypasses every handle gate (BUG-029) and waits unbounded
 `wait_for_continuation` to one mode, dropping `PipelineRouting`,
 `untagged_routing_key` and the router.
 
-## STR-078 - Credentials and TLS mode, three copies each
-
-**Reported by:** imap-account, smtp-sasl, net-dav.
-
-The net-dav hunter adds the HTTP side: `CalDavCredentials` and `CardDavCredentials`
-are identical published enums, both converting into `DavCredentials`, identical
-again; JMAP's Basic credential stores a pre-encoded value while DAV stores username
-and password and encodes per request. A shared `HttpCredential` in bifrost-net would
-carry the token-coordination rule (BUG-111). Removing or renaming the published
-enums needs the owner; reshaping them into wrappers does not.
-
-The smtp-sasl hunter details the three credential types: `bifrost_smtp::Credentials`
-(public enum, `password: Zeroizing<String>`, re-exporting `zeroize::Zeroizing`),
-`bifrost_imap::Credentials` (struct over a private `CredentialsKind`, using
-`SecretString`), and `bifrost_imap::SubmissionCredentials` (public, `password:
-String` - plain, not zeroizing); `resolve_credentials` copies between them with
-`password.as_str().to_owned()`. All model the same two shapes (password; OAuth
-identity plus token source). A shared `SaslCredentials` in bifrost-sasl (which
-would need `TokenSource`, so either sasl depends on bifrost-net or the type lives in
-bifrost-net's auth module) is the single owner; the public SMTP and IMAP types need
-the owner, but at minimum `SubmissionCredentials::Password.password` should be a
-secret type.
-
-Credentials: `crate::types::Credentials` (with `CredentialsKind`),
-`SubmissionCredentials` (password a plain `String`), and
-`bifrost_smtp::...::Credentials`, translated structurally in
-`resolve_credentials`. The token-source type already lives in `bifrost-net`; one
-credentials type there or in `bifrost-sasl` would give IMAP, SMTP, ManageSieve and
-DAV one secret-handling story. TLS mode: `SubmissionTls { Implicit, StartTls,
-Plaintext }`, `ManageSieveTlsMode { Implicit, StartTls, None }`, and
-`ImapConfig`'s own, each with its own default-port table.
-
 ## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
 
 **Reported by:** imap-account (not a bug; a gap between vocabulary and its intended producer).

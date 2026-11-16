@@ -4,6 +4,7 @@ use super::{
     TlsParameters,
     core::{Epilogue, Op, OpOutcome, ProtocolMachine, Step},
 };
+use crate::transport::smtp::authentication::SmtpCredentialsExt;
 use crate::transport::smtp::{
     Dialect,
     authentication::{

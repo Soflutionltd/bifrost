@@ -764,7 +764,10 @@ fn echoed_credentials_never_enter_debug_or_diagnostic_exports() {
     let error = convert(error, ctx(AccountOperation::Search));
     let export = format!("{:?}", error.support_internal());
     assert!(!export.contains(secret), "{export}");
-    assert!(support_text_contains(&error, "captured body bytes"));
+    assert!(support_text_contains(
+        &error,
+        "captured response body bytes"
+    ));
     assert!(support_text_contains(&error, "authorization"));
     assert_eq!(error.telemetry_fields().status, Some(400));
     assert_eq!(error.telemetry_fields().request_id, None);

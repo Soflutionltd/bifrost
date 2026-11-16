@@ -712,9 +712,6 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
     let reason = env
         .and_then(GmailErrorEnvelope::primary_reason)
         .map(str::to_owned);
-    let message = env
-        .and_then(GmailErrorEnvelope::primary_message)
-        .map(str::to_owned);
     let signal = reason
         .as_deref()
         .map(map_reason_to_signal)
@@ -782,14 +779,8 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         builder = builder.trace_id(id.to_owned());
     }
 
-    if let Some(msg) = message {
-        builder = builder.text(DiagnosticText::support_only(msg));
-    } else if !resp.body.is_empty() {
-        builder = builder.text(DiagnosticText::support_only(format!(
-            "gmail response body: {}",
-            String::from_utf8_lossy(resp.body.as_ref()),
-        )));
-    }
+    // Support consent never authorizes exporting echoed credentials.
+    builder = builder.text(bifrost_net::account_error::body_size_text(resp.body.len()));
 
     if let Some(extra) = ctx.diagnostic_id.as_deref() {
         builder = builder.text(DiagnosticText::support_only(format!(
@@ -1735,6 +1726,20 @@ mod tests {
     }
 
     #[test]
+    fn provider_message_is_not_exported() {
+        // An envelope is still untrusted text: consent cannot admit credentials.
+        let error = into_account_error(
+            gmail_response(
+                403,
+                r#"{"error":{"message":"Bearer echoed-credential","errors":[{"reason":"forbidden","message":"Bearer echoed-credential"}]}}"#,
+            ),
+            GmailErrorContext::inventory(),
+        );
+        assert_eq!(error.telemetry_fields().native_code, Some("forbidden"));
+        assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+    }
+
+    #[test]
     fn unparseable_body_falls_back_by_status() {
         let err = gmail_response(500, "<html>oops</html>");
         let acc = into_account_error(err, GmailErrorContext::inventory());
@@ -1742,10 +1747,10 @@ mod tests {
             acc.kind(),
             AccountErrorKind::Server(ServerErrorKind::Error { status: Some(500) })
         ));
-        // Support-only text retains the raw body.
+        // Support consent must not export a server page that can echo credentials.
         let support = acc.support_consented();
         assert!(
-            support
+            !support
                 .support_text
                 .iter()
                 .any(|t| t.contains("html") || t.contains("oops"))

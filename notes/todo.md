@@ -45,15 +45,24 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **Provider crates still export raw server evidence into diagnostics.**
-  bifrost-net and the DAV crates now export only structural evidence (status,
-  header names, sizes, origins). Reported in passing, unverified:
-  - `crates/google/src/account/error.rs` exports provider messages, fallback
-    raw bodies and header ids; Calendar and People tests assert on that text.
-  - `crates/graph/src/error.rs` derives `Debug` over raw response evidence.
-  - `crates/jmap/src/sync/error.rs` exports arbitrary server descriptions.
+- **Remaining free-form text in diagnostics.** bifrost-net, the DAV crates and
+  the Google, Graph and JMAP HTTP error mappers export only structural evidence
+  and shape-checked ids. Reported in passing, unverified:
   - net's ordinary transport `Display` and account diagnostics still accept
     free-form messages and sources.
+  - Graph EWS SOAP and XML and JSON-parse mappings in
+    `crates/graph/src/account/graph_error.rs` export free-form detail.
+  - JMAP decode and custom-transport mappings in `sync/error.rs` export
+    free-form strings, and `core/error.rs` problem types derive `Debug` over
+    raw descriptions.
+  - JMAP's reusable pre-encoded Basic credential is a plain `String`, not a
+    zeroizing secret.
+  - JMAP `convert_problem` no longer exports a limit name even when it matched
+    the known set (`maxSizeRequest`, `maxCallsInRequest`, `maxObjectsIn*`);
+    those values are pinned by the match, so exporting them is safe.
+  - `AGENTS.md` still describes bifrost-sasl as private in at least one place,
+    although bifrost-net now re-exports its `Secret` as a credential field
+    type.
 
 ## 2. Blocked on a live probe
 

@@ -123,9 +123,9 @@ mod tests {
         DavDispatch::with_account_net(
             net,
             BASE,
-            DavCredentials::Basic {
+            DavCredentials::Password {
                 username: "user".to_string(),
-                password: "pass".to_string(),
+                password: "pass".into(),
             },
             protocol,
         )

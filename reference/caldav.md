@@ -1211,9 +1211,15 @@ the wire, by `a_header_the_record_could_not_carry_fails_before_the_wire` and
 `a_non_ascii_header_value_fails_before_the_wire` in bifrost-carddav, both of
 which script an EMPTY transport so a regression panics on an exhausted script.
 
-`CalDavCredentials` stays published and unchanged; `to_shared` projects it onto
-the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
-read live from the shared source at every request.
+`CalDavCredentials` and dispatch's `DavCredentials` alias
+`bifrost_net::credentials::HttpCredentials`. Password fields use
+`bifrost_sasl::Secret`; use `password.into()` in variant literals or
+`basic(username, password)`. Clones retain zeroizing storage and live bearer
+sources. HTTP credentials use the same Password/OAuth2 variants with a unit OAuth
+identity. `basic` and `bearer_source` construct them without inventing a SASL
+authorization identity for bearer-only requests.
+Net owns both credential surfaces, and DAV retains its coordinated storage
+boundary and credential-origin admission.
 
 `DavDispatch` also supports an optional `DavRequestGuard` installed before
 sharing an account. The dispatcher invokes it before each hop, for the request

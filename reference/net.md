@@ -1912,8 +1912,19 @@ remain available to protocol code and error observers for typed interpretation.
 They are not safe to log directly.
 
 Generic account diagnostics export no response body text at any consent tier.
-Telemetry request_id uses the first valid value from x-request-id, request-id,
-x-ms-request-id, x-goog-request-id and x-guploader-uploadid, in that order.
+Telemetry request_id uses the first valid value from `REQUEST_ID_HEADERS`
+(x-request-id, request-id, x-ms-request-id, x-goog-request-id,
+x-google-request-id and x-guploader-uploadid, in that order).
+
+`account_error` owns the one id-validation channel in the workspace, and every
+provider mapper (generic net, Google, Graph, JMAP) exports correlation ids only
+through it: `correlation_id` is the single shape check on a value from a header
+or a body field, `correlation_header` applies it to one header,
+`request_id_from_headers` and `trace_id_from_headers` apply the shared header
+lists, and `traceparent_trace_id` validates a W3C value. `push_header_names`
+and `body_size_text` are the shared structural evidence lines that replace
+header values and body text. A provider needing another id header extends the
+shared list rather than keeping its own.
 Telemetry trace_id uses traceparent's trace id, falling back to the portion
 before the first slash in a validated x-cloud-trace-context value.
 Traceparent must have exactly four lowercase hex fields of lengths 2/32/16/2,
@@ -1934,3 +1945,28 @@ evidence. Arbitrary error pages and extension-header payloads cannot be scrubbed
 reliably; enterprise users expect support consent to protect credentials too.
 OAuth refresh diagnostics likewise retain typed causes and retry hints while
 omitting foreign error prose, which may quote a rejected credential.
+
+
+## Shared credential and stream TLS vocabulary
+
+`credentials::Credentials` owns password plus username, or OAuth identity plus
+live `TokenSource`. SMTP, IMAP and submission alias it.
+`HttpCredentials` aliases `Credentials<()>` for HTTP Basic or identity-free
+HTTP bearer input, shared by both DAV clients and the DAV dispatcher. The default
+`Credentials<String>` retains a SASL identity. Debug never formats token sources.
+Every password field uses `bifrost_sasl::Secret`, which zeroizes and redacts even
+when a caller formats the field independently. Constructors can move existing
+zeroizing allocations without extracting a plain String.
+
+Net depends on SASL for secret storage; SASL has no net dependency. Token sources
+stay in net, so this direction has a publication order and does not pull transport
+machinery into SASL. HTTP bearer input intentionally has no SASL identity.
+DAV still coordinates its source on attachment, while stream protocols keep
+per-connect lookup and their own token error translation.
+
+`credentials::TlsMode` owns Implicit, StartTls and None. Its `port_for(TlsService)`
+is the single default-port table for IMAP, SMTP relay, submission, LMTP and
+ManageSieve. Service selection preserves plaintext relay 25 versus submission
+587, IMAP 993/143, LMTP 24 and ManageSieve 4190. A configured port always wins.
+This vocabulary does not replace SMTP's connector parameters or opportunistic
+upgrade policy.

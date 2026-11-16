@@ -10,7 +10,7 @@ REST and auxiliary funnels use `reqwest::Method` through net's typed request
 builder. REST header options use named `RequestOptions` fields (`prefer` and
 `eventual_consistency`). Auxiliary requests are intrinsically unmetered and
 accept no assertion-only `Resource` argument.
-Body diagnostics use net's shared byte cap and truncation marker.
+Body diagnostics export captured byte counts without body text.
 
 Every request declares its `ReplayPolicy`; the table lives at the call sites.
 Unabsorbed DELETEs and calendar updates are Never; read batches are Idempotent.
@@ -2760,7 +2760,7 @@ the engine then records ALONE.
 A non-envelope 5xx batch body retains the status-based server classification,
 including 507 quota handling, just like an empty body. An Outlook user expects
 an HTML proxy error to retry like the same temporary failure with a JSON body;
-body diagnostics remain available without making that failure terminal.
+captured body sizes remain available without making that failure terminal.
 
 Batch readers reject numeric statuses outside 100..=999 as acknowledged
 `Protocol(ContractViolation)` errors rather than substituting a retryable 500.
@@ -3309,3 +3309,13 @@ Update admission precedes contact validator reads and event recurrence-content
 reads. A StateBased declaration or an ExpectedVersion declaration omitting the
 specific update door refuses a caller version before I/O. Unversioned updates
 retain their existing immediate-read guards.
+
+## Credential-safe provider error exports
+
+Graph response diagnostics retain status, typed provider codes, header names
+and captured body sizes. Provider messages, nested messages/dates, raw bodies and
+arbitrary header values are omitted. Header and innerError correlation ids use
+bifrost-net's shared shape checks before export. Hand-written response and
+innerError Debug omit raw evidence. Enterprise users need escalation ids without
+exposing credentials that an error response may echo. Classification still uses
+the original status and typed signals.

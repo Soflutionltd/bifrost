@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 use bifrost_net::{
     AccessToken, AccountNet, AccountSpec, CoordinatedTokenSource, Error as NetError,
-    FollowRedirects, HopCredential, HopPolicy, MethodRewrite, Net, TokenSource, coordinate,
+    FollowRedirects, HopCredential, HopPolicy, MethodRewrite, Net, coordinate,
 };
 use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
@@ -38,16 +38,8 @@ use crate::transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body,
 };
 
-/// Credentials as the dispatcher needs them.
-///
-/// The published `CalDavCredentials` and `CardDavCredentials` stay exactly where
-/// they are and convert into this; it exists so one dispatcher can serve both
-/// without either public enum moving.
-#[derive(Clone)]
-pub enum DavCredentials {
-    Basic { username: String, password: String },
-    Bearer { token_source: Arc<dyn TokenSource> },
-}
+/// Shared HTTP credentials; dispatch additionally enforces token coordination.
+pub use bifrost_net::credentials::HttpCredentials as DavCredentials;
 
 // Keep raw-source ergonomics at the public input boundary, but make bypassing
 // coordination impossible in the dispatcher's stored credentials.
@@ -55,7 +47,7 @@ pub enum DavCredentials {
 enum DispatchCredentials {
     Basic {
         username: String,
-        password: String,
+        password: bifrost_net::credentials::Secret,
     },
     Bearer {
         token_source: CoordinatedTokenSource,
@@ -65,10 +57,14 @@ enum DispatchCredentials {
 impl From<DavCredentials> for DispatchCredentials {
     fn from(credentials: DavCredentials) -> Self {
         match credentials {
-            DavCredentials::Basic { username, password } => Self::Basic { username, password },
-            DavCredentials::Bearer { token_source } => Self::Bearer {
+            DavCredentials::Password { username, password } => Self::Basic { username, password },
+            DavCredentials::OAuth2 {
+                identity: (),
+                token_source,
+            } => Self::Bearer {
                 token_source: coordinate(token_source),
             },
+            _ => unreachable!("unsupported HTTP credential shape"),
         }
     }
 }
@@ -411,7 +407,7 @@ impl DavDispatch {
         match &self.credentials {
             DispatchCredentials::Basic { username, password } => {
                 let credentials = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"));
+                    .encode(format!("{username}:{}", password.as_str()));
                 let value =
                     HeaderValue::from_str(&format!("Basic {credentials}")).map_err(|_| {
                         local_error(
@@ -924,7 +920,7 @@ impl HopPolicy for DavHopPolicy {
         match &self.dispatch.credentials {
             DispatchCredentials::Basic { username, password } => {
                 let encoded = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"));
+                    .encode(format!("{username}:{}", password.as_str()));
                 let value = HeaderValue::from_str(&format!("Basic {encoded}"))
                     .map_err(|_| self.local("Basic credential contains header-invalid bytes"))?;
                 Ok(HopCredential::Header(value))
@@ -1085,6 +1081,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+    use bifrost_net::TokenSource;
     use crate::test_support::{
         DavTranscript, dav_dropped_after_send, dav_redirect, dav_script, dav_script_empty,
         scripted_dav_net, scripted_dav_net_capped, transcripts,
@@ -1103,9 +1100,9 @@ mod tests {
                 let dispatch = DavDispatch::with_account_net(
                     scripted_dav_net(&script),
                     BASE,
-                    DavCredentials::Basic {
+                    DavCredentials::Password {
                         username: "account-user".to_string(),
-                        password: "account-password".to_string(),
+                        password: "account-password".into(),
                     },
                     protocol,
                 );
@@ -1142,9 +1139,9 @@ mod tests {
             let dispatch = DavDispatch::with_account_net(
                 scripted_dav_net(&script),
                 BASE,
-                DavCredentials::Basic {
+                DavCredentials::Password {
                     username: "account-user".to_string(),
-                    password: "account-password".to_string(),
+                    password: "account-password".into(),
                 },
                 protocol,
             );
@@ -1192,9 +1189,9 @@ mod tests {
         DavDispatch::with_account_net(
             net,
             base_url,
-            DavCredentials::Basic {
+            DavCredentials::Password {
                 username: "user".to_string(),
-                password: "pass".to_string(),
+                password: "pass".into(),
             },
             DavProtocol::CalDav,
         )
@@ -1216,7 +1213,7 @@ mod tests {
         DavDispatch::with_account_net(
             net,
             BASE,
-            DavCredentials::Basic {
+            DavCredentials::Password {
                 username: "user".into(),
                 password: "pass".into(),
             },
@@ -1870,7 +1867,8 @@ mod tests {
         let dispatch = DavDispatch::with_account_net(
             scripted_dav_net(&script),
             BASE,
-            DavCredentials::Bearer {
+            DavCredentials::OAuth2 {
+                identity: (),
                 token_source: Arc::new(RotatingTokenSource {
                     refreshes: Arc::clone(&refreshes),
                 }),
@@ -2106,7 +2104,8 @@ mod tests {
             let dispatch = DavDispatch::with_account_net(
                 scripted_dav_net(&dav_script_empty()),
                 BASE,
-                DavCredentials::Bearer {
+                DavCredentials::OAuth2 {
+                    identity: (),
                     token_source: Arc::new(RawProvider {
                         refreshes: Arc::clone(&refreshes),
                     }),
@@ -2186,7 +2185,8 @@ mod tests {
             let dispatch = DavDispatch::with_account_net(
                 scripted_dav_net(&script),
                 BASE,
-                DavCredentials::Bearer {
+                DavCredentials::OAuth2 {
+                    identity: (),
                     token_source: Arc::new(RotatingTokenSource {
                         refreshes: Arc::clone(&refreshes),
                     }),
@@ -2392,7 +2392,8 @@ mod tests {
                 let dispatch = DavDispatch::with_account_net(
                     scripted_dav_net(&script),
                     BASE,
-                    DavCredentials::Bearer {
+                    DavCredentials::OAuth2 {
+                        identity: (),
                         token_source: Arc::new(RedirectFailingTokenSource {
                             reads: std::sync::atomic::AtomicUsize::new(0),
                             fail_refresh,
@@ -2452,7 +2453,8 @@ mod tests {
         let dispatch = DavDispatch::with_account_net(
             scripted_dav_net(&script),
             BASE,
-            DavCredentials::Bearer {
+            DavCredentials::OAuth2 {
+                identity: (),
                 token_source: Arc::new(AdvancingTokenSource),
             },
             DavProtocol::CalDav,
@@ -2528,7 +2530,8 @@ mod tests {
         let dispatch = DavDispatch::with_account_net(
             scripted_dav_net(&script),
             BASE,
-            DavCredentials::Bearer {
+            DavCredentials::OAuth2 {
+                identity: (),
                 token_source: Arc::new(PendingTokenSource),
             },
             DavProtocol::CalDav,
@@ -2633,7 +2636,8 @@ mod tests {
                 let dispatch = DavDispatch::with_account_net(
                     scripted_dav_net(&script),
                     BASE,
-                    DavCredentials::Bearer {
+                    DavCredentials::OAuth2 {
+                        identity: (),
                         token_source: Arc::new(PendingTokenSource),
                     },
                     protocol,
@@ -2691,7 +2695,8 @@ mod tests {
         DavDispatch::with_account_net(
             scripted_dav_net(&dav_script_empty()),
             BASE,
-            DavCredentials::Bearer {
+            DavCredentials::OAuth2 {
+                identity: (),
                 token_source: Arc::new(FailingTokenSource(make)),
             },
             DavProtocol::CalDav,

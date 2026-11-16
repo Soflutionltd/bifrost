@@ -778,7 +778,7 @@ A consequence: `Message::formatted()` is byte-identical to the delivered data se
 
 ## Auth
 
-`Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, using only the synchronous, non-refreshing `TokenSource::snapshot()`. Static sources and fresh refresher caches resolve without a runtime. Cache-lock contention returns a typed transient refresh error so callers can retry; refresh-required snapshots reject with an instruction to use the async SMTP transport. The safe trait default also requires async resolution, so custom sources must implement snapshot support to serve blocking SMTP. No async token future is created or polled, and an empty or stale refresher is left unchanged. With `account-error`, token-source errors retain bifrost-net's typed account-error projection, including terminal auth loss versus transient refresh failure. Without it, the original net error remains in the low-level connection error's source chain. Cache contention likewise remains a retryable connection failure without the account feature.
+`Credentials` aliases `bifrost_net::Credentials`: `Password { username, password: bifrost_sasl::Secret }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, using only the synchronous, non-refreshing `TokenSource::snapshot()`. Static sources and fresh refresher caches resolve without a runtime. Cache-lock contention returns a typed transient refresh error so callers can retry; refresh-required snapshots reject with an instruction to use the async SMTP transport. The safe trait default also requires async resolution, so custom sources must implement snapshot support to serve blocking SMTP. No async token future is created or polled, and an empty or stale refresher is left unchanged. With `account-error`, token-source errors retain bifrost-net's typed account-error projection, including terminal auth loss versus transient refresh failure. Without it, the original net error remains in the low-level connection error's source chain. Cache contention likewise remains a retryable connection failure without the account feature.
 
 Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM computation is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing. `ScramExchange` keeps its client-first and client-final lines in `Secret` values through the continuation write. The client-first is base64-framed once with a zeroizing encoder; the shared `SaslClient` returns raw replies, which this adapter base64-frames once.
 
@@ -1407,3 +1407,16 @@ account. With the optional `tracing` feature, committed partial submissions
 emit a warning with delivered, failed and uncertain counts and no addresses.
 `jiff` is optional and enabled by `tokio` for HOLDUNTIL formatting; the facade
 itself additionally requires `account-error`.
+
+
+## Shared credentials and TLS mode
+
+SMTP `Credentials` and `SubmissionCredentials` alias `bifrost_net::Credentials`.
+Password constructors accept strings, `Zeroizing<String>` and `Secret`; cloning
+keeps the password zeroizing. Debug never formats password bytes or token sources.
+SMTP retains its protocol-specific token error mapping and blocking snapshot path.
+`SubmissionTls` and `PortTls` alias net's `credentials::TlsMode`; plaintext is
+`None`. `TlsMode::port_for(TlsService)` owns the port table. Relay plaintext uses
+25, submission plaintext uses 587, and LMTP keeps 24 in every mode. Low-level
+SMTP `Tls` retains required versus opportunistic upgrade and connector parameters;
+those are transport capabilities beyond the shared encryption mode.

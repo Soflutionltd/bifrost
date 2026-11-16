@@ -1,58 +1,15 @@
 //! Account-oriented SMTP submission in shared address and error vocabulary.
 use crate::transport::smtp::{SendOptions, SubmissionStatus, submission_status};
 use crate::{Address as SmtpAddress, AsyncSmtpTransport};
-use bifrost_net::TokenSource;
 use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
 use bifrost_types::mime::SubmissionEnvelope;
 use bifrost_types::{RecipientNotAccepted, RecipientOutcome};
-use std::sync::Arc;
 
-/// TLS mode for the submission transport. Maps to SMTP's `relay` / `starttls_relay` / `builder_dangerous`
-/// at build time.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubmissionTls {
-    /// Implicit TLS (SMTPS). Default port 465.
-    Implicit,
-    /// STARTTLS upgrade. Default port 587.
-    StartTls,
-    /// Plaintext. Default port 587. Requires opting into insecure auth.
-    Plaintext,
-}
+/// Shared stream encryption policy.
+pub use bifrost_net::credentials::TlsMode as SubmissionTls;
 
-impl SubmissionTls {
-    /// Message-submission defaults, not relay defaults: plaintext stays on
-    /// 587 (see `default_submission_port`).
-    pub const fn default_port(self) -> u16 {
-        use crate::transport::smtp::{PortTls, default_submission_port};
-        let tls = match self {
-            Self::Implicit => PortTls::Implicit,
-            Self::StartTls => PortTls::StartTls,
-            Self::Plaintext => PortTls::Plaintext,
-        };
-        default_submission_port(tls)
-    }
-}
-
-/// Password or rotating OAuth credentials for message submission.
-#[non_exhaustive]
-#[derive(Clone)]
-pub enum SubmissionCredentials {
-    /// Username + password submission auth.
-    Password {
-        /// Authentication identity.
-        username: String,
-        /// Password or app password.
-        password: String,
-    },
-    /// OAuth 2.0 bearer submission auth, sharing a rotation source.
-    OAuth2 {
-        /// Authorization identity, usually the email address.
-        identity: String,
-        /// Live token source, read fresh at each connect.
-        token_source: Arc<dyn TokenSource>,
-    },
-}
+/// Shared zeroizing password or live OAuth submission credentials.
+pub use bifrost_net::Credentials as SubmissionCredentials;
 
 /// Fully configurable transport builder for account submission.
 /// Retains all low-level SMTP builder options, including metering and test transports.
@@ -67,28 +24,17 @@ impl SubmissionConfig {
         let transport = match tls {
             SubmissionTls::Implicit => AsyncSmtpTransport::relay(host)?,
             SubmissionTls::StartTls => AsyncSmtpTransport::starttls_relay(host)?,
-            SubmissionTls::Plaintext => {
+            SubmissionTls::None => {
                 AsyncSmtpTransport::builder_dangerous(host).dangerous_allow_insecure_auth(true)
             }
-        }
-        .port(tls.default_port());
-        Ok(Self { transport })
-    }
-}
-
-impl SubmissionCredentials {
-    /// Convert submission authentication into transport credentials without freezing tokens.
-    pub fn transport_credentials(&self) -> crate::transport::smtp::authentication::Credentials {
-        use crate::transport::smtp::authentication::Credentials;
-        match self {
-            Self::Password { username, password } => {
-                Credentials::password(username.clone(), password.clone())
+            _ => {
+                return Err(crate::transport::smtp::error::invalid_input(
+                    "unsupported TLS mode",
+                ));
             }
-            Self::OAuth2 {
-                identity,
-                token_source,
-            } => Credentials::oauth2_source(identity.clone(), Arc::clone(token_source)),
         }
+        .port(tls.port_for(bifrost_net::credentials::TlsService::Submission));
+        Ok(Self { transport })
     }
 }
 

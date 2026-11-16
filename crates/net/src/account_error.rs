@@ -619,43 +619,37 @@ fn response_diagnostics(
     body: &Bytes,
 ) -> AccountErrorBuilder {
     builder = builder.status(Some(status.as_u16()));
-    if let Some(id) = [
-        "x-request-id",
-        "request-id",
-        "x-ms-request-id",
-        "x-goog-request-id",
-        "x-guploader-uploadid",
-    ]
-    .iter()
-    .find_map(|name| correlation_header(headers, name))
-    {
+    if let Some(id) = request_id_from_headers(headers) {
         builder = builder.request_id(id);
     }
-    let trace_id = headers
-        .get("traceparent")
-        .and_then(|value| value.to_str().ok())
-        .and_then(traceparent_trace_id)
-        .or_else(|| {
-            correlation_header(headers, "x-cloud-trace-context").and_then(|value| {
-                let id = value.split('/').next()?;
-                (!id.is_empty()).then(|| id.to_owned())
-            })
-        });
-    if let Some(id) = trace_id {
+    if let Some(id) = trace_id_from_headers(headers) {
         builder = builder.trace_id(id);
     }
-    // Support consent does not authorize disclosure of credentials echoed by a
-    // server. Preserve bounded structural evidence, never arbitrary wire text.
+    builder = push_header_names(builder, headers);
+    builder.text(body_size_text(body.len()))
+}
+
+/// Append one support-only line per response header name.
+///
+/// Support consent does not authorize disclosure of credentials echoed by a
+/// server, so a mapper preserves bounded structural evidence, never arbitrary
+/// wire text: header names, never header values.
+pub fn push_header_names(
+    mut builder: AccountErrorBuilder,
+    headers: &HeaderMap,
+) -> AccountErrorBuilder {
     for name in headers.keys() {
         builder = builder.text(DiagnosticText::support_only(format!(
             "response header: {name}"
         )));
     }
-    builder.text(DiagnosticText::support_only(format!(
-        "response evidence: {} headers, {} captured body bytes",
-        headers.len(),
-        body.len()
-    )))
+    builder
+}
+
+/// The support-only size of a captured response body, exported in place of
+/// the body itself, which may echo credentials.
+pub fn body_size_text(len: usize) -> DiagnosticText {
+    DiagnosticText::support_only(format!("captured response body bytes: {len}"))
 }
 
 fn maybe_support_text(value: String) -> Option<DiagnosticText> {
@@ -670,10 +664,59 @@ fn maybe_support_text_from_option(value: Option<String>) -> Option<DiagnosticTex
     value.and_then(maybe_support_text)
 }
 
-// Enterprise support needs provider correlation ids, but echoed credentials must
-// never become telemetry. Validate the entire value before extracting any part.
-fn correlation_header(headers: &HeaderMap, name: &str) -> Option<String> {
-    let value = headers.get(name)?.to_str().ok()?;
+/// Response headers that carry a provider request id, in priority order.
+///
+/// The one list every HTTP provider mapper reads; a provider with an extra
+/// request-id header adds it here rather than keeping a local list.
+pub const REQUEST_ID_HEADERS: &[&str] = &[
+    "x-request-id",
+    "request-id",
+    "x-ms-request-id",
+    "x-goog-request-id",
+    "x-google-request-id",
+    "x-guploader-uploadid",
+];
+
+/// The first request-id header in [`REQUEST_ID_HEADERS`] whose value passes
+/// [`correlation_id`]. A header that fails the check is skipped, not trimmed.
+pub fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    REQUEST_ID_HEADERS
+        .iter()
+        .find_map(|name| correlation_header(headers, name))
+}
+
+/// A trace id from a W3C `traceparent` header (see [`traceparent_trace_id`]),
+/// falling back to the id part of `x-cloud-trace-context`. The whole
+/// `x-cloud-trace-context` value must pass [`correlation_id`] before any part
+/// of it is extracted.
+pub fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(traceparent_trace_id)
+        .or_else(|| {
+            correlation_header(headers, "x-cloud-trace-context").and_then(|value| {
+                let id = value.split('/').next()?;
+                (!id.is_empty()).then(|| id.to_owned())
+            })
+        })
+}
+
+/// The value of header `name`, if it passes [`correlation_id`].
+pub fn correlation_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    correlation_id(headers.get(name)?.to_str().ok()?)
+}
+
+/// The workspace's single shape check for a provider correlation id, from a
+/// header or from a response body field.
+///
+/// Enterprise support needs provider request and trace ids, but a server can
+/// echo credentials into any field, and echoed credentials must never become
+/// telemetry. The entire value is validated, never trimmed or partly
+/// extracted: non-empty, at most 256 bytes, ASCII alphanumerics and `-_./;=`
+/// only, and no credential marker such as `bearer` or `token` anywhere in it.
+/// Every provider mapper exports an id only through this function.
+pub fn correlation_id(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     if value.is_empty()
         || value.len() > 256
@@ -701,7 +744,11 @@ fn correlation_header(headers: &HeaderMap, name: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn traceparent_trace_id(value: &str) -> Option<String> {
+/// The trace-id field of a W3C `traceparent` value, or `None` unless the
+/// whole value is well formed: version, trace id, parent id and flags as
+/// lowercase hex of lengths 2, 32, 16 and 2, version not `ff`, and neither id
+/// all zeros.
+pub fn traceparent_trace_id(value: &str) -> Option<String> {
     if value.len() != 55 {
         return None;
     }

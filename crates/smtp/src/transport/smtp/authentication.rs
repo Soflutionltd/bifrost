@@ -6,7 +6,7 @@ use bifrost_sasl::{ScramChannelBinding, ScramHash, Secret};
 
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
 use crate::transport::smtp::extension::ServerInfo;
-// pub: Credentials exposes zeroizing fields and constructors accept this type.
+// pub: Credentials constructors accept this type as secret input.
 pub use zeroize::Zeroizing;
 
 /// Accepted password authentication mechanisms, strongest first.
@@ -43,6 +43,9 @@ pub(crate) use framing::{decode_auth_challenge, decode_scram_payload};
 #[cfg(all(test, feature = "account-error"))]
 use credentials::oauth_token_error;
 pub use credentials::{Credentials, IntoSecretString};
+// The SMTP-specific credential behavior lives on an extension trait because
+// `Credentials` itself is the shared `bifrost_net` type.
+pub(crate) use credentials::SmtpCredentialsExt;
 
 /// Represents authentication mechanisms
 #[derive(PartialEq, Eq, Copy, Clone, Hash, Debug)]
@@ -407,7 +410,7 @@ fn test_binding() -> Option<bifrost_sasl::ChannelBindingData> {
 
 #[cfg(all(test, feature = "account-error"))]
 mod test {
-    use super::{Credentials, Mechanism, test_binding};
+    use super::{Credentials, Mechanism, SmtpCredentialsExt as _, test_binding};
     use bifrost_net::auth::TokenSnapshot;
     use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
     use std::sync::Arc;
@@ -1472,7 +1475,9 @@ mod test {
 
 #[cfg(all(test, not(feature = "account-error")))]
 mod standalone_tests {
-    use super::{Credentials, Mechanism, PASSWORD_MECHANISMS, password_mechanism};
+    use super::{
+        Credentials, Mechanism, PASSWORD_MECHANISMS, SmtpCredentialsExt as _, password_mechanism,
+    };
     use crate::transport::smtp::extension::ServerInfo;
 
     #[test]

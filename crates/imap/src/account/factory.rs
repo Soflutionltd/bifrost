@@ -873,18 +873,12 @@ mod tests {
         if calendar {
             cfg.caldav = Some(CalDavConfig::new(
                 "https://dav.invalid",
-                bifrost_caldav::CalDavCredentials::Basic {
-                    username: "user".into(),
-                    password: "pass".into(),
-                },
+                bifrost_caldav::CalDavCredentials::basic("user", "pass"),
             ));
         } else {
             cfg.carddav = Some(CardDavConfig::new(
                 "https://dav.invalid",
-                bifrost_carddav::CardDavCredentials::Basic {
-                    username: "user".into(),
-                    password: "pass".into(),
-                },
+                bifrost_carddav::CardDavCredentials::basic("user", "pass"),
             ));
         }
         cfg

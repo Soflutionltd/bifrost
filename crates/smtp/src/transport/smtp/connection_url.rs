@@ -29,7 +29,7 @@ pub(crate) fn from_connection_url<R>(connection_url: &str) -> Result<Builder<Smt
         ("smtp", None) => {
             builder = builder.port(connection_url.port().unwrap_or(default_port(
                 crate::transport::smtp::Dialect::Smtp,
-                PortTls::Plaintext,
+                PortTls::None,
             )));
         }
         ("smtp", Some("required")) => {

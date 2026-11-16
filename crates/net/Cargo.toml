@@ -22,6 +22,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+bifrost-sasl = { path = "../sasl" }
 bifrost-types = { path = "../types" }
 reqwest = { workspace = true, features = ["native-tls", "stream", "json", "http2"] }
 native-tls = { workspace = true }

@@ -812,8 +812,15 @@ root-relative href replace the base path per RFC 3986, and resolves a relative
 href UNDER the configured base path rather than beside it. `reference/caldav.md`,
 "How `resolve_url` turns a native id into a request URL", carries the rule and
 the trailing-slash reason it depends on.
-`CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
-the dispatcher's `DavCredentials`.
+`CardDavCredentials` and dispatch's `DavCredentials` alias
+`bifrost_net::credentials::HttpCredentials`. Password fields use
+`bifrost_sasl::Secret`; use `password.into()` in variant literals or
+`basic(username, password)`. Clones retain zeroizing storage and live bearer
+sources. HTTP credentials use the same Password/OAuth2 variants with a unit OAuth
+identity. `basic` and `bearer_source` construct them without inventing a SASL
+authorization identity for bearer-only requests.
+Net owns both credential surfaces, and DAV retains its coordinated storage
+boundary and credential-origin admission.
 
 Shared DAV request/response/body records and the configured base use `DavHref`, retaining
 the native spelling and a parsed target together. Only absolute HTTP(S) targets

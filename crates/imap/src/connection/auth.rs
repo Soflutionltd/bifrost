@@ -36,7 +36,7 @@ impl ImapConnection {
         use crate::types::{AuthMechanism, AuthOutcome, CredentialsKind};
 
         let profile = self.server_profile();
-        match credentials.kind() {
+        match credentials {
             CredentialsKind::OAuth2 {
                 identity,
                 token_source,
@@ -214,6 +214,13 @@ impl ImapConnection {
                     AuthPolicyFailure::new(offered_authentication(&profile, true), rejected),
                 )))
             }
+            // `Credentials` is a non-exhaustive shared type: a future shape is a
+            // local configuration this client cannot use, never server data.
+            _ => Err(Error::LocalRefusal(
+                crate::error::LocalRefusal::UnsupportedOperation(
+                    "unsupported credential shape".into(),
+                ),
+            )),
         }
     }
 

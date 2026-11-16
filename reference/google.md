@@ -2200,3 +2200,13 @@ HTTP resource fallback uses only the operation resource hint or typed scope.
 Scopeless filter and directory errors do not invent a Message subject on 403
 or 404: users expect permission and absence reports to identify only known
 resources. A 404 without either hint retains the generic HTTP status error.
+
+## Credential-safe provider error exports
+
+Google error exports preserve typed reason/status codes, HTTP status and shaped
+request/trace ids using bifrost-net's shared correlation helpers. Provider messages
+and fallback response bodies never enter support exports. Response Debug and
+Display omit body text, and envelope Debug omits message text. Captured body byte
+counts remain available. Enterprise users expect support consent to protect
+credentials that a provider or proxy may echo; classification still reads the
+original response evidence.

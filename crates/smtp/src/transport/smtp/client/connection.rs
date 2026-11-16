@@ -1,3 +1,4 @@
+use crate::transport::smtp::authentication::SmtpCredentialsExt;
 #[cfg(feature = "account-error")]
 use crate::transport::smtp::batch::{SendProgress, SmtpBatchRecipient};
 #[cfg(unix)]

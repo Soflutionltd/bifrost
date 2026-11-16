@@ -169,7 +169,7 @@ impl CardDavClient {
             &net,
             account_id,
             &config.base_url,
-            config.credentials.to_shared(),
+            config.credentials.clone(),
             DAV,
         ))
     }
@@ -194,7 +194,7 @@ impl CardDavClient {
         Self::with_dispatch(DavDispatch::with_account_net(
             net,
             base_url,
-            crate::CardDavCredentials::bearer("token").to_shared(),
+            crate::CardDavCredentials::bearer("token"),
             DAV,
         ))
     }

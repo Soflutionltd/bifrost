@@ -27,7 +27,7 @@ impl ImapConfig {
     pub fn tls(host: impl Into<String>) -> Self {
         Self {
             host: host.into(),
-            port: 993,
+            port: TlsMode::Implicit.port_for(bifrost_net::credentials::TlsService::Imap),
             tls_mode: TlsMode::Implicit,
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_secs(60),
@@ -43,7 +43,7 @@ impl ImapConfig {
     pub fn starttls(host: impl Into<String>) -> Self {
         Self {
             tls_mode: TlsMode::StartTls,
-            port: 143,
+            port: TlsMode::StartTls.port_for(bifrost_net::credentials::TlsService::Imap),
             ..Self::tls(host)
         }
     }
@@ -52,7 +52,7 @@ impl ImapConfig {
     pub fn plaintext(host: impl Into<String>) -> Self {
         Self {
             tls_mode: TlsMode::None,
-            port: 143,
+            port: TlsMode::None.port_for(bifrost_net::credentials::TlsService::Imap),
             ..Self::tls(host)
         }
     }
@@ -189,26 +189,7 @@ where
 #[path = "config_tests.rs"]
 mod tests;
 
-/// TLS policy for an IMAP connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TlsMode {
-    /// Connect directly over TLS.
-    Implicit,
-    /// Connect in cleartext, then upgrade via STARTTLS.
-    StartTls,
-    /// Connect without TLS.
-    None,
-}
-
-impl TlsMode {
-    pub(super) fn uses_implicit_tls(self) -> bool {
-        matches!(self, Self::Implicit)
-    }
-
-    pub(super) fn uses_starttls(self) -> bool {
-        matches!(self, Self::StartTls)
-    }
-}
+pub(crate) use bifrost_net::credentials::TlsMode;
 
 /// TCP keepalive configuration for the underlying socket.
 #[non_exhaustive]

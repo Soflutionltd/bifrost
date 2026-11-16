@@ -31,6 +31,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 10 * 1000;
 
 #[non_exhaustive]
 pub(crate) enum Credentials {
+    // This is an already encoded Authorization value, not a username/password
+    // pair. Keep the representation at the HTTP header boundary: decoding it
+    // into stream-protocol credentials adds no authentication capability and
+    // would require retaining or regenerating the encoded value anyway.
     Basic(String),
     Bearer(Arc<dyn TokenSource>),
 }

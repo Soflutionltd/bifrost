@@ -203,7 +203,7 @@ pub(super) async fn draft_send_scripted(
     });
     let cfg = crate::account::SmtpSubmissionConfig::new(
         "smtp.invalid",
-        crate::account::SubmissionTls::Plaintext,
+        crate::account::SubmissionTls::None,
         bifrost_types::Address::bare("user@example.com"),
     )
     .with_save_to_sent_default(false);
@@ -444,7 +444,7 @@ pub(super) async fn send_through_peers(
     });
     let cfg = crate::account::SmtpSubmissionConfig::new(
         "smtp.invalid",
-        crate::account::SubmissionTls::Plaintext,
+        crate::account::SubmissionTls::None,
         bifrost_types::Address::bare("user@example.com"),
     )
     .with_save_to_sent_default(save_to_sent_default)

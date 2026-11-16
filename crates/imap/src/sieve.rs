@@ -68,23 +68,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ManageSieveTlsMode {
-    Implicit,
-    StartTls,
-    None,
-}
-
-impl ManageSieveTlsMode {
-    fn uses_implicit_tls(self) -> bool {
-        matches!(self, Self::Implicit)
-    }
-
-    fn uses_starttls(self) -> bool {
-        matches!(self, Self::StartTls)
-    }
-}
+pub use bifrost_net::credentials::TlsMode as ManageSieveTlsMode;
 
 #[non_exhaustive]
 #[derive(Clone)]
@@ -101,7 +85,8 @@ impl ManageSieveConfig {
     pub fn starttls(host: impl Into<String>) -> Self {
         Self {
             host: host.into(),
-            port: 4190,
+            port: ManageSieveTlsMode::StartTls
+                .port_for(bifrost_net::credentials::TlsService::ManageSieve),
             tls_mode: ManageSieveTlsMode::StartTls,
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_secs(60),
@@ -377,7 +362,7 @@ async fn authenticate(
     tls_active: bool,
 ) -> Result<(), Error> {
     let offered = capabilities.sasl.clone();
-    let (allowed, oauth): (&[_], _) = match credentials.kind() {
+    let (allowed, oauth): (&[_], _) = match credentials {
         CredentialsKind::Password { .. } => (
             &[
                 AuthMechanism::ScramSha256Plus,
@@ -391,6 +376,7 @@ async fn authenticate(
         CredentialsKind::OAuth2 { .. } => {
             (&[AuthMechanism::OAuthBearer, AuthMechanism::Xoauth2], true)
         }
+        _ => return Err(Error::Internal("unsupported credential shape".into())),
     };
     let binding = if !oauth
         && allowed
@@ -442,7 +428,7 @@ async fn authenticate(
         selected.ok_or_else(|| Error::AuthPolicy(AuthPolicyFailure::new(offered, rejected)))?;
     let mechanism = selection.mechanism;
     // Resolve tokens only after policy admission, as for IMAP and SMTP.
-    let mut client = match credentials.kind() {
+    let mut client = match credentials {
         CredentialsKind::Password { username, password } => {
             if let Some(rung) = selection.scram {
                 let hash = mechanism
@@ -473,6 +459,7 @@ async fn authenticate(
             };
             bifrost_sasl::SaslClient::oauth(oauth, identity, token.as_str())?
         }
+        _ => return Err(Error::Internal("unsupported credential shape".into())),
     };
     let payload = client
         .initial_response()

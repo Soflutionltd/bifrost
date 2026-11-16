@@ -313,3 +313,12 @@ capability disappearance; both protocols treat a wire rejection as final.
 
 SCRAM server-final parsing rejects an empty `e=` and a message containing both
 `e=` and `v=` as protocol faults before interpreting a typed server refusal.
+
+
+## Credential storage owner
+
+`Secret` remains the transport-free zeroizing and Debug-redacting string type.
+Net depends on SASL for it and owns credential containers beside `TokenSource`;
+SASL does not depend on net. SMTP, IMAP and submission alias net's common
+credentials, and the DAV clients alias net's unit-identity specialization. SASL continues to own
+proof computation and mechanism policy rather than live token-source I/O.

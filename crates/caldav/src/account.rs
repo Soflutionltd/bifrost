@@ -918,7 +918,7 @@ impl Account for CalDavAccount {
 
 fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
     match &config.credentials {
-        CalDavCredentials::Basic { username, .. } if username.contains('@') => {
+        CalDavCredentials::Password { username, .. } if username.contains('@') => {
             Some(username.to_ascii_lowercase())
         }
         _ => None,

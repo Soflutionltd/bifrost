@@ -19,7 +19,7 @@ use bifrost_types::{
     TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 use crate::error::{GraphError, GraphInnerError, GraphResponseError};
 use crate::ews::{EwsError, SoapFaultCode};
@@ -342,9 +342,7 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             // Wrap the raw HTTP failure as a Graph-style response so
             // the standard status-fallback classification applies,
             // but stamp the protocol as EWS via the context. The body
-            // is passed uncapped: `response_to_account_error` caps it
-            // once via `body_diagnostic`; capping here first would
-            // double-truncate (cap, then cap the capped string).
+            // stays available for classification; diagnostics export only its size.
             let response = GraphResponseError::from_response(status, HeaderMap::new(), body);
             response_to_account_error(response, &ctx)
         }
@@ -662,7 +660,7 @@ fn response_to_account_error(
         headers,
         body,
         signal,
-        message,
+        message: _,
         inner,
     } = response;
 
@@ -691,25 +689,15 @@ fn response_to_account_error(
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, &headers, &body, inner.as_ref());
 
-    if let Some(msg) = message.as_ref().filter(|m| !m.trim().is_empty()) {
-        builder = builder.text(DiagnosticText::support_only(msg.clone()));
-    }
-    if let Some(inner) = inner.as_ref() {
-        if let Some(code) = inner.code.as_ref().filter(|c| !c.trim().is_empty()) {
-            builder = builder.text(DiagnosticText::support_only(format!(
-                "innerError.code: {code}"
-            )));
-        }
-        if let Some(msg) = inner.message.as_ref().filter(|m| !m.trim().is_empty()) {
-            builder = builder.text(DiagnosticText::support_only(format!(
-                "innerError.message: {msg}"
-            )));
-        }
-        if let Some(date) = inner.date.as_ref().filter(|d| !d.trim().is_empty()) {
-            builder = builder.text(DiagnosticText::support_only(format!(
-                "innerError.date: {date}"
-            )));
-        }
+    // Keep the provider code, but never export free-form response prose.
+    if let Some(code) = inner
+        .as_ref()
+        .and_then(|inner| inner.code.as_ref())
+        .filter(|code| !code.trim().is_empty())
+    {
+        builder = builder.text(DiagnosticText::support_only(format!(
+            "innerError.code: {code}"
+        )));
     }
 
     // The retry hint already lives structurally on `ServerCause`; no
@@ -888,64 +876,35 @@ fn response_diagnostics(
 
     // Prefer header request-id; fall back to innerError.request-id
     // when the headers do not carry one.
-    let request_id = first_header(headers, REQUEST_ID_HEADERS)
-        .or_else(|| inner.and_then(|i| i.request_id.clone()));
+    use bifrost_net::account_error::{correlation_header, correlation_id, request_id_from_headers};
+    let request_id = request_id_from_headers(headers).or_else(|| {
+        inner
+            .and_then(|i| i.request_id.as_deref())
+            .and_then(correlation_id)
+    });
     if let Some(id) = request_id {
         builder = builder.request_id(id);
     }
-    let client_id = header_text(headers, "client-request-id")
-        .or_else(|| inner.and_then(|i| i.client_request_id.clone()));
+    let client_id = correlation_header(headers, "client-request-id").or_else(|| {
+        inner
+            .and_then(|i| i.client_request_id.as_deref())
+            .and_then(correlation_id)
+    });
     if let Some(trace) = client_id {
         builder = builder.trace_id(trace);
     }
 
-    for name in SUPPORT_ONLY_HEADER_TEXT {
-        if let Some(value) = header_text(headers, name) {
-            builder = builder.text(DiagnosticText::support_only(format!("{name}: {value}")));
-        }
-    }
+    builder = bifrost_net::account_error::push_header_names(builder, headers);
     if let Some(text) = body_diagnostic(body) {
         builder = builder.text(text);
     }
     builder
 }
 
-const REQUEST_ID_HEADERS: &[&str] = &["request-id", "x-ms-request-id", "x-request-id"];
-
-const SUPPORT_ONLY_HEADER_TEXT: &[&str] = &["x-ms-ags-diagnostic"];
-
-fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    for name in names {
-        if let Some(value) = header_text(headers, name) {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
-    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-    let value = headers.get(name)?;
-    let text = value.to_str().ok()?.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    }
-}
-
-/// Cap response-body diagnostics at `STATUS_BODY_CAP` bytes so a
-/// multi-megabyte error page does not become a multi-megabyte
-/// `DiagnosticText` retained across the lifetime of the error.
+/// Captured sizes support diagnosis without exporting echoed credentials.
+/// An empty body carries no evidence and adds no line.
 fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
-    if body.is_empty() {
-        return None;
-    }
-    let capped = bifrost_net::error::cap_status_body(body.clone());
-    let capped = String::from_utf8_lossy(&capped);
-    Some(DiagnosticText::support_only(format!(
-        "response body: {capped}"
-    )))
+    (!body.is_empty()).then(|| bifrost_net::account_error::body_size_text(body.len()))
 }
 
 /// Preserve absolute HTTP-dates, including elapsed deadlines, for recovery.

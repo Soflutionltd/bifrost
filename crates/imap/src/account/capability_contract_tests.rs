@@ -88,7 +88,7 @@ async fn account_with_submission() -> ImapAccount {
     let parts = scripted_account_parts(conn, 1);
     let submission_config = super::SmtpSubmissionConfig::new(
         "smtp.test.invalid",
-        super::SubmissionTls::Plaintext,
+        super::SubmissionTls::None,
         bifrost_types::Address::bare("user@test.invalid"),
     );
     let submission = Arc::new(

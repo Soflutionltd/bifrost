@@ -782,7 +782,7 @@ pub(crate) fn set_error_to_account_error(
         | SetErrorType::TooManyKeywords
         | SetErrorType::TooManyMailboxes
         | SetErrorType::TooManyRecipients => PrimaryCause::Request(RequestCause::PayloadTooLarge {
-            detail: DiagnosticText::support_only(set_error.to_string()),
+            detail: DiagnosticText::support_only("JMAP set request refused"),
         }),
         SetErrorType::InvalidPatch
         | SetErrorType::InvalidProperties
@@ -790,7 +790,7 @@ pub(crate) fn set_error_to_account_error(
         | SetErrorType::InvalidRecipients
         | SetErrorType::NoRecipients
         | SetErrorType::InvalidScript => PrimaryCause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(set_error.to_string()),
+            detail: DiagnosticText::support_only("JMAP set request refused"),
         }),
         // Valid requests refused because of target state need a caller decision.
         // Repeating the write or blaming the provider would not help the user.
@@ -801,7 +801,7 @@ pub(crate) fn set_error_to_account_error(
         | SetErrorType::MailboxHasChild
         | SetErrorType::MailboxHasEmail => {
             PrimaryCause::Request(RequestCause::PreconditionFailed {
-                detail: DiagnosticText::support_only(set_error.to_string()),
+                detail: DiagnosticText::support_only("JMAP set request refused"),
             })
         }
         SetErrorType::Other(code) => PrimaryCause::Protocol {
@@ -823,9 +823,7 @@ pub(crate) fn set_error_to_account_error(
     {
         builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
     }
-    if let Some(description) = set_error.description() {
-        builder = builder.text(DiagnosticText::support_only(description));
-    }
+    // Typed refusal evidence survives; descriptions may echo credentials.
     if matches!(set_error.error_type(), &SetErrorType::RateLimit) {
         builder = builder.with_throttle(|throttle| throttle.scope = Some(ThrottleScope::Account));
     }
@@ -1424,7 +1422,7 @@ fn convert_problem(
                 || limit.starts_with("maxObjectsIn") =>
         {
             PrimaryCause::Request(RequestCause::PayloadTooLarge {
-                detail: DiagnosticText::support_only(format!("JMAP request exceeds {limit}")),
+                detail: DiagnosticText::support_only("JMAP request exceeds a provider input limit"),
             })
         }
         (ProblemType::JMAP(JMAPError::UnknownCapability), _, _) => {
@@ -1440,7 +1438,9 @@ fn convert_problem(
                 kind: ProtocolErrorKind::ContractViolation,
                 wire: WireCause::MalformedResponse {
                     protocol: Protocol::Jmap,
-                    detail: Some(DiagnosticText::support_only(details.to_string())),
+                    detail: Some(DiagnosticText::support_only(
+                        "invalid JMAP request envelope",
+                    )),
                 },
             }
         }
@@ -1473,18 +1473,14 @@ fn convert_problem(
     if let Some(status) = status_u16 {
         builder = builder.status(Some(status));
     }
-    if let Some(request_id) = details.request_id() {
-        builder = builder.request_id(request_id.to_string());
+    if let Some(request_id) = details
+        .request_id()
+        .and_then(bifrost_net::account_error::correlation_id)
+    {
+        builder = builder.request_id(request_id);
     }
-    if let Some(title) = details.title() {
-        builder = builder.text(DiagnosticText::support_only(title.to_string()));
-    }
-    if let Some(detail) = details.detail() {
-        builder = builder.text(DiagnosticText::support_only(detail.to_string()));
-    }
-    if let Some(limit) = details.limit() {
-        builder = builder.text(DiagnosticText::support_only(format!("limit: {limit}")));
-    }
+    // Problem title/detail and arbitrary limit names are server prose.
+    // Support consent must not expose credentials echoed by a server.
     builder
         .try_build()
         .expect("valid account error classification")
@@ -1706,17 +1702,8 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
     let mut builder = build_with(&ctx, primary).push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )));
-    // Preserve the server's own explanation and named limit as
-    // support-only diagnostics - the error-model contract prizes evidence
-    // preservation, and these were previously dropped at the wire.
-    if let Some(description) = method.description() {
-        builder = builder.text(DiagnosticText::support_only(description.to_string()));
-    }
-    if let Some(limit) = method.limit() {
-        builder = builder.text(DiagnosticText::support_only(format!(
-            "server-named limit: {limit}"
-        )));
-    }
+    // Descriptions and arbitrary limit names are not safe support evidence.
+    // The typed method cause below retains the provider's refusal code.
     // Push the wire cause as a forensic-only layer only if it differs
     // from the primary cause already on the chain (ServerPartialFail
     // and Other already use Wire as primary).
@@ -2146,6 +2133,54 @@ mod tests {
             reqwest::header::HeaderValue::from_static(seconds),
         );
         headers
+    }
+
+    #[test]
+    fn provider_descriptions_never_enter_support_exports() {
+        // Descriptions can echo credentials, even on a structured refusal.
+        for kind in ["tooLarge", "invalidProperties", "willDestroy"] {
+            let set: SetError<String> = serde_json::from_value(serde_json::json!({
+                "type": kind, "description": "Bearer echoed-credential"
+            }))
+            .unwrap();
+            let error = set_error_to_account_error(
+                set,
+                JmapErrorContext::new(AccountOperation::UpdateFlags),
+                None,
+            );
+            assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+        }
+        let method: MethodError = serde_json::from_value(serde_json::json!({
+            "type": "invalidArguments", "description": "Bearer echoed-credential",
+            "limit": "Bearer echoed-credential"
+        }))
+        .unwrap();
+        let error = convert_method(
+            method,
+            JmapErrorContext::new(AccountOperation::SyncInventory),
+        );
+        assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+    }
+
+    #[test]
+    fn problem_exports_only_typed_evidence_and_shaped_request_ids() {
+        for (request_id, expected) in [("req-123", Some("req-123")), ("Bearer-credential", None)] {
+            // Check the complete internal export, including primary-cause details.
+            let details: ProblemDetails = serde_json::from_value(serde_json::json!({
+                "type": "urn:ietf:params:jmap:error:notRequest", "status": 400,
+                "title": "echoed-credential", "detail": "echoed-credential",
+                "request_id": request_id, "limit": "echoed-credential"
+            }))
+            .unwrap();
+            let error = convert_problem(
+                details,
+                None,
+                JmapErrorContext::new(AccountOperation::SyncInventory),
+            );
+            assert_eq!(error.telemetry_fields().status, Some(400));
+            assert_eq!(error.telemetry_fields().request_id, expected);
+            assert!(!format!("{:?}", error.support_internal()).contains("echoed-credential"));
+        }
     }
 
     #[test]

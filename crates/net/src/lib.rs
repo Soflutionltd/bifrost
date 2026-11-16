@@ -22,6 +22,8 @@
 pub mod account_error;
 pub mod attempt;
 pub mod auth;
+pub mod credentials;
+pub use credentials::{Credentials, IntoSecretString};
 pub mod bandwidth;
 pub mod budget;
 pub mod concurrency;

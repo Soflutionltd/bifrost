@@ -191,6 +191,7 @@
 //! # }
 //! ```
 
+use crate::transport::smtp::authentication::SmtpCredentialsExt;
 use std::{path::PathBuf, time::Duration};
 
 pub(crate) use self::client::WireMetering;
@@ -287,43 +288,35 @@ pub(super) mod util;
 
 /// Default smtp port
 // pub: callers use standard SMTP ports when building custom configs.
-pub const SMTP_PORT: u16 = 25;
+pub const SMTP_PORT: u16 = PortTls::None.port_for(bifrost_net::credentials::TlsService::Smtp);
 /// Common LMTP TCP port.
 ///
 /// RFC 2033 does not assign a TCP port for LMTP. Port 24 is the closest
 /// deployed convention, notably used by Dovecot for TCP LMTP listeners.
 // pub: callers use the deployed LMTP TCP convention for local delivery.
-pub const LMTP_PORT: u16 = 24;
+pub const LMTP_PORT: u16 = PortTls::None.port_for(bifrost_net::credentials::TlsService::Lmtp);
 /// Default submission port
 // pub: callers use the standard message-submission port in configs.
-pub const SUBMISSION_PORT: u16 = 587;
+pub const SUBMISSION_PORT: u16 =
+    PortTls::StartTls.port_for(bifrost_net::credentials::TlsService::Submission);
 /// Default submission over TLS port
 ///
 /// Defined in [RFC8314](https://tools.ietf.org/html/rfc8314)
 // pub: callers use the standard implicit-TLS submission port in configs.
-pub const SUBMISSIONS_PORT: u16 = 465;
+pub const SUBMISSIONS_PORT: u16 =
+    PortTls::Implicit.port_for(bifrost_net::credentials::TlsService::Submission);
 
-/// TLS mode used to select a default TCP port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum PortTls {
-    /// Plaintext SMTP or LMTP.
-    Plaintext,
-    /// Required or opportunistic STARTTLS.
-    StartTls,
-    /// TLS from connection establishment.
-    Implicit,
-}
+/// Shared stream TLS mode used for default port selection.
+pub use bifrost_net::credentials::TlsMode as PortTls;
 
 /// Default TCP port shared by transport builders, URLs and composed accounts.
 /// LMTP has no assigned TLS ports and retains its deployed port 24 convention.
 pub const fn default_port(protocol: Dialect, tls: PortTls) -> u16 {
-    match (protocol, tls) {
-        (Dialect::Lmtp, _) => LMTP_PORT,
-        (Dialect::Smtp, PortTls::Plaintext) => SMTP_PORT,
-        (Dialect::Smtp, PortTls::StartTls) => SUBMISSION_PORT,
-        (Dialect::Smtp, PortTls::Implicit) => SUBMISSIONS_PORT,
-    }
+    let service = match protocol {
+        Dialect::Smtp => bifrost_net::credentials::TlsService::Smtp,
+        Dialect::Lmtp => bifrost_net::credentials::TlsService::Lmtp,
+    };
+    tls.port_for(service)
 }
 
 /// Default TCP port for client message submission (RFC 6409), as opposed to
@@ -333,10 +326,7 @@ pub const fn default_port(protocol: Dialect, tls: PortTls) -> u16 {
 /// configuring a mail account against an internal relay without TLS expects
 /// the submission service, and client networks commonly block outbound 25.
 pub const fn default_submission_port(tls: PortTls) -> u16 {
-    match tls {
-        PortTls::Implicit => SUBMISSIONS_PORT,
-        PortTls::Plaintext | PortTls::StartTls => SUBMISSION_PORT,
-    }
+    tls.port_for(bifrost_net::credentials::TlsService::Submission)
 }
 
 /// Default timeout
@@ -382,7 +372,7 @@ impl Default for SmtpInfo {
         Self {
             protocol: Dialect::Smtp,
             server: "localhost".to_owned(),
-            port: default_port(Dialect::Smtp, PortTls::Plaintext),
+            port: default_port(Dialect::Smtp, PortTls::None),
             unix_socket: None,
             hello_name: ClientId::default(),
             credentials: None,
@@ -405,7 +395,7 @@ enum MechanismChoice {
 
 impl SmtpInfo {
     fn new<T: Into<String>>(server: T, protocol: Dialect) -> Self {
-        let port = default_port(protocol, PortTls::Plaintext);
+        let port = default_port(protocol, PortTls::None);
         Self {
             protocol,
             server: server.into(),

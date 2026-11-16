@@ -308,6 +308,11 @@ impl AccessToken {
         &self.secret
     }
 
+    /// Move resolved token bytes into another zeroizing credential buffer.
+    pub fn into_zeroizing(self) -> Zeroizing<String> {
+        self.secret
+    }
+
     /// Absolute expiry deadline, if the token issuer supplied a TTL.
     #[must_use]
     pub fn expires_at(&self) -> Option<Instant> {

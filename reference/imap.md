@@ -621,14 +621,14 @@ ENABLED response strings remain wire observations and are parsed on adoption.
 
 ## Auth
 
-`Credentials` is a public opaque wrapper with `password(username, password)`,
+`Credentials` aliases `bifrost_net::Credentials`, with `password(username, password)`,
 `oauth2(identity, access_token)` (raw string), and
 `oauth2_source(identity, Arc<dyn TokenSource>)` (shared rotation source)
 constructors. The OAuth variant holds an `Arc<dyn TokenSource>` (bifrost-net's
 trait), read via `current().await` at every connect/reconnect (in
 `authenticate_best` and the ManageSieve auth path), so a rotated token is
-presented fresh on reconnect. Password material stays in the internal
-`SecretString` alias of `bifrost_sasl::Secret` (zeroizes + redacts under `Debug`). `Credentials` is
+presented fresh on reconnect. Password material stays in
+`bifrost_sasl::Secret` (zeroizes + redacts under `Debug`). `Credentials` is
 `Clone` only (no `PartialEq`/`Eq` - a live token source is not `Eq`), no
 `From<(String, String)>`.
 
@@ -855,7 +855,7 @@ and mutation cannot disagree about equality or cursor bytes.
 
 ## Configuration and connect
 
-`ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. `ImapAccountConfig::pool_cap` caps physical IMAP sessions, clamped to at least one, from connector start through driver exit, including push, replacement dials and LOGOUT tails. `idle_connection_budget` is the non-NOTIFY push ceiling (see its field doc for the default), carved out of that cap. With `headroom = pool_cap.max(1) - 1`, push capacity is `min(idle_connection_budget.max(1), headroom)` without NOTIFY and `min(1, headroom)` with it. The last session stays available to data; `pool_cap = 1` disables push and advertises `PushCapability::None`. SMTP submission, DAV and ManageSieve have separate limits. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
+`ImapConfig` centralizes TLS mode (Implicit / StartTls / None), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. `ImapAccountConfig::pool_cap` caps physical IMAP sessions, clamped to at least one, from connector start through driver exit, including push, replacement dials and LOGOUT tails. `idle_connection_budget` is the non-NOTIFY push ceiling (see its field doc for the default), carved out of that cap. With `headroom = pool_cap.max(1) - 1`, push capacity is `min(idle_connection_budget.max(1), headroom)` without NOTIFY and `min(1, headroom)` with it. The last session stays available to data; `pool_cap = 1` disables push and advertises `PushCapability::None`. SMTP submission, DAV and ManageSieve have separate limits. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
 
 Internally, `connect_authenticated_metered(credentials, policy, meter, budget)`
 composes connect + STARTTLS-if-needed + `authenticate_best` for the factory,
@@ -1109,9 +1109,9 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 
 `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` makes the account own a `bifrost-smtp` transport (`submission.rs`, `SubmissionTransport`), built at open and stored on `ImapAccountInner.submission`. `build_capabilities(.., submission_configured)` flips `send_message` / `draft_send` true together with the impls. `attachment_upload` stays false (A6).
 
-- `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 / StartTls 587 / Plaintext 587, the RFC 6409 submission defaults from `bifrost_smtp::transport::smtp::default_submission_port` rather than the relay port 25 a plain SMTP builder defaults to; mapped to SMTP `relay` / `starttls_relay` / `builder_dangerous`), optional port/timeout/pool, default From, `save_to_sent_default`, optional `SubmissionCredentials`. `Clone`, not `Eq`/serde.
+- `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 / StartTls 587 / None 587, the RFC 6409 submission defaults from `bifrost_smtp::transport::smtp::default_submission_port` rather than the relay port 25 a plain SMTP builder defaults to; mapped to SMTP `relay` / `starttls_relay` / `builder_dangerous`), optional port/timeout/pool, default From, `save_to_sent_default`, optional `SubmissionCredentials`. `Clone`, not `Eq`/serde.
 - Credential reuse: when `credentials` is `None`, SMTP creds derive from the IMAP
-  `Credentials` via `credentials.kind()` (password->password, or OAuth identity +
+  `Credentials` by cloning the shared value (zeroizing password, or OAuth identity +
   the *same* `Arc<dyn TokenSource>` cloned across the boundary); an override
   supplies explicit submission auth.
 - The send path stays in `bifrost_types::Address` space; the only
@@ -2473,3 +2473,15 @@ Decoder tests live in `codec/decode/tests/` by grammar family, and encoder tests
 in `codec/encode/tests/` by command family, strings and validation. Shared codec
 fixtures stay in each test module's root; BODYSTRUCTURE generators stay with
 their grammar tests. Existing test bodies and hermetic transcripts are preserved.
+
+
+## Shared credential storage and TLS defaults
+
+IMAP, ManageSieve and SMTP submission use net's common `Credentials`. Passwords
+use `bifrost_sasl::Secret`; `SubmissionCredentials` is the same type, so inherited
+and overridden submission credentials clone directly without plaintext extraction.
+OAuth sources retain their shared identity and live rotation behavior.
+`TlsMode`, `ManageSieveTlsMode`, `SubmissionTls` and SMTP `PortTls` name one net
+type. `None` denotes plaintext. The net-owned `TlsService` port table preserves
+IMAP's 993/143 and ManageSieve's 4190 for every mode; submission uses 465/587.
+Explicit ports and authentication policy remain protocol-specific.

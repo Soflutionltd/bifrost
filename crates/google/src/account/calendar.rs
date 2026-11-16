@@ -2451,12 +2451,12 @@ mod tests {
         assert_eq!(telemetry.protocol, Some(Protocol::GoogleCalendar));
         assert!(telemetry.native_code.is_some());
         assert!(
-            error
+            !error
                 .support_consented()
                 .support_text
                 .iter()
                 .any(|text| text.contains("denied")),
-            "the provider's own diagnostic text must survive decoration"
+            "decoration must not export provider prose that can echo credentials"
         );
         assert_eq!(
             error.partial_commit().unwrap().steps()[0].effect(),

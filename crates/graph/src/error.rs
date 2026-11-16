@@ -85,7 +85,7 @@ pub(crate) enum GraphError {
 }
 
 /// Parsed Graph error response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub(crate) struct GraphResponseError {
     pub(crate) status: StatusCode,
@@ -99,14 +99,14 @@ pub(crate) struct GraphResponseError {
     /// translates the former into `WireCause::MalformedResponse` while
     /// the latter still flows through `GraphSignal::Unknown`.
     pub(crate) signal: Option<GraphSignal>,
-    /// `error.message`. Kept for support-only diagnostic text. Must
+    /// `error.message`. Retained for protocol inspection only. Must
     /// never drive classification.
     pub(crate) message: Option<String>,
     /// Parsed `innerError`, when present.
     pub(crate) inner: Option<GraphInnerError>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub(crate) struct GraphInnerError {
     pub(crate) code: Option<String>,
@@ -116,12 +116,12 @@ pub(crate) struct GraphInnerError {
     pub(crate) date: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ErrorBody {
     code: Option<String>,
     message: Option<String>,
@@ -129,7 +129,7 @@ struct ErrorBody {
     inner_error: Option<InnerErrorBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct InnerErrorBody {
     code: Option<String>,
     message: Option<String>,
@@ -138,6 +138,29 @@ struct InnerErrorBody {
     #[serde(rename = "client-request-id")]
     client_request_id: Option<String>,
     date: Option<String>,
+}
+
+impl std::fmt::Debug for GraphResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphResponseError")
+            .field("status", &self.status)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_bytes", &self.body.len())
+            .field("signal", &self.signal)
+            .field("has_message", &self.message.is_some())
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for GraphInnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphInnerError")
+            .field("code", &self.code)
+            .field("has_message", &self.message.is_some())
+            .field("has_date", &self.date.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl GraphError {

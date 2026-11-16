@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use bifrost_types::AccountOperation;
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 
 #[cfg(test)]
@@ -76,58 +76,13 @@ impl GmailResponseHeaders {
             }),
             retry_after,
             project: None,
-            request_id: first_header(
-                headers,
-                &["x-goog-request-id", "x-google-request-id", "x-request-id"],
-            ),
-            trace_id: trace_id_from_headers(headers),
+            // The shared net policy owns the header list and the shape check.
+            request_id: bifrost_net::account_error::request_id_from_headers(headers),
+            trace_id: bifrost_net::account_error::trace_id_from_headers(headers),
         }
     }
 }
 
-fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    for name in names {
-        if let Some(value) = header_text(headers, name) {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
-    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-    let value = headers.get(name)?;
-    let text = value.to_str().ok()?.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    }
-}
-
-fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = header_text(headers, "traceparent") {
-        let mut parts = value.split('-');
-        let _version = parts.next()?;
-        let trace_id = parts.next()?;
-        if trace_id.len() == 32 && trace_id.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-            return Some(trace_id.to_owned());
-        }
-    }
-    header_text(headers, "x-cloud-trace-context").and_then(|value| {
-        let trace_id = match value.split_once('/') {
-            Some((trace_id, _)) => trace_id.trim(),
-            None => value.trim(),
-        };
-        if trace_id.is_empty() {
-            None
-        } else {
-            Some(trace_id.to_owned())
-        }
-    })
-}
-
-#[derive(Debug)]
 pub(crate) struct GmailResponseError {
     pub(crate) service: ApiSurface,
     pub(crate) status: u16,
@@ -136,7 +91,7 @@ pub(crate) struct GmailResponseError {
     pub(crate) envelope: Option<GmailErrorEnvelope>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct GmailErrorEnvelope {
     #[serde(default)]
     pub(crate) message: Option<String>,
@@ -146,12 +101,38 @@ pub(crate) struct GmailErrorEnvelope {
     pub(crate) errors: Vec<GmailErrorDetail>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct GmailErrorDetail {
     #[serde(default)]
     pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) message: Option<String>,
+}
+
+impl fmt::Debug for GmailResponseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailResponseError")
+            .field("service", &self.service)
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body_bytes", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for GmailErrorEnvelope {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailErrorEnvelope")
+            .field("errors", &self.errors.len())
+            .field("has_message", &self.primary_message().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for GmailErrorDetail {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailErrorDetail").finish_non_exhaustive()
+    }
 }
 
 impl GmailErrorEnvelope {
@@ -495,10 +476,10 @@ impl Display for Error {
             Self::Response(resp) => {
                 write!(
                     f,
-                    "{} returned HTTP {}: {}",
+                    "{} returned HTTP {} ({} captured body bytes)",
                     resp.service,
                     resp.status,
-                    String::from_utf8_lossy(resp.body.as_ref())
+                    resp.body.len()
                 )
             }
             Self::JsonDecode { service, source } => {
@@ -616,6 +597,48 @@ mod tests {
     fn non_gmail_body_returns_none() {
         let body = br#"<html>oops</html>"#;
         assert!(parse_gmail_envelope(body).is_none());
+    }
+
+    #[test]
+    fn response_debug_and_display_omit_raw_evidence() {
+        // A provider may echo credentials in any message or raw body.
+        let error = Error::response_from_parts(
+            ApiSurface::Gmail, 403, GmailResponseHeaders::default(),
+            Bytes::from_static(br#"{"error":{"message":"echoed-credential","errors":[{"reason":"forbidden","message":"echoed-credential"}]}}"#),
+        );
+        assert!(!format!("{error:?}").contains("echoed-credential"));
+        assert!(!format!("{error}").contains("echoed-credential"));
+        if let Error::Response(response) = error {
+            assert!(!format!("{:?}", response.envelope).contains("echoed-credential"));
+        }
+    }
+
+    #[test]
+    fn correlation_headers_use_shared_validation_without_trimming() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "Bearer-echoed-credential".parse().unwrap());
+        headers.insert("x-goog-request-id", "req-123".parse().unwrap());
+        headers.insert(
+            "traceparent",
+            "00-00000000000000000000000000000000-0000000000000001-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "x-cloud-trace-context",
+            "trace-123/1;token=echoed".parse().unwrap(),
+        );
+        let parsed = GmailResponseHeaders::from_headers(&headers);
+        // Invalid priority ids are skipped; even an unsafe suffix rejects a trace.
+        assert_eq!(parsed.request_id.as_deref(), Some("req-123"));
+        assert_eq!(parsed.trace_id, None);
+        headers.insert("x-request-id", " padded-id".parse().unwrap());
+        assert_eq!(
+            GmailResponseHeaders::from_headers(&headers)
+                .request_id
+                .as_deref(),
+            Some("req-123")
+        );
     }
 
     #[test]

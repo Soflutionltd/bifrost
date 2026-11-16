@@ -9,7 +9,7 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 fn body(json: &str) -> Bytes {
     Bytes::copy_from_slice(json.as_bytes())
@@ -624,6 +624,36 @@ fn http_404_with_message_scope_maps_to_notfound_message() {
 }
 
 #[test]
+fn response_evidence_is_safe_to_debug_and_export() {
+    // All text channels can echo credentials, including nested messages and ids.
+    let response = GraphResponseError::from_response(
+        StatusCode::FORBIDDEN,
+        HeaderMap::from_iter([
+            (
+                HeaderName::from_static("request-id"),
+                HeaderValue::from_static("Bearer-echoed-credential"),
+            ),
+            (
+                HeaderName::from_static("x-ms-ags-diagnostic"),
+                HeaderValue::from_static("echoed-credential"),
+            ),
+        ]),
+        body(
+            r#"{"error":{"code":"AccessDenied","message":"echoed-credential","innerError":{"code":"InnerCode","message":"echoed-credential","date":"echoed-credential","request-id":"Bearer-echoed-credential","client-request-id":"Bearer-echoed-credential"}}}"#,
+        ),
+    );
+    assert!(!format!("{response:?}").contains("echoed-credential"));
+    let error = response_to_account_error(response, &graph_ctx(AccountOperation::SyncInventory));
+    assert_eq!(error.telemetry_fields().request_id, None);
+    assert_eq!(error.telemetry_fields().trace_id, None);
+    assert_eq!(error.telemetry_fields().status, Some(403));
+    let support = format!("{:?}", error.support_internal());
+    assert!(support.contains("AccessDenied"));
+    assert!(support.contains("InnerCode"));
+    assert!(!support.contains("echoed-credential"));
+}
+
+#[test]
 fn graph_request_ids_are_preserved() {
     let err = classify(
         StatusCode::TOO_MANY_REQUESTS,
@@ -640,7 +670,7 @@ fn graph_request_ids_are_preserved() {
 }
 
 #[test]
-fn unparseable_body_falls_through_to_status_with_support_text() {
+fn unparseable_body_keeps_status_without_exporting_text() {
     let err = classify(
         StatusCode::INTERNAL_SERVER_ERROR,
         "definitely not JSON",
@@ -650,17 +680,17 @@ fn unparseable_body_falls_through_to_status_with_support_text() {
     // A non-empty 5xx body that does not parse as an envelope was not
     // written by Graph, so it stays on bifrost-net's status mapping
     // (see `net_to_account_error`) rather than becoming a terminal
-    // contract violation; the body still reaches support text.
+    // contract violation. Support consent must not export the raw page.
     match err.kind() {
         AccountErrorKind::Server(_) => {}
         other => panic!("expected Server error, got {other:?}"),
     }
     let support: Vec<_> = err.support_consented().support_text.into_iter().collect();
-    assert!(support.iter().any(|t| t.contains("definitely not JSON")));
+    assert!(!support.iter().any(|t| t.contains("definitely not JSON")));
 }
 
 #[test]
-fn body_diagnostic_caps_large_bodies() {
+fn body_diagnostic_exports_only_size() {
     let large = "x".repeat(STATUS_BODY_CAP * 4);
     let err = classify(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -669,20 +699,13 @@ fn body_diagnostic_caps_large_bodies() {
         &[],
     );
     let support: Vec<&str> = err.support_consented().support_text;
-    let body_text = support
-        .iter()
-        .find(|t| t.contains("response body"))
-        .expect("body diagnostic present");
+    // Size evidence remains useful, but no prefix of a page is safe to export.
     assert!(
-        body_text.len() < large.len(),
-        "body diagnostic was not capped: {} >= {}",
-        body_text.len(),
-        large.len(),
+        support
+            .iter()
+            .any(|text| text.contains("captured response body bytes"))
     );
-    assert!(
-        body_text.contains("(truncated)"),
-        "missing truncation marker"
-    );
+    assert!(!support.iter().any(|text| text.contains(&"x".repeat(32))));
 }
 
 /// The whole `GraphSignal` table is reachable only if a REST failure

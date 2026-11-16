@@ -14,6 +14,7 @@
 //! conversion (bare addr-specs, no display name) happens only at
 //! `bifrost_smtp::submission::Submission::submit`.
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use bifrost_types::RecipientOutcome;
 use bifrost_types::error::AccountError;
 use bifrost_types::mime::SubmissionEnvelope;
 
-use crate::types::{Credentials, CredentialsKind};
+use crate::types::Credentials;
 
 pub use bifrost_smtp::submission::{SubmissionCredentials, SubmissionTls};
 /// Submission transport configuration, independent of the IMAP dial
@@ -163,7 +164,10 @@ impl SubmissionTransport {
         #[cfg(test)] connector: Option<bifrost_smtp::transport::smtp::ScriptedConnector>,
     ) -> Result<Self, crate::Error> {
         let credentials = resolve_credentials(cfg, imap_credentials);
-        let port = cfg.port.unwrap_or_else(|| cfg.tls.default_port());
+        let port = cfg.port.unwrap_or_else(|| {
+            cfg.tls
+                .port_for(bifrost_net::credentials::TlsService::Submission)
+        });
 
         // A builder error here is a local submission-config fault (bad TLS
         // SNI / host), not a wire failure: surface it as InvalidInput so the
@@ -227,18 +231,8 @@ fn resolve_credentials(
     cfg: &SmtpSubmissionConfig,
     imap_credentials: &Credentials,
 ) -> SmtpCredentials {
-    match &cfg.credentials {
-        Some(credentials) => credentials.transport_credentials(),
-        None => match imap_credentials.kind() {
-            CredentialsKind::Password { username, password } => {
-                SmtpCredentials::password(username.clone(), password.as_str().to_owned())
-            }
-            CredentialsKind::OAuth2 {
-                identity,
-                token_source,
-            } => SmtpCredentials::oauth2_source(identity.clone(), Arc::clone(token_source)),
-        },
-    }
+    // Both protocols retain the same zeroizing storage and live token source.
+    cfg.credentials.as_ref().unwrap_or(imap_credentials).clone()
 }
 
 #[cfg(test)]
@@ -274,7 +268,7 @@ mod tests {
         });
         let cfg = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = Arc::new(
@@ -314,7 +308,7 @@ mod tests {
         drop(peer);
         let config = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let budget = bifrost_net::BandwidthBudget::default();
@@ -351,7 +345,7 @@ mod tests {
         select_inbox(&conn, &mut peer).await;
         let config = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = Arc::new(
@@ -479,7 +473,7 @@ mod tests {
         );
         let cfg = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = SubmissionTransport::build_with_connector(
@@ -560,7 +554,7 @@ mod tests {
         });
         let cfg = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = SubmissionTransport::build_with_connector(
@@ -649,7 +643,7 @@ mod tests {
         use bifrost_smtp::transport::smtp::ScriptedConnector;
         let cfg = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = SubmissionTransport::build_with_connector(
@@ -687,7 +681,7 @@ mod tests {
         use bifrost_smtp::transport::smtp::ScriptedConnector;
         let cfg = SmtpSubmissionConfig::new(
             "smtp.invalid",
-            SubmissionTls::Plaintext,
+            SubmissionTls::None,
             bifrost_types::Address::bare("user@example.com"),
         );
         let submission = SubmissionTransport::build_with_connector(
@@ -736,14 +730,23 @@ mod tests {
                 // Same A1 token source threaded across the IMAP/SMTP boundary.
                 assert!(Arc::ptr_eq(&token_source, &source));
             }
-            SmtpCredentials::Password { .. } => panic!("expected OAuth2 credentials"),
+            _ => panic!("expected OAuth2 credentials"),
         }
     }
 
     #[test]
     fn submission_tls_default_ports() {
-        assert_eq!(SubmissionTls::Implicit.default_port(), 465);
-        assert_eq!(SubmissionTls::StartTls.default_port(), 587);
-        assert_eq!(SubmissionTls::Plaintext.default_port(), 587);
+        assert_eq!(
+            SubmissionTls::Implicit.port_for(bifrost_net::credentials::TlsService::Submission),
+            465
+        );
+        assert_eq!(
+            SubmissionTls::StartTls.port_for(bifrost_net::credentials::TlsService::Submission),
+            587
+        );
+        assert_eq!(
+            SubmissionTls::None.port_for(bifrost_net::credentials::TlsService::Submission),
+            587
+        );
     }
 }

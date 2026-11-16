@@ -2126,3 +2126,22 @@ so its local empty-send refusal retains the account protocol.
 tests exercise the live `sync/mail_set.rs::classify_set_response` boundary,
 including missing input blobs retaining errors for operations that skip absent
 subjects. This keeps test expectations on the policy used by real mutations.
+
+## Credential-safe provider error exports
+
+The sync error mapper retains typed set, method and problem codes plus HTTP
+status. Problem request ids use bifrost-net's shared correlation shape check.
+Server descriptions, problem titles/details and arbitrary limit names are
+omitted from exports, including primary-cause detail. Limit classification still
+reads the original name. Enterprise users expect support consent to protect
+credentials echoed in server prose while keeping typed failure and retry evidence.
+
+
+## Preencoded Basic credentials
+
+JMAP's internal Basic credential remains an already encoded Authorization value.
+It does not join net's username/password credential container: decoding and
+re-encoding this header-bound representation would add no authentication
+capability, and the HTTP/WebSocket consumers still need the encoded value.
+Bearer sources continue to use net's shared coordination. The encoded Basic
+value remains reusable credential material despite being base64.
