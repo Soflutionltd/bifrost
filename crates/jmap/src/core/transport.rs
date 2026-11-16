@@ -301,3 +301,6 @@ pub(crate) trait SseTransport: Send + Sync + 'static {
         last_event_id: Option<&str>,
     ) -> impl Future<Output = Result<Self::ByteStream, TransportError>> + Send;
 }
+
+#[cfg(test)]
+mod wire_tests;

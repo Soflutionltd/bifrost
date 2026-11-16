@@ -52,8 +52,6 @@ pub(crate) fn estimate_fetch_response_bytes(fr: &FetchResponse) -> usize {
 /// streaming variant (`uid_fetch_streaming`).
 pub(crate) struct FetchConsumer {
     fetches: Vec<FetchResponse>,
-    /// Non-FETCH responses routed here (classified as `Either`).
-    buffered: Vec<UntaggedResponse>,
     /// Running byte-size estimate of accumulated FETCH data.
     estimated_bytes: usize,
     /// Threshold at which to emit a warn-on-large log.
@@ -70,7 +68,7 @@ impl FetchConsumer {
     pub(crate) fn new() -> Self {
         Self {
             fetches: Vec::new(),
-            buffered: Vec::new(),
+
             estimated_bytes: 0,
             warn_threshold: DEFAULT_FETCH_WARN_BYTES,
             hard_limit: None,
@@ -100,7 +98,7 @@ impl Consumer for FetchConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 3501 Section7.4.2: FETCH responses are the solicited data
         // for FETCH/UID FETCH commands.
         if let UntaggedResponse::Fetch(fr) = resp {
@@ -118,7 +116,7 @@ impl Consumer for FetchConsumer {
                         uid: fr.uid.and_then(crate::types::Uid::new),
                     },
                 ));
-                return;
+                return None;
             }
             if !self.warned && self.estimated_bytes > self.warn_threshold {
                 tracing::warn!(
@@ -134,8 +132,9 @@ impl Consumer for FetchConsumer {
         } else {
             // Non-FETCH responses (EXISTS, EXPUNGE, FLAGS, etc.)
             // classified as Either; reclassify as events.
-            self.buffered.push(resp);
+            return Some(resp);
         }
+        None
     }
 
     fn finalize(
@@ -143,23 +142,16 @@ impl Consumer for FetchConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Vec<FetchResponse>> {
-        // The `Either` buffer is surrendered on every failure path: a tagged
-        // NO/BAD is the strongest evidence those responses were asynchronous
-        // server data, and the typed event stream is their only carrier.
         //
-        // The accumulated `fetches` are NOT re-emitted as events. They are
-        // solicited read-only query payload the caller was never going to
-        // receive on a failed FETCH, and they can be arbitrarily large
-        // (bodies, binary sections); pushing them into the event sink would
-        // turn a failed bulk fetch into an event-stream flood without telling
-        // any listener anything it did not already know.
+        // Failed read-only FETCH payloads are not asynchronous observations.
+        // Dropping them avoids flooding the event sink with message bodies.
         if let Err(err) = tagged.require_ok() {
-            return Finalized::failure(err, self.buffered);
+            return Finalized::failure(err, Vec::new());
         }
         if let Some(error) = self.limit_exceeded {
-            return Finalized::failure(error, self.buffered);
+            return Finalized::failure(error, Vec::new());
         }
-        Finalized::success(self.fetches, self.buffered)
+        Finalized::success(self.fetches, Vec::new())
     }
 }
 
@@ -170,14 +162,10 @@ impl Consumer for FetchConsumer {
 /// reading until the tagged OK regardless of whether the receiver is
 /// still alive; this keeps the IMAP stream consistent.
 ///
-/// Non-FETCH responses classified as `Either` are buffered and returned
-/// in `finalize` for the dispatcher to re-emit as events.
+/// Non-FETCH responses are declined immediately for the driver to emit as events.
 #[cfg(test)]
 pub(crate) struct StreamingFetchConsumer {
     tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
-    /// Buffer for ambiguous responses the dispatcher routed here but
-    /// that finalize will re-emit as events.
-    ambiguous_buffer: Vec<UntaggedResponse>,
 }
 
 #[cfg(test)]
@@ -185,10 +173,7 @@ impl StreamingFetchConsumer {
     pub(crate) fn new(
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
     ) -> Self {
-        Self {
-            tx,
-            ambiguous_buffer: Vec::new(),
-        }
+        Self { tx }
     }
 }
 
@@ -271,7 +256,6 @@ impl<T: Send + 'static> BoundedStreamingPipe<T> {
 pub(crate) struct BoundedStreamingFetchConsumer {
     pipe: BoundedStreamingPipe<FetchResponse>,
     remaining_literal_bytes: Option<usize>,
-    ambiguous_buffer: Vec<UntaggedResponse>,
 }
 
 impl BoundedStreamingFetchConsumer {
@@ -289,7 +273,6 @@ impl BoundedStreamingFetchConsumer {
         Self {
             pipe: BoundedStreamingPipe::new(tx),
             remaining_literal_bytes: budget,
-            ambiguous_buffer: Vec::new(),
         }
     }
 }
@@ -306,7 +289,7 @@ impl Consumer for BoundedStreamingFetchConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         if let UntaggedResponse::Fetch(fr) = resp {
             if let Some(remaining) = &mut self.remaining_literal_bytes {
                 let octets = fr
@@ -323,20 +306,16 @@ impl Consumer for BoundedStreamingFetchConsumer {
             }
             self.pipe.push(*fr);
         } else {
-            self.ambiguous_buffer.push(resp);
+            return Some(resp);
         }
+        None
     }
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Consuming `self` drops the pipe either way, which closes the
-        // delivery channel and ends the stream - that is unchanged. Items
-        // already delivered stay delivered. Only the ambiguous buffer has a
-        // choice to make, and it is surrendered: a failed FETCH is no reason
-        // to swallow an EXPUNGE the server volunteered mid-command.
         if let Err(err) = tagged.require_ok() {
-            return Finalized::failure(err, self.ambiguous_buffer);
+            return Finalized::failure(err, Vec::new());
         }
-        Finalized::success((), self.ambiguous_buffer)
+        Finalized::success((), Vec::new())
     }
 }
 
@@ -359,7 +338,7 @@ impl Consumer for StreamingFetchConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 3501 Section7.4.2: FETCH responses are the solicited data
         // for FETCH/UID FETCH commands.
         if let UntaggedResponse::Fetch(fr) = resp {
@@ -368,18 +347,16 @@ impl Consumer for StreamingFetchConsumer {
             let _ = self.tx.send(Ok(*fr));
         } else {
             // Non-FETCH response routed to us; ambiguous.
-            self.ambiguous_buffer.push(resp);
+            return Some(resp);
         }
+        None
     }
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // Dropping self.tx by consuming self signals end of stream on both
-        // paths. The ambiguous buffer survives a failure for the same reason
-        // as the bounded variant.
         if let Err(err) = tagged.require_ok() {
-            return Finalized::failure(err, self.ambiguous_buffer);
+            return Finalized::failure(err, Vec::new());
         }
-        Finalized::success((), self.ambiguous_buffer)
+        Finalized::success((), Vec::new())
     }
 }
 
@@ -396,7 +373,6 @@ pub(crate) struct BoundedStreamingFetchVanishedConsumer {
     pipe: BoundedStreamingPipe<FetchStreamItem>,
     requested_set: Option<UidSet>,
     dropped_vanished_count: usize,
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl BoundedStreamingFetchVanishedConsumer {
@@ -408,7 +384,6 @@ impl BoundedStreamingFetchVanishedConsumer {
             pipe: BoundedStreamingPipe::new(tx),
             requested_set,
             dropped_vanished_count: 0,
-            buffered: Vec::new(),
         }
     }
 }
@@ -421,7 +396,7 @@ impl Consumer for BoundedStreamingFetchVanishedConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             UntaggedResponse::Fetch(fr) => self.pipe.push(FetchStreamItem::Fetch(*fr)),
             UntaggedResponse::Vanished {
@@ -439,8 +414,9 @@ impl Consumer for BoundedStreamingFetchVanishedConsumer {
                     self.pipe.push(FetchStreamItem::VanishedEarlier(filtered));
                 }
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
@@ -450,13 +426,10 @@ impl Consumer for BoundedStreamingFetchVanishedConsumer {
                 "filtered out-of-set VANISHED (EARLIER) UIDs per RFC 7162 Section 3.2.6",
             );
         }
-        // VANISHED (EARLIER) that already went down the pipe stays delivered;
-        // nothing is retained here to re-emit. The generic `Either` buffer is
-        // surrendered on failure.
         if let Err(err) = tagged.require_ok() {
-            return Finalized::failure(err, self.buffered);
+            return Finalized::failure(err, Vec::new());
         }
-        Finalized::success((), self.buffered)
+        Finalized::success((), Vec::new())
     }
 }
 
@@ -518,7 +491,7 @@ impl Consumer for StoreConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 3501 Section6.4.6: STORE returns implicit FETCH responses
         // with updated flags for each message whose flags were changed.
         // `.SILENT` operations suppress these.
@@ -527,6 +500,7 @@ impl Consumer for StoreConsumer {
         } else {
             self.buffered.push(resp);
         }
+        None
     }
 
     fn finalize(
@@ -649,7 +623,7 @@ impl Consumer for FetchVanishedConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             // RFC 7162 Section3.2.6: FETCH responses for messages whose
             // flags changed since the given mod-sequence.
@@ -690,6 +664,7 @@ impl Consumer for FetchVanishedConsumer {
                 self.buffered.push(resp);
             }
         }
+        None
     }
 
     fn finalize(
@@ -838,7 +813,8 @@ mod store_tests {
     /// than dying with the consumer.
     #[test]
     fn tagged_bad_surrenders_the_implicit_fetches_as_events() {
-        let mut consumer = StoreConsumer::new(None);
+        let mut consumer =
+            crate::connection::test_support::record_consumer(StoreConsumer::new(None));
         let fetch = FetchResponse {
             seq: 7,
             uid: Some(7),

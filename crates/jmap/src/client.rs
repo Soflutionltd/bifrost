@@ -202,6 +202,9 @@ fn require_absolute_http_url(shown: &str, url: &str) -> Result<(), String> {
 
 impl SessionState {
     fn derive(session: Session) -> crate::Result<Self> {
+        // Cache both limits and their validation error. Keeping that error as
+        // data preserves the account boundary's absent-core recovery lane.
+        session.core_limits();
         // `apiUrl` is a plain URL, not a template, but the same rule holds:
         // it is the server's, and a relative or non-http one otherwise
         // failed later inside the transport, blaming nobody.
@@ -466,14 +469,15 @@ impl ClientBuilder {
         // Every installed session hands its API and upload limits to the
         // transport, so both bounds hold across all callers sharing this
         // client, not only within one call site.
-        transport.set_api_concurrency(session.api_request_concurrency());
-        transport.set_upload_concurrency(session.upload_concurrency());
+        let state = Arc::new(SessionState::derive(session)?);
+        transport.set_api_concurrency(state.session().api_request_concurrency());
+        transport.set_upload_concurrency(state.session().upload_concurrency());
 
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
                 session_cell: SessionCell {
-                    state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                    state: std::sync::Mutex::new(state),
                     refresh_gate: futures::lock::Mutex::new(()),
                     session_url,
                     session_updated: true.into(),
@@ -1071,6 +1075,52 @@ mod session_state_tests {
         session.to_string()
     }
 
+    #[test]
+    fn installed_session_caches_core_validation_before_any_reader() {
+        use crate::core::session::{CoreLimitsError, Session};
+
+        for (core, expected) in [
+            (json!(null), Err(CoreLimitsError::Absent)),
+            (
+                json!({"maxCallsInRequest": "16"}),
+                Err(CoreLimitsError::Malformed),
+            ),
+            (
+                json!({"maxCallsInRequest": 0}),
+                Err(CoreLimitsError::Unusable),
+            ),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&session_json("old", "A1", "s1")).unwrap();
+            if core.is_null() {
+                value["capabilities"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("urn:ietf:params:jmap:core");
+            } else {
+                value["capabilities"]["urn:ietf:params:jmap:core"] = core;
+            }
+            let state =
+                super::SessionState::derive(serde_json::from_value::<Session>(value).unwrap())
+                    .expect("invalid core limits retain their account-level classification");
+            state.session().assert_core_limits_cached();
+            assert_eq!(state.session().validated_core_limits(), expected);
+            let cached = state.session().core_limits();
+            assert!(std::ptr::eq(cached, state.session().core_limits()));
+        }
+
+        let state = super::SessionState::derive(
+            serde_json::from_str(&session_with_call_limit("new", "B2", "s2", 3)).unwrap(),
+        )
+        .unwrap();
+        state.session().assert_core_limits_cached();
+        assert!(state.session().validated_core_limits().is_ok());
+        assert_eq!(
+            state.session().core_limits().max_calls_in_request(),
+            Some(3)
+        );
+    }
+
     #[tokio::test]
     async fn oversized_http_request_is_refused_before_transport() {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1559,13 +1609,14 @@ impl<T: HttpTransport> Client<T> {
                 "a custom transport client needs a session URL".to_string(),
             ));
         }
-        transport.set_api_concurrency(session.api_request_concurrency());
-        transport.set_upload_concurrency(session.upload_concurrency());
+        let state = Arc::new(SessionState::derive(session)?);
+        transport.set_api_concurrency(state.session().api_request_concurrency());
+        transport.set_upload_concurrency(state.session().upload_concurrency());
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
                 session_cell: SessionCell {
-                    state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                    state: std::sync::Mutex::new(state),
                     refresh_gate: futures::lock::Mutex::new(()),
                     session_url,
                     session_updated: true.into(),
@@ -1620,9 +1671,8 @@ impl<T: HttpTransport> Client<T> {
         if let Some(max) = request
             .session_state()
             .session()
-            .core_capabilities()
-            .and_then(crate::core::session::CoreCapabilities::max_size_request)
-            && max > 0
+            .core_limits()
+            .max_size_request()
             && body.len() > max
         {
             return Err(crate::Error::RequestSizeLimit {
@@ -1704,9 +1754,9 @@ impl<T: HttpTransport> Client<T> {
             .map_err(crate::Error::from)?;
         let session: Session =
             serde_json::from_slice(&bytes).map_err(crate::Error::EnvelopeDecode)?;
-        let api_limit = session.api_request_concurrency();
-        let upload_limit = session.upload_concurrency();
         let state = Arc::new(SessionState::derive(session)?);
+        let api_limit = state.session().api_request_concurrency();
+        let upload_limit = state.session().upload_concurrency();
         // Both limits are applied under the same lock as the state they came
         // from, so two overlapping refreshes cannot leave one session beside
         // another session's gates. The setters are synchronous.

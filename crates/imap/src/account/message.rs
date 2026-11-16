@@ -1,6 +1,6 @@
 //! Typed message and thread hydration, including MIME body projection.
 
-use super::error::{expunged_message, folder_err, folder_preflight_err, pim_malformed};
+use super::error::{expunged_message, folder_err, folder_preflight_err};
 use super::mail_actions::IMPORTANCE_KEYWORD;
 use super::message_targets::{ThreadScope, group_by_folder, pim_operand, resolve_thread_members};
 use super::{
@@ -137,10 +137,7 @@ fn valid_uids(
         if id.uidvalidity != uidvalidity {
             // This is the hydration read guard. Writes use the shared
             // mutation engine's per-target stale-epoch classification.
-            return Err(pim_malformed(
-                op,
-                "UIDVALIDITY changed before IMAP operation",
-            ));
+            return Err(super::error::uidvalidity_changed_error(op, &id.folder));
         }
         uids.push(id.uid.get());
     }

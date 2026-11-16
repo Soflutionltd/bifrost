@@ -4,7 +4,8 @@ use crate::error::Error;
 use crate::types::Command;
 use crate::types::response::Capability;
 
-use super::super::dispatch::{CapabilityConsumer, TaggedOkConsumer};
+use super::super::dispatch::TaggedOkConsumer;
+use super::super::request::{self, Request};
 use super::super::{CompressedStream, ImapStream, InnerStream, SessionState};
 use super::{ConsumerErased, DriverConsumer, UpgradePayload, event_sink};
 
@@ -28,20 +29,20 @@ pub(super) async fn run_upgrade(
             server_name,
             tls_active,
         } => {
-            starttls_upgrade(
+            run_starttls_upgrade(
                 wire_reader,
                 state,
                 tag_gen,
                 event_sink,
                 tls_connector,
                 server_name,
-                Some(tls_active),
-                Some(gate),
+                tls_active,
+                gate,
             )
             .await
         }
         UpgradePayload::Compress => {
-            run_compress_upgrade(wire_reader, state, tag_gen, event_sink, Some(gate)).await
+            run_compress_upgrade(wire_reader, state, tag_gen, event_sink, gate).await
         }
     }
 }
@@ -59,41 +60,16 @@ pub(super) async fn run_upgrade(
 ///    reader has an empty buffer; the old buffer was dropped with
 ///    the old reader in step 3 (I10).
 /// 6. Re-fetch capabilities (RFC 3501 Section6.2.1).
-pub(in crate::connection) async fn run_starttls_upgrade(
-    wire_reader: &mut super::super::wire::WireReader,
-    state: &mut super::super::state::ProtocolState,
-    tag_gen: &mut super::super::tag::TagGenerator,
-    event_sink: &mut event_sink::DriverEventSink,
-    tls_connector: native_tls::TlsConnector,
-    server_name: String,
-    tls_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<(), Error> {
-    starttls_upgrade(
-        wire_reader,
-        state,
-        tag_gen,
-        event_sink,
-        tls_connector,
-        server_name,
-        tls_active,
-        None,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// [`run_starttls_upgrade`], withdrawable through `gate` until the STARTTLS
-/// line's first byte. Ungated (connection setup) it always runs.
 #[allow(clippy::too_many_arguments)]
-async fn starttls_upgrade(
+pub(super) async fn run_starttls_upgrade(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
     tls_connector: native_tls::TlsConnector,
     server_name: String,
-    tls_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    gate: Option<&super::super::reply::CommitGate>,
+    tls_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gate: &super::super::reply::CommitGate,
 ) -> Result<super::Gated<()>, Error> {
     // Step 1: Send STARTTLS command, await tagged OK (RFC 3501 Section6.2.1).
     let consumer =
@@ -105,7 +81,7 @@ async fn starttls_upgrade(
         event_sink,
         Command::StartTls,
         consumer,
-        gate,
+        Some(gate),
     )
     .await?
     {
@@ -177,12 +153,8 @@ async fn starttls_upgrade(
     *wire_reader =
         super::super::wire::WireReader::with_metering(ImapStream::Tls(tls_stream), metering);
     state.set_tls_active(true);
-    if let Some(tls_active) = tls_active {
-        // Publish the security boundary at the stream swap, not after the
-        // later CAPABILITY round trip. A failed refresh retires the driver,
-        // but callers must not observe an installed TLS stream as cleartext.
-        tls_active.store(true, std::sync::atomic::Ordering::Release);
-    }
+    // Publish encryption at the stream swap, even if the later refresh fails.
+    tls_active.store(true, std::sync::atomic::Ordering::Release);
 
     // Step 6: Re-read capabilities after TLS upgrade (RFC 3501 Section6.2.1).
     state.apply_capability_fetch(Vec::new());
@@ -215,14 +187,14 @@ pub(super) async fn required_capability_refresh(
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
 ) -> Result<(), Error> {
-    let cap_consumer =
-        DriverConsumer::Regular(Box::new(CapabilityConsumer::default()) as Box<dyn ConsumerErased>);
+    let (command, consumer) = request::Capability {}.into_parts();
+    let cap_consumer = DriverConsumer::Regular(Box::new(consumer));
     let result = super::run_one_command(
         wire_reader,
         state,
         tag_gen,
         event_sink,
-        Command::Capability,
+        command,
         cap_consumer,
     )
     .await
@@ -264,7 +236,7 @@ async fn run_compress_upgrade(
     state: &mut super::super::state::ProtocolState,
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
-    gate: Option<&super::super::reply::CommitGate>,
+    gate: &super::super::reply::CommitGate,
 ) -> Result<super::Gated<()>, Error> {
     // Defer the final inbound grant until the plaintext boundary is known.
     wire_reader.begin_compress_boundary();
@@ -277,7 +249,7 @@ async fn run_compress_upgrade(
         event_sink,
         Command::Compress,
         consumer,
-        gate,
+        Some(gate),
     )
     .await;
     match result {
@@ -495,8 +467,9 @@ mod bandwidth_review_tests {
             peer.write_all(&coalesced).await.unwrap();
             ok.len()
         };
+        let gate = super::super::super::reply::CommitGate::committed();
         let (result, ok_len) = tokio::join!(
-            run_compress_upgrade(&mut reader, &mut state, &mut tags, &mut events, None),
+            run_compress_upgrade(&mut reader, &mut state, &mut tags, &mut events, &gate),
             script
         );
         result.unwrap();

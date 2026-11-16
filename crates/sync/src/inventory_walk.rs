@@ -6,31 +6,27 @@
 //! Both now hold an `InventoryWalk` and route every barrier decision through
 //! this module, so a rule can only be changed for both at once.
 //!
-//! What is shared here is the SAFETY-CRITICAL half only: the barrier decision
-//! and the last accepted resume checkpoint. Checkpoint MINTING and terminal
-//! `Done` handling remain two implementations, because the shapes genuinely
-//! differ - fusion forwards the account's own checkpoint, backfill mints a
-//! positional `page:F:T` from partition coordinates the account never sees.
-//! That is an accepted structural residual, not an oversight: no loss path has
-//! been found through it across five rounds and two close passes. What remains
-//! is a RE-DIVERGENCE RISK, not a defect - the two minting sites can drift the
-//! way the barrier rules once did. Unifying them is worth doing only when one
-//! of two things happens: a THIRD inventory front end appears (at which point
-//! the shapes have to be reconciled anyway), or a defect is actually traced to
-//! the split. Until then the shapes are different enough that a forced common
-//! abstraction would cost more than it buys.
-//!
-//! Both front ends must refuse to announce a barrier the store REFUSED - the
-//! backfill partition fails so the scope stays Pending and re-walks, the
-//! fusion walk returns the error. A DEPARTED writer (detach or shutdown) is
-//! deliberately non-fatal, because there is nothing left to persist to; a
-//! store error is fatal, because there is. Getting this onto one front end and
-//! not the other is exactly the divergence this module exists to prevent, and
-//! it happened once already.
+//! Crossing waived barriers, recording blocked progress and warning cadence
+//! belong to the walk. Checkpoint minting and completion stay with each front
+//! end: fusion accepts provider cursors; backfill uses partition coordinates.
+//! Repair is not another walk: it resolves named obligations without advancing
+//! an enumeration checkpoint, and shares only the Created-id projection.
 
 use bifrost_types::{Checkpoint, InventoryCoverageReport};
 
 use crate::error::Error;
+
+/// Inventory and repair announce existence, leaving hydration to the consumer.
+pub(crate) fn created<'a>(
+    ids: impl IntoIterator<Item = &'a bifrost_types::ObjectId>,
+) -> impl Iterator<Item = bifrost_types::Change> {
+    ids.into_iter().map(|id| {
+        bifrost_types::Change::ObjectChange(bifrost_types::ObjectChange {
+            id: id.clone(),
+            kind: bifrost_types::ObjectChangeKind::Created,
+        })
+    })
+}
 
 /// Project inventory tombstones into the same removal vocabulary as changes.
 /// Keep these in the page's synthetic batch so its checkpoint cannot be
@@ -76,9 +72,111 @@ pub(crate) enum WalkDecision {
 #[derive(Default)]
 pub(crate) struct InventoryWalk {
     last_accepted: Option<Checkpoint>,
+    degraded: bool,
+    warned_incomplete: bool,
+}
+
+/// The writer has settled the barrier decision before this verdict is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageVerdict {
+    Advance,
+    CrossedWaived,
+    Stop,
+}
+
+impl PageVerdict {
+    pub(crate) fn crossed(self) -> bool {
+        self == Self::CrossedWaived
+    }
 }
 
 impl InventoryWalk {
+    /// Crossing is ordered by the writer against operator decisions. A refused
+    /// barrier write fails the walk before any barrier page or warning goes out.
+    pub(crate) async fn judge(
+        &mut self,
+        coverage: &InventoryCoverageReport,
+        publisher: &crate::delivery::PagePublisher,
+        generation: crate::cursor::WalkGeneration,
+    ) -> Result<PageVerdict, Error> {
+        if coverage.has_barrier()
+            && cross_waived_barriers(Some(&publisher.writer), coverage, generation).await?
+        {
+            return Ok(PageVerdict::CrossedWaived);
+        }
+        if !coverage.is_complete() {
+            self.degraded = true;
+        }
+        if let WalkDecision::StopAtBarrier { resume_from } = self.inspect(coverage) {
+            let result =
+                record_barriers(Some(&publisher.writer), coverage, generation, resume_from).await;
+            if let Err(error) = &result {
+                tracing::error!(
+                    target: "bifrost.sync.inventory",
+                    account = ?publisher.control.account(),
+                    scope = ?coverage.domain.scope,
+                    %error,
+                    "failed to persist inventory barrier incident; failing the walk"
+                );
+            }
+            result?;
+            Ok(PageVerdict::Stop)
+        } else {
+            Ok(PageVerdict::Advance)
+        }
+    }
+
+    pub(crate) fn degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Users need the first incomplete page even if the provider never sends
+    /// Done, plus a terminal summary. Repeated page warnings would hide useful
+    /// notices in a large folder. A waived barrier does not announce a stop.
+    pub(crate) fn warn_coverage(
+        &mut self,
+        delivery: &crate::delivery::ChangeDelivery,
+        scope: &bifrost_types::CursorScope,
+        coverage: &InventoryCoverageReport,
+        verdict: PageVerdict,
+        terminal: bool,
+    ) {
+        if coverage.is_complete() || verdict.crossed() {
+            return;
+        }
+        if verdict != PageVerdict::Stop && !terminal && self.warned_incomplete {
+            return;
+        }
+        self.warned_incomplete = true;
+        let count = coverage.obligations().len();
+        let barriers = coverage
+            .obligations()
+            .iter()
+            .filter(|o| o.is_barrier())
+            .count();
+        let (notice, message) = if verdict == PageVerdict::Stop {
+            (
+                bifrost_types::EngineNotice::BarrierStop { regions: barriers },
+                format!(
+                    "inventory stopped at {barriers} region(s) it cannot represent and cannot replay; \
+                     the scope cannot advance past them until an operator waives them"
+                ),
+            )
+        } else {
+            (
+                bifrost_types::EngineNotice::DegradedCoverage { obligations: count },
+                format!(
+                    "inventory reported {count} object(s) or region(s) it could not represent; \
+                     the scope is live but incomplete"
+                ),
+            )
+        };
+        delivery.publish_warning(
+            crate::delivery::EventScope::Cursor(scope.clone()),
+            bifrost_types::Warning::user_safe(bifrost_types::WarningKind::Engine(notice), message),
+        );
+    }
+
     pub(crate) fn inspect(&self, coverage: &InventoryCoverageReport) -> WalkDecision {
         if coverage.has_barrier() {
             WalkDecision::StopAtBarrier {

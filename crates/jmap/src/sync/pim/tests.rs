@@ -61,7 +61,9 @@ async fn attachment_upload_stops_polling_at_the_first_oversize_chunk() {
         .expect_err("oversize stream is refused before it is drained");
         assert_eq!(
             error.kind(),
-            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed,),
+            &bifrost_types::AccountErrorKind::Request(
+                bifrost_types::RequestErrorKind::PayloadTooLarge,
+            ),
         );
     }
 }

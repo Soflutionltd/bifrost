@@ -144,3 +144,6 @@ impl QueryObject for Principal {
 
     type Sort = Comparator;
 }
+
+#[cfg(test)]
+mod wire_tests;

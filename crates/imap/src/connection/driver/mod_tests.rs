@@ -16,7 +16,8 @@ impl super::super::dispatch::Consumer for DummyConsumer {
         _resp: crate::types::response::UntaggedResponse,
         _notify: super::super::NotifyFlags,
         _ctx: &super::super::dispatch::ConsumerContext,
-    ) {
+    ) -> Option<crate::types::response::UntaggedResponse> {
+        None
     }
 
     fn finalize(

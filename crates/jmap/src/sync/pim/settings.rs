@@ -19,6 +19,7 @@ pub(crate) fn identities_list<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::IdentitiesList,
                 None,
+                bifrost_types::UnsupportedReason::SubmissionUnavailable,
                 "JMAP submission capability not available",
             ));
         };
@@ -149,6 +150,7 @@ pub(super) fn select_concrete_identity(
     Err(crate::sync::error::unsupported_error(
         AccountOperation::Send,
         None,
+        bifrost_types::UnsupportedReason::IdentitySelection,
         missing_detail,
     ))
 }
@@ -163,6 +165,7 @@ pub(crate) fn identity_update<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::IdentityUpdate,
                 None,
+                bifrost_types::UnsupportedReason::SubmissionUnavailable,
                 "JMAP submission capability not available",
             ));
         };
@@ -170,6 +173,7 @@ pub(crate) fn identity_update<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::IdentityUpdate,
                 None,
+                bifrost_types::UnsupportedReason::RequestShape,
                 "JMAP does not support setting default identity",
             ));
         }
@@ -218,6 +222,7 @@ pub(crate) fn vacation_get<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::VacationGet,
                 None,
+                bifrost_types::UnsupportedReason::CapabilityUnavailable,
                 "JMAP vacation capability not available",
             ));
         };
@@ -248,6 +253,7 @@ pub(crate) fn vacation_set<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::VacationSet,
                 None,
+                bifrost_types::UnsupportedReason::CapabilityUnavailable,
                 "JMAP vacation capability not available",
             ));
         };
@@ -290,6 +296,7 @@ pub(crate) fn quota_get<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::QuotaGet,
                 None,
+                bifrost_types::UnsupportedReason::CapabilityUnavailable,
                 "JMAP quota capability not available",
             ));
         };

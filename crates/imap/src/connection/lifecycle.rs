@@ -27,10 +27,8 @@ impl ImapConnection {
     /// Connect with a custom TLS connector (RFC 3501 Section 6.1.1 /
     /// RFC 9051 Section 6.1.1).
     ///
-    /// Establishes the TCP/TLS connection, reads the server greeting,
-    /// fetches initial capabilities, then spawns the driver task and
-    /// returns a handle-based `ImapConnection`.
-    #[allow(clippy::too_many_lines)]
+    /// Establishes TCP/TLS, then spawns the driver to read the greeting and
+    /// negotiate initial capabilities before returning the ready handle.
     pub async fn connect_with_tls_connector(
         host: &str,
         port: u16,
@@ -62,9 +60,6 @@ impl ImapConnection {
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
         leases: &super::LeaseHandoff,
     ) -> Result<Self, Error> {
-        use super::dispatch::CapabilityConsumer;
-        use super::driver;
-
         debug!(host, port, ?tls_mode, "connecting to IMAP server");
 
         let unsent = TransmissionState::Unsent;
@@ -105,154 +100,78 @@ impl ImapConnection {
             ImapStream::Plain(tcp)
         };
 
-        // --- Pre-driver phase: read greeting and initial capabilities ---
-        //
-        // The WireReader and ProtocolState live on the stack here. After
-        // the greeting and capability fetch they are moved into the
-        // driver task, which owns them for the rest of the connection.
-        let mut wire_reader = wire::WireReader::new_metered(stream, meter_sink, bandwidth_budget);
-        // One budget covers the complete bootstrap. Reinstall this same
-        // shared value at each phase; building a new budget would reset the
-        // peer allowance for CAPABILITY or STARTTLS.
-        let setup_peer_budget = wire::PeerBudget::new(timeout);
-        wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
-        let mut proto_state = state::ProtocolState::new();
-        proto_state.set_tls_active(tls_mode.uses_implicit_tls());
-        let mut tag_gen = tag::TagGenerator::new();
+        Self::from_wire_reader(
+            wire::WireReader::new_metered(stream, meter_sink, bandwidth_budget),
+            host,
+            tls_mode,
+            tls_connector,
+            timeout,
+            leases,
+        )
+        .await
+    }
 
-        // Set up the event channel.
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<typed_event::TypedEvent>(256);
-
-        // Read and parse the server greeting (RFC 3501 Section 7.1).
-        // This MUST happen before wrapping events_tx in DriverEventSink
-        // so we can send a greeting ALERT on the raw channel (emit() is
-        // pub(in crate::connection::driver) and inaccessible from here).
-        let greeting = setup_timeout(timeout, wire_reader.read_greeting())
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-
-        let Response::Greeting(g) = &greeting else {
-            return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
-                "expected greeting from server (RFC 3501 Section 7.1)".into(),
-            )));
-        };
-
-        // Apply greeting to protocol state (sets session state, caches
-        // capabilities, returns Err on BYE).
-        let greeting_alert = proto_state.apply_greeting(g)?;
-        if tls_mode.uses_starttls() {
-            // RFC 9051 requires closing a cleartext PREAUTH session. Check
-            // before a CAPABILITY fallback can send another cleartext command.
-            ensure_starttls_session(&proto_state)?;
-        }
-
-        // RFC 3501 Section7.1: if the greeting carried an [ALERT], deliver it
-        // on the raw channel before wrapping in DriverEventSink.
-        if let Some(alert_text) = greeting_alert {
-            // Best-effort: if the channel is full we drop the alert.
-            let _ = events_tx.try_send(typed_event::TypedEvent::Alert(alert_text));
-        }
-
-        // Wrap the channel in DriverEventSink  -  events_tx moves here.
-        let mut event_sink = driver::event_sink::DriverEventSink::new(events_tx, None);
-
-        // If we didn't get capabilities from the greeting, request them
-        // explicitly using the driver's run_one_command (RFC 3501 Section6.1.1).
-        if proto_state.capabilities().is_empty() {
-            let consumer = driver::DriverConsumer::Regular(
-                Box::new(CapabilityConsumer::default()) as Box<dyn driver::ConsumerErased>
-            );
-            wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
-            let result = setup_timeout(
-                timeout,
-                driver::run_one_command(
-                    &mut wire_reader,
-                    &mut proto_state,
-                    &mut tag_gen,
-                    &mut event_sink,
-                    Command::Capability,
-                    consumer,
-                ),
-            )
-            .await?;
-
-            // Downcast the erased output back to Vec<Capability>.
-            // CapabilityConsumer::Output is Vec<Capability>, so the downcast
-            // is provably correct. An Internal error here would indicate a
-            // library bug in the consumer/erased-output machinery.
-            let caps = result
-                .downcast::<Vec<Capability>>()
-                .map_err(|_| Error::Internal {
-                    kind: crate::error::InternalFailure::Invariant(
-                        "CapabilityConsumer output downcast failed".into(),
-                    ),
-                    mid_exchange: None,
-                })?;
-            proto_state.apply_capability_fetch(*caps);
-        }
-
-        // --- STARTTLS upgrade (RFC 3501 Section6.2.1) ---
-        //
-        // When the caller requests `TlsMode::StartTls`, negotiate the
-        // upgrade before spawning the driver task.  All required state
-        // (`wire_reader`, `proto_state`, `tag_gen`, `event_sink`) is
-        // still on the stack.  `run_starttls_upgrade` sends the STARTTLS
-        // command, verifies the buffer is empty, performs the TLS
-        // handshake, installs a fresh `WireReader`, and re-fetches
-        // capabilities  -  so `proto_state` reflects post-TLS caps by the
-        // time we snapshot it into `state_tx` below.
-        if tls_mode.uses_starttls() {
-            ensure_starttls_available(&proto_state)?;
-
-            validate_tls_server_name(host)?;
-
-            wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
-            setup_timeout(
-                timeout,
-                driver::run_starttls_upgrade(
-                    &mut wire_reader,
-                    &mut proto_state,
-                    &mut tag_gen,
-                    &mut event_sink,
-                    tls_connector,
-                    host.to_owned(),
-                    None,
-                ),
-            )
-            .await?;
-        }
-
-        wire_reader.set_peer_timeout(None);
-
-        // --- Spawn the driver task ---
+    /// Start ownership before reading any IMAP bytes. Cancellation while waiting
+    /// for readiness aborts setup, including before the driver's first poll.
+    pub(super) async fn from_wire_reader(
+        wire_reader: wire::WireReader,
+        host: &str,
+        tls_mode: TlsMode,
+        tls_connector: native_tls::TlsConnector,
+        timeout: Duration,
+        leases: &super::LeaseHandoff,
+    ) -> Result<Self, Error> {
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(256);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
+        let (state_tx, state_rx) = tokio::sync::watch::channel(Default::default());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let inbound_bytes = wire_reader.metering().inbound_counter();
-
-        let driver_task = super::DriverTask::spawn(
-            driver::driver_task(
+        let tls_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            tls_mode.uses_implicit_tls(),
+        ));
+        let driver_task = std::sync::Arc::new(super::DriverTask::spawn(
+            driver::setup::setup_then_drive(
                 wire_reader,
-                proto_state,
-                tag_gen,
+                driver::setup::Setup {
+                    host: host.to_owned(),
+                    tls_mode,
+                    tls_connector,
+                    timeout,
+                    tls_active: std::sync::Arc::clone(&tls_active),
+                },
                 cmd_rx,
                 state_tx,
-                event_sink,
+                driver::event_sink::DriverEventSink::new(events_tx, None),
+                ready_tx,
             ),
             inbound_bytes,
             leases.take(),
-        );
-
-        Ok(Self {
+        ));
+        let mut setup_guard = SetupGuard(Some(std::sync::Arc::clone(&driver_task)));
+        let conn = Self {
             cmd_tx,
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
-            driver_handle: std::sync::Arc::new(driver_task),
+            driver_handle: driver_task,
             host: host.to_owned(),
-            tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),
-            )),
+            tls_active,
             abandoned: std::sync::atomic::AtomicBool::new(false),
-        })
+        };
+        match ready_rx.await {
+            Ok(Ok(())) => {
+                setup_guard.0.take();
+                Ok(conn)
+            }
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(_) => conn.observe_driver_panic(TransmissionState::Unsent).await,
+                    Ok(Ok(())) => unreachable!("handled readiness success"),
+                };
+                conn.driver_handle.abort_and_join().await;
+                Err(error)
+            }
+        }
     }
 
     /// Set TCP keepalive on the underlying socket (RFC 1122 Section 4.2.3.6).
@@ -409,298 +328,19 @@ impl ImapConnection {
             Some(tokio::time::Instant::now() + timeout),
         )
         .await?;
-        self.tls_active
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
 
-/// Connection-time STARTTLS admission, through the same policy as every other
-/// entry path: session state, an unencrypted transport, and the advertised
-/// capability. The PREAUTH case never reaches here on the connect path:
-/// `ensure_starttls_session` refuses it first as a TLS-policy error.
-fn ensure_starttls_available(state: &super::state::ProtocolState) -> Result<(), Error> {
-    let snapshot = state.snapshot();
-    super::admission::admit(
-        &Command::StartTls,
-        &super::admission::SessionView {
-            snapshot: &snapshot,
-            tls_active: state.tls_active(),
-        },
-    )
-}
+/// Setup owns a transport and retained pool leases even before readiness.
+/// Destroying the caller must destroy that task, not leave it waiting on a peer.
+struct SetupGuard(Option<std::sync::Arc<super::DriverTask>>);
 
-/// STARTTLS is only available before authentication, even when the greeting
-/// advertises the capability. PREAUTH therefore means the server has already
-/// chosen an authenticated cleartext session and the client must refuse it as
-/// a TLS-policy error instead of reporting a stale command-state transition.
-fn ensure_starttls_session(state: &super::state::ProtocolState) -> Result<(), Error> {
-    if state.session_state() != super::SessionState::NotAuthenticated {
-        return Err(Error::LocalRefusal(
-            crate::error::LocalRefusal::StartTlsUnavailable,
-        ));
-    }
-    Ok(())
-}
-
-/// An absolute setup exchange deadline, including admission and unsolicited
-/// responses. Peer I/O independently spends the reader's cumulative allowance.
-pub(super) async fn setup_timeout<T>(
-    timeout: Duration,
-    exchange: impl std::future::Future<Output = Result<T, Error>>,
-) -> Result<T, Error> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    tokio::time::timeout_at(deadline, exchange)
-        .await
-        .map_err(|_| Error::Transport {
-            kind: crate::error::TransportFailure::Timeout,
-            attempt: None,
-        })?
-}
-
-#[cfg(test)]
-mod bandwidth_review_tests {
-    use super::*;
-    use bifrost_net::{BandwidthBudget, BandwidthDirection};
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::Instant;
-
-    async fn setup_deadline_case(phase: usize) {
-        let budget = BandwidthBudget::new(Some(4));
-        budget
-            .admit(
-                if phase == 0 {
-                    BandwidthDirection::Inbound
-                } else {
-                    BandwidthDirection::Outbound
-                },
-                4,
-            )
-            .await
-            .finish(4);
-        let (client, mut peer) = tokio::io::duplex(128);
-        if phase == 0 {
-            peer.write_all(b"* OK hello\r\n").await.unwrap();
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        if let Some(driver) = &self.0 {
+            driver.abort();
         }
-        let mut reader = wire::WireReader::new_metered(
-            ImapStream::Memory(stream::Tracked::new(client)),
-            None,
-            Some(budget),
-        );
-        let mut state = state::ProtocolState::new();
-        let (_, Response::Greeting(greeting)) =
-            crate::codec::decode::parse_greeting(b"* OK [CAPABILITY IMAP4rev1 STARTTLS] hello\r\n")
-                .unwrap()
-        else {
-            panic!("greeting")
-        };
-        state.apply_greeting(&greeting).unwrap();
-        let mut tags = tag::TagGenerator::new();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut events = driver::event_sink::DriverEventSink::new(tx, None);
-        let timeout = Duration::from_millis(100);
-        reader.set_peer_timeout(Some(timeout));
-        let start = Instant::now();
-        let result = setup_timeout(timeout, async {
-            match phase {
-                0 => reader.read_greeting().await.map(|_| ()),
-                1 => driver::run_one_command(
-                    &mut reader,
-                    &mut state,
-                    &mut tags,
-                    &mut events,
-                    Command::Capability,
-                    driver::DriverConsumer::Regular(Box::new(
-                        dispatch::CapabilityConsumer::default(),
-                    )),
-                )
-                .await
-                .map(|_| ()),
-                _ => {
-                    driver::run_starttls_upgrade(
-                        &mut reader,
-                        &mut state,
-                        &mut tags,
-                        &mut events,
-                        build_default_tls_connector().unwrap(),
-                        "imap.invalid".into(),
-                        None,
-                    )
-                    .await
-                }
-            }
-        })
-        .await;
-        assert!(
-            matches!(
-                result,
-                Err(Error::Transport {
-                    kind: crate::error::TransportFailure::Timeout,
-                    ..
-                })
-            ),
-            "phase {phase}: {result:?}"
-        );
-        assert_eq!(start.elapsed(), timeout, "phase {phase}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bandwidth_setup_greeting_deadline_includes_admission() {
-        setup_deadline_case(0).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bandwidth_setup_capability_deadline_includes_admission() {
-        setup_deadline_case(1).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bandwidth_setup_starttls_deadline_includes_admission() {
-        setup_deadline_case(2).await;
-    }
-
-    async fn setup_peer_case(capability: bool) {
-        let (client, mut peer) = tokio::io::duplex(256);
-        let mut reader = wire::WireReader::new(ImapStream::Memory(stream::Tracked::new(client)));
-        reader.set_peer_timeout(Some(Duration::from_millis(100)));
-        let mut state = state::ProtocolState::new();
-        let (_, Response::Greeting(greeting)) =
-            crate::codec::decode::parse_greeting(b"* OK [CAPABILITY IMAP4rev1 STARTTLS] hello\r\n")
-                .unwrap()
-        else {
-            panic!("greeting")
-        };
-        state.apply_greeting(&greeting).unwrap();
-        let mut tags = tag::TagGenerator::new();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut events = driver::event_sink::DriverEventSink::new(tx, None);
-        let writer = tokio::spawn(async move {
-            if capability {
-                let command = test_support::read_line(&mut peer).await;
-                for _ in 0..4 {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    if peer.write_all(b"* OK still waiting\r\n").await.is_err() {
-                        return;
-                    }
-                }
-                let _ = peer
-                    .write_all(format!("{} OK done\r\n", test_support::tag_of(&command)).as_bytes())
-                    .await;
-            } else {
-                for byte in b"* OK hello\r\n" {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    if peer.write_all(&[*byte]).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        });
-        let start = Instant::now();
-        let result = setup_timeout(Duration::from_secs(1), async {
-            if capability {
-                driver::run_one_command(
-                    &mut reader,
-                    &mut state,
-                    &mut tags,
-                    &mut events,
-                    Command::Capability,
-                    driver::DriverConsumer::Regular(Box::new(
-                        dispatch::CapabilityConsumer::default(),
-                    )),
-                )
-                .await
-                .map(|_| ())
-            } else {
-                reader.read_greeting().await.map(|_| ())
-            }
-        })
-        .await;
-        assert!(matches!(
-            result,
-            Err(Error::Transport {
-                kind: crate::error::TransportFailure::Timeout,
-                ..
-            })
-        ));
-        assert_eq!(start.elapsed(), Duration::from_millis(100));
-        writer.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bandwidth_setup_trickled_greeting_spends_one_peer_budget() {
-        setup_peer_case(false).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bandwidth_setup_unsolicited_capability_spends_one_peer_budget() {
-        setup_peer_case(true).await;
-    }
-}
-
-#[cfg(test)]
-mod starttls_policy_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use super::*;
-    use crate::types::response::{GreetingResponse, GreetingStatus, ResponseCode};
-
-    #[test]
-    fn preauth_with_starttls_capability_is_a_tls_policy_refusal() {
-        let mut state = super::super::state::ProtocolState::new();
-        state
-            .apply_greeting(&GreetingResponse {
-                status: GreetingStatus::PreAuth,
-                code: Some(ResponseCode::Capability(vec![Capability::StartTls])),
-                text: "already authenticated".into(),
-            })
-            .unwrap();
-
-        assert!(matches!(
-            ensure_starttls_available(&state),
-            Err(Error::LocalRefusal(
-                crate::error::LocalRefusal::InvalidState(_)
-            ))
-        ));
-    }
-
-    #[test]
-    fn preauth_without_greeting_capabilities_is_rejected_before_capability_fallback() {
-        let mut state = super::super::state::ProtocolState::new();
-        state
-            .apply_greeting(&GreetingResponse {
-                status: GreetingStatus::PreAuth,
-                code: None,
-                text: "already authenticated".into(),
-            })
-            .unwrap();
-
-        assert_eq!(
-            ensure_starttls_session(&state),
-            Err(Error::LocalRefusal(
-                crate::error::LocalRefusal::StartTlsUnavailable
-            ))
-        );
-    }
-
-    #[test]
-    fn unauthenticated_session_requires_starttls_advertisement() {
-        let mut state = super::super::state::ProtocolState::new();
-        state
-            .apply_greeting(&GreetingResponse {
-                status: GreetingStatus::Ok,
-                code: Some(ResponseCode::Capability(vec![Capability::StartTls])),
-                text: "ready".into(),
-            })
-            .unwrap();
-
-        assert_eq!(ensure_starttls_available(&state), Ok(()));
-        state.apply_capability_fetch(Vec::new());
-        assert_eq!(
-            ensure_starttls_available(&state),
-            Err(Error::LocalRefusal(
-                crate::error::LocalRefusal::StartTlsUnavailable
-            ))
-        );
     }
 }
 

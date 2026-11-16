@@ -833,18 +833,12 @@ async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
     let (mut reader, _peer) = bandwidth_reader(bifrost_net::BandwidthBudget::default());
     reader.set_peer_timeout(Some(Duration::from_millis(100)));
     let start = Instant::now();
-    let result = super::super::lifecycle::setup_timeout(
+    let result = tokio::time::timeout(
         Duration::from_millis(30),
         reader.read_one(crate::types::wire::WireMode::ModifiedUtf7),
     )
     .await;
-    assert!(matches!(
-        result,
-        Err(Error::Transport {
-            kind: crate::error::TransportFailure::Timeout,
-            ..
-        })
-    ));
+    assert!(result.is_err());
     assert_eq!(start.elapsed(), Duration::from_millis(30));
     assert!(matches!(
         reader

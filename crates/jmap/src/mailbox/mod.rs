@@ -342,3 +342,6 @@ impl Serialize for Role {
         })
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

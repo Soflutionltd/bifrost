@@ -13,7 +13,7 @@ use crate::core::id::AccountId;
 use crate::core::transport::HttpTransport;
 use crate::transport_reqwest::ReqwestTransport;
 
-use super::capabilities::CoreLimits;
+use super::capabilities::ObjectLimits;
 use super::foreign;
 use super::foreign::{JmapRef, Owner};
 use super::state_cache::StateCache;
@@ -43,7 +43,7 @@ impl std::borrow::Borrow<str> for AccountKey {
 /// fork a handle, but must never fork its account's observations.
 pub(crate) struct Slot<T: HttpTransport = ReqwestTransport, C: Capability = capability::Mail> {
     pub(crate) mail: Account<T, C>,
-    pub(crate) limits: CoreLimits,
+    pub(crate) limits: ObjectLimits,
     pub(crate) email_states: StateCache,
     pub(crate) scopes: Vec<(CursorScope, OpaqueChangeState)>,
     pub(crate) submission: bool,
@@ -64,7 +64,7 @@ impl<T: HttpTransport, C: Capability> Clone for Slot<T, C> {
 }
 
 impl<T: HttpTransport, C: Capability> Slot<T, C> {
-    pub(crate) fn from_mail(mail: Account<T, C>, limits: CoreLimits) -> Self {
+    pub(crate) fn from_mail(mail: Account<T, C>, limits: ObjectLimits) -> Self {
         Self {
             mail,
             limits,
@@ -350,7 +350,7 @@ impl<T: HttpTransport> Registry<T> {
         registry
     }
 
-    pub(crate) fn with_limits(mut self, limits: CoreLimits) -> Self {
+    pub(crate) fn with_limits(mut self, limits: ObjectLimits) -> Self {
         self.primary.limits = limits;
         for slot in self.accounts.values_mut() {
             slot.limits = limits;
@@ -361,7 +361,7 @@ impl<T: HttpTransport> Registry<T> {
     pub(crate) fn from_test_states<H: Clone + Into<Slot<T>>>(
         primary: impl Into<Slot<T>>,
         shared: Arc<HashMap<AccountId, H>>,
-        limits: CoreLimits,
+        limits: ObjectLimits,
         states: StateMap,
     ) -> Self {
         let mut registry = Self::from_test(primary, shared).with_limits(limits);

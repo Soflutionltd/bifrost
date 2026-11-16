@@ -164,3 +164,6 @@ impl crate::core::SetCreate for VacationResponseCreate {
 
 crate::define_get_method!(VacationResponseGet, VacationResponse);
 crate::define_set_method!(VacationResponseSet, VacationResponse);
+
+#[cfg(test)]
+mod wire_tests;

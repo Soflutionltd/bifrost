@@ -142,3 +142,6 @@ impl ParticipantIdentitySet {
         self
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

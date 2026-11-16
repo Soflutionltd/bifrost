@@ -29,7 +29,7 @@ pub(crate) mod set;
 pub(crate) mod transport;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod test_support;
 
 /// The base trait for a JMAP object's server-returned (Get) shape.
 pub(crate) trait Object: Sized {

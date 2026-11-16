@@ -45,6 +45,16 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
+- **Next-wave fixes, not rulings: request refusal kinds that misread the user.**
+  The AGENTS.md product yardstick settles all three; implement them.
+  - HTTP 413 in `crates/net/src/http_status.rs` should classify as
+    `PayloadTooLarge`: an oversized attachment is not a client bug.
+  - JMAP `urn:ietf:params:jmap:error:limit` should split on its `limit`
+    property: `maxSizeRequest`, `maxCallsInRequest` and `maxObjectsIn*` are
+    `PayloadTooLarge`, and only `maxConcurrentRequests` is `RateLimited`.
+  - A stale UIDVALIDITY on IMAP move or hydrate is now terminal
+    `PreconditionFailed`; the user expects the folder to refresh and the
+    action to retry against the new generation.
 
 ## 2. Blocked on a live probe
 
@@ -393,15 +403,6 @@ Narrow edge cases, audits with no known defect, and design work.
   (imap-account scope) reported the same and filed IMAP's wider skip-lane gap
   (shared-namespace LIST / NAMESPACE failures dropped at open) in the hunt's
   `bugs.md`.
-- **IMAP search: the ESEARCH expansion cap is reported as `Request(Malformed)`.**
-  `SearchResultTruncated` (`crates/imap/src/account/error.rs`) maps to a
-  `ClientBug` class although the request was well formed and the server
-  answered correctly; a caller cannot tell "criteria malformed" from "result
-  too large" except by support-only text. Position paging does not help, since
-  every page call still expands the whole folder result. The November 2026
-  design hunt (imap-account scope) traced this to a gap in the shared
-  vocabulary - `RequestErrorKind` has only `Malformed` and `BatchInputInvalid` -
-  and filed the wider set of collapsed failures in the hunt's `structural.md`.
 - **IMAP search cursor is not bound to its query.** The `imapsearch1:` cursor
   carries only a position, so it is accepted for a different `SearchRequest`.
   A position is meaningful under any query, so this resumes rather than
@@ -416,11 +417,11 @@ Narrow edge cases, audits with no known defect, and design work.
   the object-id section, while search pages by position since the bifrost#2
   fix; the test `search_folder_offsets_survive_registry_rebuild_with_display_ties`
   keeps the old word too.
-- **UIDVALIDITY change has four classifications across the IMAP account.**
+- **UIDVALIDITY change has several classifications across the IMAP account.**
   Changes stream `SyncState(CursorInvalid)`, search cursor
-  `ConcurrencyConflict`, hydration, mutation and `open_raw_rfc822`
-  `Request(Malformed)` (a `ClientBug` class for a server-side generation
-  change); reference/error-model.md never names UIDVALIDITY. The poller
+  `ConcurrencyConflict`, hydration and mutation now `Request(PreconditionFailed)`
+  (see the next-wave entry in section 1); reference/error-model.md never names
+  UIDVALIDITY. The poller
   (`crates/imap/src/account/poll.rs`) answers a typed `GenerationChanged`
   instead. Needs a ruling on the shared class. The November 2026 design hunt
   (imap-account scope) counted seven sites: `get.rs` and `mutate.rs`
@@ -472,16 +473,30 @@ Narrow edge cases, audits with no known defect, and design work.
   (`WatchEvent` or `SinkPush` side) while keeping the unattributed door;
   sampling the current generation at push time was rejected, since it labels
   an old event with the new identity.
-- **IMAP connect-time STARTTLS expiry carries no evidence.** `setup_timeout`
-  in `crates/imap/src/connection/lifecycle.rs` maps every connect-time expiry
-  to `Error::Timeout { attempt: None }`, including one after the STARTTLS
-  tagged OK or the stream swap. Harmless today (the half-built session is
-  dropped before a driver exists and the only recovery is a fresh dial), but
-  it is the one transition path whose error states no phase. The November 2026
-  design hunt (imap-connection scope) found the same for the CAPABILITY line,
-  and traced it to setup running outside the driver as a second execution
-  context with its own evidence model; its proposal to move setup into the
-  driver is filed in the hunt's `structural.md`.
+- **Lateral findings from the review of the structural batch after 83339bcb.**
+  - IMAP setup has one total deadline across greeting, CAPABILITY, STARTTLS
+    and the TLS handshake where each phase used to get its own, so a slow
+    STARTTLS server gets less time than before.
+  - The setup panic path (`driver/setup.rs`) has no test.
+  - The IMAP test double `RecordedConsumer` (`connection/test_support.rs`) turns declined responses back into
+    finalize output, so consumer tests cannot tell keep from decline.
+  - `unsubscribe_push` cancelled after taking the registry discards in-flight
+    and unattempted handles. Marking orphans in place instead risks the
+    retrier racing the delete to `NotFound`.
+  - A waived barrier on a page hides non-barrier obligations in the same
+    coverage report from the warning.
+  - Backfill runner `Stop` pages now write the barrier before the removal
+    projection can fail.
+  - `PagePublisher::publish_inventory`'s checkpoint-free fence check is not
+    atomic with the publish.
+  - `UnsupportedReason` is not carried into the ledger or telemetry exports,
+    and only JMAP sets it.
+  - A library batching bug that overflows `maxCallsInRequest` would surface as
+    `PayloadTooLarge` rather than an internal fault.
+  - No test bites `Campaign::declaration_matches` (`crates/sync/src/mutation/campaign.rs`):
+    changing its `all` to `any` passes the whole bifrost-sync suite. A
+    multi-target cohort where only some targets still map to the cohort
+    identity after a reattach would pin it.
 - **Session cap does not span account incarnations.** A failed or cancelled
   factory open, or a closing incarnation during reopen, can leave a transport
   tail that the next incarnation's cap does not count.

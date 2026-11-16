@@ -291,3 +291,6 @@ impl CalendarEventQuery {
         self
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

@@ -212,10 +212,7 @@ pub(crate) fn container_delete(
             .iter()
             .any(|item| matches!(item, StatusItem::Messages(count) if *count > 0));
         if non_empty {
-            return Err(pim_malformed(
-                AccountOperation::ContainerDelete,
-                "refusing to delete non-empty IMAP mailbox",
-            ));
+            return Err(super::error::non_empty_mailbox(&folder));
         }
         conn.connection()
             .delete(&folder, account.command_timeout())

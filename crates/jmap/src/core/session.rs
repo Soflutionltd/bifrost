@@ -4,9 +4,16 @@ use crate::email::{MailCapabilities, SubmissionCapabilities};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Session {
+    // Immutable wire fields make this cache valid for the session's lifetime.
+    // SessionState eagerly initializes it before publishing an installed session.
+    #[serde(skip)]
+    core_limits: OnceLock<CoreLimits>,
+
     #[serde(rename = "capabilities")]
     #[serde(deserialize_with = "deserialize_session_capabilities_map")]
     capabilities: HashMap<String, Capabilities>,
@@ -201,11 +208,10 @@ where
 /// omitted one and an advertised `0` are two different server bugs with two
 /// different honest readings - "the server told us nothing" versus "the
 /// server told us a limit that forbids every request" - and a blanket
-/// `#[serde(default)]` merged them into the same zero. The readers that
-/// enforce a bound (`CallLimit`, the WebSocket frame-size guard) and the
-/// reader that validates the session (`sync::capabilities::build`) need the
-/// distinction to land in the right lane. The required `collationAlgorithms`
-/// array also preserves presence, while its existing accessor keeps returning
+/// `#[serde(default)]` merged them into the same zero. The cached core-limit
+/// interpretation preserves this distinction for enforcement and validation.
+/// The required `collationAlgorithms` array also preserves presence, while its
+/// existing accessor keeps returning
 /// an empty slice for callers that only need the list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -237,80 +243,186 @@ pub(crate) struct CoreCapabilities {
     collation_algorithms: Option<Vec<String>>,
 }
 
-/// Protocol-owned object batching limits. Account routing never changes these
-/// session-wide limits; foreign handles read their own session.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CoreLimits {
-    pub(crate) max_objects_in_get: usize,
-    pub(crate) max_objects_in_set: usize,
+/// Object batching view used by account routing. Foreign handles read their
+/// own session; routing never changes these session-wide limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectLimits {
+    pub(crate) max_objects_in_get: NonZeroUsize,
+    pub(crate) max_objects_in_set: NonZeroUsize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoreLimitsError {
     Absent,
     Malformed,
     Unusable,
 }
 
-impl Session {
-    /// Decode required core fields before account probes. Keep absence separate
-    /// from malformed advertisements so the account boundary can choose reopen
-    /// versus contract violation without making a request-builder error.
-    pub(crate) fn validated_core_limits(&self) -> Result<CoreLimits, CoreLimitsError> {
-        let core = match self.core_capability_state() {
-            CoreCapabilityState::Absent => return Err(CoreLimitsError::Absent),
-            CoreCapabilityState::Malformed => return Err(CoreLimitsError::Malformed),
-            CoreCapabilityState::Present(core) => core,
-        };
-        let positive = |value: Option<usize>| {
-            value
-                .and_then(std::num::NonZeroUsize::new)
-                .ok_or(CoreLimitsError::Unusable)
-        };
-        positive(core.max_calls_in_request)?;
-        positive(core.max_size_request)?;
-        let max_objects_in_get = positive(core.max_objects_in_get)?.get();
-        let max_objects_in_set = positive(core.max_objects_in_set)?.get();
-        // Upload size and concurrency are unsigned, not positive integers.
-        // Empty-only uploads and serial scheduling are distinct policies,
-        // not disagreements about the same bound.
-        self.required_upload_size_limit()?;
-        if core.max_concurrent_upload.is_none()
-            || core.max_concurrent_requests.is_none()
-            || !core.has_collation_algorithms()
-        {
-            return Err(CoreLimitsError::Unusable);
+/// A positive advertised bound, preserving absence and invalidity for session
+/// validation. Bare protocol requests enforce only usable advertisements;
+/// account opening reports bad sessions through its recovery-aware error map.
+#[derive(Debug, Clone, Copy)]
+enum PositiveLimit {
+    Unadvertised,
+    Invalid,
+    Advertised(NonZeroUsize),
+}
+
+impl PositiveLimit {
+    fn read(value: Option<usize>) -> Self {
+        match value {
+            None => Self::Unadvertised,
+            Some(value) => NonZeroUsize::new(value).map_or(Self::Invalid, Self::Advertised),
         }
-        Ok(CoreLimits {
-            max_objects_in_get,
-            max_objects_in_set,
-        })
+    }
+
+    fn enforced(self) -> Option<usize> {
+        match self {
+            Self::Advertised(value) => Some(value.get()),
+            Self::Unadvertised | Self::Invalid => None,
+        }
+    }
+
+    fn required(self) -> Result<NonZeroUsize, CoreLimitsError> {
+        match self {
+            Self::Advertised(value) => Ok(value),
+            Self::Unadvertised | Self::Invalid => Err(CoreLimitsError::Unusable),
+        }
+    }
+}
+
+/// Zero concurrency is an unsigned advertisement, but cannot form a live
+/// zero-permit gate. An Outlook user expects serial progress on that server.
+#[derive(Debug, Clone, Copy)]
+enum Concurrency {
+    Serial,
+    Parallel(NonZeroUsize),
+}
+
+impl Concurrency {
+    fn read(value: Option<usize>) -> Self {
+        match value.and_then(NonZeroUsize::new) {
+            Some(value) if value.get() > 1 => Self::Parallel(value),
+            _ => Self::Serial,
+        }
+    }
+
+    fn get(self) -> usize {
+        match self {
+            Self::Serial => 1,
+            Self::Parallel(value) => value.get(),
+        }
+    }
+}
+
+/// One interpretation of every core limit, including the validation outcome.
+/// Installed sessions initialize this once in SessionState::derive. The cache
+/// lives with Session so bare protocol handles and account readers share it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoreLimits {
+    max_calls: PositiveLimit,
+    max_request_size: PositiveLimit,
+    max_upload_size: Option<usize>,
+    api_concurrency: Concurrency,
+    upload_concurrency: Concurrency,
+    objects: ObjectLimits,
+    validated: Result<ObjectLimits, CoreLimitsError>,
+    upload_size: Result<usize, CoreLimitsError>,
+}
+
+impl CoreLimits {
+    fn derive(session: &Session) -> Self {
+        let core = match session.core_capability_state() {
+            CoreCapabilityState::Present(core) => Ok(core),
+            CoreCapabilityState::Absent => Err(CoreLimitsError::Absent),
+            CoreCapabilityState::Malformed => Err(CoreLimitsError::Malformed),
+        };
+        let field = |read: fn(&CoreCapabilities) -> Option<usize>| core.ok().and_then(read);
+        let positive = |read: fn(&CoreCapabilities) -> Option<usize>| match core {
+            Err(CoreLimitsError::Malformed) => PositiveLimit::Invalid,
+            _ => PositiveLimit::read(field(read)),
+        };
+        let max_calls = positive(CoreCapabilities::max_calls_in_request);
+        let max_request_size = positive(CoreCapabilities::max_size_request);
+        let max_get = positive(CoreCapabilities::max_objects_in_get);
+        let max_set = positive(CoreCapabilities::max_objects_in_set);
+        let max_upload_size = field(CoreCapabilities::max_size_upload);
+        let api_concurrency = field(CoreCapabilities::max_concurrent_requests);
+        let upload_concurrency = field(CoreCapabilities::max_concurrent_upload);
+        let upload_size = core.and_then(|_| max_upload_size.ok_or(CoreLimitsError::Unusable));
+        let validated = (|| {
+            let core = core?;
+            max_calls.required()?;
+            max_request_size.required()?;
+            let max_objects_in_get = max_get.required()?;
+            let max_objects_in_set = max_set.required()?;
+            // Zero upload size permits empty files only. Zero concurrency
+            // selects a serial lane. Neither is a positive request bound.
+            upload_size?;
+            if api_concurrency.is_none()
+                || upload_concurrency.is_none()
+                || !core.has_collation_algorithms()
+            {
+                return Err(CoreLimitsError::Unusable);
+            }
+            Ok(ObjectLimits {
+                max_objects_in_get,
+                max_objects_in_set,
+            })
+        })();
+        Self {
+            max_calls,
+            max_request_size,
+            max_upload_size,
+            api_concurrency: Concurrency::read(api_concurrency),
+            upload_concurrency: Concurrency::read(upload_concurrency),
+            objects: ObjectLimits {
+                max_objects_in_get: max_get.required().unwrap_or(NonZeroUsize::MIN),
+                max_objects_in_set: max_set.required().unwrap_or(NonZeroUsize::MIN),
+            },
+            validated,
+            upload_size,
+        }
+    }
+
+    pub(crate) fn max_calls_in_request(&self) -> Option<usize> {
+        self.max_calls.enforced()
+    }
+
+    pub(crate) fn max_size_request(&self) -> Option<usize> {
+        self.max_request_size.enforced()
+    }
+
+    pub(crate) fn max_size_upload(&self) -> Option<usize> {
+        self.max_upload_size
+    }
+}
+
+impl Session {
+    #[cfg(test)]
+    pub(crate) fn assert_core_limits_cached(&self) {
+        assert!(
+            self.core_limits.get().is_some(),
+            "installed session must cache core limits"
+        );
+    }
+
+    pub(crate) fn core_limits(&self) -> &CoreLimits {
+        self.core_limits.get_or_init(|| CoreLimits::derive(self))
+    }
+
+    pub(crate) fn validated_core_limits(&self) -> Result<ObjectLimits, CoreLimitsError> {
+        self.core_limits().validated
     }
 
     pub(crate) fn required_upload_size_limit(&self) -> Result<usize, CoreLimitsError> {
-        match self.core_capability_state() {
-            CoreCapabilityState::Absent => Err(CoreLimitsError::Absent),
-            CoreCapabilityState::Malformed => Err(CoreLimitsError::Malformed),
-            CoreCapabilityState::Present(core) => {
-                core.max_size_upload.ok_or(CoreLimitsError::Unusable)
-            }
-        }
+        self.core_limits().upload_size
     }
 
-    /// Conservative object batching for protocol handles used before validation.
-    /// Account opening validates first; no missing field becomes a dead default
-    /// on that path. Do not use another account's cached limits for a share.
-    pub(crate) fn object_limits(&self) -> CoreLimits {
-        let core = self.core_capabilities();
-        let positive_or_serial = |value: Option<usize>| value.unwrap_or(1).max(1);
-        CoreLimits {
-            max_objects_in_get: positive_or_serial(
-                core.and_then(CoreCapabilities::max_objects_in_get),
-            ),
-            max_objects_in_set: positive_or_serial(
-                core.and_then(CoreCapabilities::max_objects_in_set),
-            ),
-        }
+    /// Conservative object batching for bare protocol handles. Account
+    /// opening instead checks the cached validation result before probes.
+    pub(crate) fn object_limits(&self) -> ObjectLimits {
+        self.core_limits().objects
     }
 }
 
@@ -605,10 +717,7 @@ impl Session {
     /// and every fan-out width derive from it, so they cannot disagree about
     /// a session that leaves it out.
     pub(crate) fn api_request_concurrency(&self) -> usize {
-        self.core_capabilities()
-            .and_then(CoreCapabilities::max_concurrent_requests)
-            .unwrap_or(1)
-            .max(1)
+        self.core_limits().api_concurrency.get()
     }
 
     /// How many upload requests this session admits at once. Missing or zero
@@ -616,10 +725,7 @@ impl Session {
     /// safe minimum instead of creating a zero-permit gate that cannot make
     /// progress.
     pub(crate) fn upload_concurrency(&self) -> usize {
-        self.core_capabilities()
-            .and_then(CoreCapabilities::max_concurrent_upload)
-            .unwrap_or(1)
-            .max(1)
+        self.core_limits().upload_concurrency.get()
     }
 
     session_cap_accessor!(
@@ -1189,5 +1295,80 @@ mod blob_capability_limits {
         assert_eq!(capability.max_data_sources(), Some(7));
         let encoded = serde_json::to_value(capability).expect("blob capabilities encode");
         assert_eq!(encoded["maxDataSources"], 7);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests;
+
+#[cfg(test)]
+mod call_limit_tests {
+    use super::PositiveLimit;
+    use crate::core::session::Session;
+
+    fn session_with_capabilities(capabilities: serde_json::Value) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": capabilities,
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses")
+    }
+
+    fn session_with_core(core: serde_json::Value) -> Session {
+        session_with_capabilities(serde_json::json!({ "urn:ietf:params:jmap:core": core }))
+    }
+
+    /// The three lanes must be told apart at the source. "No core block",
+    /// "core block that omits the limit", "core block that advertises
+    /// zero" and "core block that does not parse" all decline to enforce,
+    /// so preserve the wire lane as well as the cached validation error:
+    /// an absent capability and an invalid advertisement recover differently.
+    #[test]
+    fn call_limit_reads_the_lane_the_session_actually_describes() {
+        assert!(matches!(
+            session_with_capabilities(serde_json::json!({}))
+                .core_limits()
+                .max_calls,
+            PositiveLimit::Unadvertised
+        ));
+        assert!(
+            matches!(
+                session_with_core(serde_json::json!({}))
+                    .core_limits()
+                    .max_calls,
+                PositiveLimit::Unadvertised
+            ),
+            "an OMITTED maxCallsInRequest advertised no limit; \
+             it is not an advertised zero"
+        );
+        assert!(matches!(
+            session_with_core(serde_json::json!({"maxCallsInRequest": 0}))
+                .core_limits()
+                .max_calls,
+            PositiveLimit::Invalid
+        ));
+        assert!(
+            matches!(
+                session_with_core(serde_json::json!({"maxCallsInRequest": "16"}))
+                    .core_limits()
+                    .max_calls,
+                PositiveLimit::Invalid
+            ),
+            "a present-but-unparseable core block advertised something \
+             unusable; it must not read as unadvertised"
+        );
+        assert!(matches!(
+            session_with_core(
+                serde_json::json!({"maxCallsInRequest": 16})
+            ).core_limits().max_calls,
+            PositiveLimit::Advertised(max) if max.get() == 16
+        ));
     }
 }

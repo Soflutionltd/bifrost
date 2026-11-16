@@ -46,8 +46,6 @@ impl ImapConnection {
         message: AppendMessage,
         timeout: Duration,
     ) -> Result<Option<crate::types::AppendUid>, Error> {
-        use super::dispatch::AppendConsumer;
-
         self.check_utf8_only_enforced()?;
         // RFC 3501 Section 6.3.11: APPEND is valid in Authenticated and Selected
         // states. Only an early refusal - the driver re-checks against live
@@ -59,13 +57,11 @@ impl ImapConnection {
             self.check_append_limit(message.data.len(), limit)?;
         }
 
-        self.submit_regular(
-            Command::Append {
+        self.submit_request(
+            super::request::AppendOne {
                 mailbox: mailbox.mailbox_name()?.into(),
                 messages: vec![message],
-                multi: false,
             },
-            AppendConsumer::default(),
             Some(deadline),
         )
         .await
@@ -93,8 +89,6 @@ impl ImapConnection {
         messages: &[AppendMessage],
         timeout: Duration,
     ) -> Result<Vec<crate::types::AppendUid>, Error> {
-        use super::dispatch::MultiAppendConsumer;
-
         self.check_utf8_only_enforced()?;
         // RFC 3502 Section 3: MULTIAPPEND is valid in Authenticated and Selected
         // states. Only an early refusal - the driver re-checks against live
@@ -124,13 +118,11 @@ impl ImapConnection {
             }
         }
 
-        self.submit_regular(
-            Command::Append {
+        self.submit_request(
+            super::request::AppendMany {
                 mailbox: mailbox.mailbox_name()?.into(),
                 messages: messages.to_vec(),
-                multi: true,
             },
-            MultiAppendConsumer::new(messages.len()),
             Some(deadline),
         )
         .await

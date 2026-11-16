@@ -128,12 +128,13 @@ pub(crate) fn stream<T: HttpTransport>(
             yield super::error::terminated_unsupported(
                 bifrost_types::AccountOperation::Hydrate,
                 None,
+                bifrost_types::UnsupportedReason::Projection,
                 "JMAP raw-MIME hydration projections need a MIME assembly path outside this wave",
             );
             return;
         }
 
-        let limit = limits.max_objects_in_get.max(1);
+        let limit = limits.max_objects_in_get.get();
         // One buffer per routing target: ids for the primary account and
         // ids for each foreign account cannot ride in the same
         // `Email/get`, because the call is accountId-scoped. Unlike the
@@ -475,7 +476,7 @@ fn properties_for_projection(projection: Projection) -> Vec<Property> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::capabilities::CoreLimits;
+    use crate::sync::capabilities::ObjectLimits;
     use std::sync::Mutex;
 
     use bytes::Bytes;
@@ -685,9 +686,9 @@ mod tests {
         let mut events = stream(
             std::sync::Arc::new(
                 crate::sync::registry::Registry::from_test(mail, foreign_mail).with_limits(
-                    CoreLimits {
-                        max_objects_in_get: 2,
-                        max_objects_in_set: 2,
+                    ObjectLimits {
+                        max_objects_in_get: std::num::NonZeroUsize::new(2).unwrap(),
+                        max_objects_in_set: std::num::NonZeroUsize::new(2).unwrap(),
                     },
                 ),
             ),

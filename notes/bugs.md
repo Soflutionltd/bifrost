@@ -98,51 +98,6 @@ position paging (for example BODYSTRUCTURE-based post-filtering of the
 candidate set). The defect is now documented at the `pim.rs` arm and in
 `reference/imap.md`.
 
-## BUG-057 - What an absent or zero JMAP core limit means is decided in eight places, with live disagreements
-
-**Reported by:** jmap-protocol (live disagreement).
-
-Partly fixed in wave 11: `CoreLimits`, required-field validation and the upload
-limit now live in `crates/jmap/src/core/session.rs`, the bare-handle batching
-callers decode through it, and factory validation already precedes the open
-probes. Upload-size zero and concurrency zero keep deliberately distinct
-policies (commented there). Residue: `SessionState::derive` does not yet
-validate once per installed session and cache the result, and the
-`CallLimit` / request-size / concurrency readers still interpret raw fields.
-The original account:
-
-RFC 8620 section 2 core limits are read raw (`CoreCapabilities` fields are
-`Option<usize>`) and interpreted per reader:
-
-| Reader | absent | zero |
-|---|---|---|
-| `core/request.rs::CallLimit` | `Unadvertised`: no limit enforced | `Invalid`: not enforced |
-| `sync/factory.rs::batched_open_probes` | "not a licence to batch": one call per request | (`max_calls < 2`) one call per request |
-| `client_ws.rs::encode_ws_request` (`maxSizeRequest`) | not enforced | not enforced (`max > 0`) |
-| `blob/upload.rs::upload_to` (`maxSizeUpload`) | not enforced | enforced (every non-empty upload refused) |
-| `Session::api_request_concurrency` / `upload_concurrency` | 1 | 1 |
-| `sync/capabilities.rs::validate_session` | refuses open (calls, get, set, size, concurrency, collations) | refuses calls/get/set/size; accepts upload and concurrency zero |
-| `validate_session` again, after refusing | `.unwrap_or(1).max(1)` on get/set (dead defaults restating a third reading) | |
-| `sync/capabilities.rs::upload_size_limit` | refuses | accepts |
-
-With `maxCallsInRequest` omitted, `CallLimit` lets a request grow without bound
-while `batched_open_probes` refuses to put two calls in one; `validate_session`
-then refuses the account, so the first two answers are reachable only before
-validation (the `CallLimit` doc says this is deliberate, because probes run
-before validation). Open probes running against an unvalidated session is itself
-why three of these readers exist. Owner: validate once, at
-`SessionState::derive` (which already runs on every installed session),
-producing a typed `CoreLimits` with `NonZeroUsize` where the RFC or the crate
-requires positive and an explicit `Unbounded`/`Serial` reading where it does
-not; every reader takes it. The session interpretation itself should move out of
-the engine-facing layer: `validate_session`, `upload_size_limit`, the
-"which capabilities are malformed and which matter" policy, and the `CoreLimits`
-type live in `sync/capabilities.rs`, interleaved with the `AccountCapabilities`
-mapping, though they are a reading of RFC 8620 section 2 and run after `Client`
-already acted on the session unvalidated; they belong in `core/session.rs` as
-`SessionState::derive -> ValidatedSession`, with `sync/capabilities.rs` keeping
-only the mapping.
-
 ## BUG-176 - Open rulings and design residue from the wave 10 to 16 lateral findings
 
 **Reported by:** wave 10 to 16 fixers (lateral); everything fixable in those

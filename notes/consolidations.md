@@ -246,54 +246,6 @@ Owner: one `PriorityLanes<T>` with a pluggable overflow policy owning the floor
 rule once; the published, engine-unused work-item path stays as a thin user of
 it.
 
-## CON-020 - What does a push teardown refusal mean?
-
-**Reported by:** sync-engine.
-
-`SyncEngine::unsubscribe_push`, `subscribe_push`'s refused-registration cleanup,
-`reattach.rs::unwind_replacement_subscriptions`, `retire_stranded` and
-`orphan_teardown.rs` each call `push_unsubscribe`, decide whether a refusal
-becomes an orphan, and log. Only the unwind path records throttle holds
-(through `RepairPacing`); only the retrier applies a timeout. Owner: a
-`SubscriptionTeardown` service on the registry, with "delete, settle or orphan,
-record holds" as one operation.
-
-## CON-024 - What does an inventory front end do with one page?
-
-**Reported by:** sync-lanes (sites already disagree).
-
-The question: project entries to `Created` ids, project removals, decide
-whether the page crosses a waived barrier, decide whether it stops the walk,
-record barriers, warn, judge the fence, and publish. Answered by
-`BackfillRunner::run_partition` (twice internally: the barrier-page and normal
-branches each build the `kept -> Change::ObjectChange { Created }` chain and
-the synthetic `Batch`), `InventoryFusion::run_stream` plus
-`forward_inventory_batch`, and `repair.rs::publish_recovered` (down-converts
-recovered entries to `Created` and publishes per scope). The crossed-or-stop
-pattern (`let crossed = if coverage.has_barrier() {
-cross_waived_barriers(..).await? } else { false }; if !crossed && let
-StopAtBarrier = walk.inspect(..)`) is written four times: runner batch, runner
-`Done`, fusion batch, fusion `Done`.
-
-Disagreements: degraded coverage is announced by fusion and never by backfill
-(BUG-017); fusion judges the fence before forwarding a checkpoint-less barrier
-page (`forward_inventory_batch` checks `fence_moved` when nothing registers)
-while the runner's barrier page goes out on the raw sender unfenced; the
-boundary-violation outcome is `Err(Error::Account)` in the runner but
-`Ok(FusionOutcome::Terminated)` in fusion; the barrier warning text is
-duplicated verbatim between `warn_barrier` and `warn_degraded`; a failed barrier
-write is logged in fusion and silent in the runner. `inventory_walk.rs` records
-an explicit trigger for unifying the minting sites, "a THIRD inventory front end
-appears"; the hunter says repair is that third front end in everything but
-checkpoint minting, so the trigger has fired.
-
-Owner: `InventoryWalk` grows `async fn judge(&mut self, coverage, writer) ->
-PageVerdict { Advance, CrossedWaived, Stop { resume_from } }`, owning the
-crossing, the stop, barrier recording and the degraded flag, plus one
-`PagePublisher` (CON-019) owning entry and removal projection, the
-fence-before-forward rule and the warnings. Only the checkpoint source (minted
-positional vs account-supplied) stays per front end.
-
 ## CON-047 - May this URL carry the account credential?
 
 **Reported by:** graph.

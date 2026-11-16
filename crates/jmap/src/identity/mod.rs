@@ -180,3 +180,6 @@ impl crate::core::SetCreate for IdentityCreate {
 crate::define_get_method!(IdentityGet, Identity);
 crate::define_set_method!(IdentitySet, Identity);
 crate::define_changes_method!(IdentityChanges, Identity);
+
+#[cfg(test)]
+mod wire_tests;

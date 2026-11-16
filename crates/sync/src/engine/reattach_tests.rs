@@ -1464,3 +1464,43 @@ async fn stale_requests_are_declined_after_their_account_was_replaced(
     assert_eq!(replacement.closed.load(Ordering::SeqCst), 0);
     fixture.engine.shutdown().await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn consumer_teardown_records_shared_holds_and_keeps_only_orphans() {
+    let mut initial = account();
+    initial.unsubscribe_error_hook = Some(Arc::new(|handle| {
+        Some(teardown_throttle(
+            if handle.0 == "first" { 20 } else { 40 },
+            Some(&handle.0),
+        ))
+    }));
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        initial,
+    )])))
+    .await;
+    fixture
+        .slot
+        .subscriptions
+        .replace(vec![
+            subscription("first", false),
+            subscription("second", false),
+        ])
+        .expect("subscriptions");
+    fixture
+        .engine
+        .unsubscribe_push(&fixture.id)
+        .await
+        .expect_err("provider refusal");
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    assert_eq!(peer_hold(&ctx, "first"), Some(Duration::from_secs(20)));
+    assert_eq!(peer_hold(&ctx, "second"), Some(Duration::from_secs(40)));
+    let records = fixture.slot.subscriptions.snapshot();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| !record.desired() && record.teardown_unconfirmed())
+    );
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}

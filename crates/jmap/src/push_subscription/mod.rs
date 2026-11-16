@@ -160,3 +160,6 @@ impl crate::core::SetCreate for PushSubscriptionCreate {
 
 crate::define_get_method!(PushSubscriptionGet, PushSubscription);
 crate::define_set_method!(PushSubscriptionSet, PushSubscription);
+
+#[cfg(test)]
+mod wire_tests;

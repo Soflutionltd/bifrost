@@ -11,21 +11,21 @@ use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, MailboxQuery, Property as MailboxProperty};
 
-use super::capabilities::CoreLimits;
+use super::capabilities::ObjectLimits;
 use super::state_walk::InventoryWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
 pub(crate) fn stream<T: HttpTransport>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
     scope: CursorScope,
     owner: Option<TypesPrincipalId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match super::state::JmapScopeRepr::from_cursor_scope(&scope) {
         Ok(super::state::JmapScopeRepr::Email) => email_inventory(mail, limits),
         Ok(super::state::JmapScopeRepr::Mailbox) => {
-            mailbox_inventory(mail, limits.max_objects_in_get.max(1))
+            mailbox_inventory(mail, limits.max_objects_in_get.get())
         }
         // A foreign (shared/delegate) account scope: page its emails via
         // `Email/query` against the foreign account, hydrating inventory
@@ -41,6 +41,7 @@ pub(crate) fn stream<T: HttpTransport>(
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(CursorScope::Type(ObjectType::Thread))),
+                    bifrost_types::UnsupportedReason::CursorScope,
                     "JMAP thread inventory is derived from Email inventory in this implementation",
                 );
         }),
@@ -48,6 +49,7 @@ pub(crate) fn stream<T: HttpTransport>(
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
                     None,
+                    bifrost_types::UnsupportedReason::CursorScope,
                     "JMAP query inventory requires registered query definitions outside the v1 Account trait",
                 );
         }),
@@ -55,6 +57,7 @@ pub(crate) fn stream<T: HttpTransport>(
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    bifrost_types::UnsupportedReason::CursorScope,
                     "cursor scope is not supported by JMAP",
                 );
         }),
@@ -63,7 +66,7 @@ pub(crate) fn stream<T: HttpTransport>(
 
 pub(crate) fn stream_partition<T: HttpTransport>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
     scope: CursorScope,
     partition: InventoryPartition,
     owner: Option<TypesPrincipalId>,
@@ -74,6 +77,7 @@ pub(crate) fn stream_partition<T: HttpTransport>(
             yield super::error::terminated_unsupported(
                 bifrost_types::AccountOperation::SyncInventory,
                 None,
+                bifrost_types::UnsupportedReason::CursorScope,
                 "JMAP inventory partition is not supported for this cursor scope",
             );
         }),
@@ -82,14 +86,14 @@ pub(crate) fn stream_partition<T: HttpTransport>(
 
 fn foreign_email_inventory<T: HttpTransport>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
     scope: CursorScope,
     mailbox_id: String,
     owner: Option<TypesPrincipalId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     let filter =
         (!mailbox_id.is_empty()).then(|| crate::email::query::Filter::in_mailbox(mailbox_id));
-    email_inventory_loop(mail, scope, filter, owner, limits.max_objects_in_get.max(1))
+    email_inventory_loop(mail, scope, filter, owner, limits.max_objects_in_get.get())
 }
 
 /// The paged `Email/query` + `Email/get` inventory walk, shared by the
@@ -294,14 +298,14 @@ pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesPrinc
 
 fn email_inventory<T: HttpTransport>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     email_inventory_loop(
         mail,
         CursorScope::Type(ObjectType::Email),
         None,
         None,
-        limits.max_objects_in_get.max(1),
+        limits.max_objects_in_get.get(),
     )
 }
 
@@ -1175,9 +1179,9 @@ mod tests {
         let mail = crate::account::Account::new(client, "primary");
         let events = stream(
             mail,
-            CoreLimits {
-                max_objects_in_get: 2,
-                max_objects_in_set: 2,
+            ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(2).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(2).unwrap(),
             },
             CursorScope::Type(ObjectType::Email),
             None,

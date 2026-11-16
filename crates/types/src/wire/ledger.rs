@@ -16,7 +16,7 @@ use crate::{
 
 /// Latest ledger version that introduced a shared vocabulary tag.
 /// Advance beyond the current sync ledger version when adding new tags.
-pub const VOCABULARY_VERSION: u32 = 13;
+pub const VOCABULARY_VERSION: u32 = 14;
 
 /// Append a coverage domain, including its scope and snapshot identity.
 pub fn encode_domain(out: &mut Vec<u8>, domain: &CoverageDomain) {
@@ -278,6 +278,8 @@ pub fn encode_error_kind(out: &mut Vec<u8>, kind: &AccountErrorKind) {
             out.push(match kind {
                 RequestErrorKind::Malformed => 0,
                 RequestErrorKind::BatchInputInvalid => 1,
+                RequestErrorKind::PayloadTooLarge => 2,
+                RequestErrorKind::PreconditionFailed => 3,
             });
         }
         AccountErrorKind::NotFound(resource) => {
@@ -369,6 +371,8 @@ pub fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Er
         6 => AccountErrorKind::Request(match reader.u8()? {
             0 => RequestErrorKind::Malformed,
             1 => RequestErrorKind::BatchInputInvalid,
+            2 if reader.version >= 14 => RequestErrorKind::PayloadTooLarge,
+            3 if reader.version >= 14 => RequestErrorKind::PreconditionFailed,
             other => return Err(unknown_tag("request error kind", other)),
         }),
         7 => AccountErrorKind::NotFound(decode_resource(reader.u8()?, reader.version)?),

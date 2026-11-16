@@ -1,7 +1,3 @@
-use super::bulk::{
-    MutationBucket, classify_item_outcome, counters_from_outcomes, queue_unresolved_for_retry,
-    should_forward_engine_recovery, unresolved_readback_ids,
-};
 use super::context::{WorkerRole, WorkerTask};
 use super::reattach::accepted_push_scopes;
 use super::{
@@ -9,6 +5,10 @@ use super::{
     take_ack_writer,
 };
 use crate::cursor::store::CheckpointStore;
+use crate::mutation::campaign::{
+    MutationBucket, classify_item_outcome, counters_from_outcomes, queue_unresolved_for_retry,
+    should_forward_engine_recovery, unresolved_readback_ids,
+};
 
 fn idle_worker(role: WorkerRole) -> WorkerTask {
     let join = tokio::spawn(async {});
@@ -2999,7 +2999,9 @@ fn retry_sweep_leaves_readback_and_engine_blocked_ids_alone() {
     let outcomes = std::collections::HashMap::from([
         (
             uncertain,
-            MutationBucket::PendingReadback(super::bulk::ReadbackOrigin::Reassertable),
+            MutationBucket::PendingReadback(
+                crate::mutation::campaign::ReadbackOrigin::Reassertable,
+            ),
         ),
         (blocked, MutationBucket::BlockedByEngine),
         (unseen.clone(), MutationBucket::InFlight),
@@ -3185,7 +3187,9 @@ fn readback_queue_is_every_still_pending_id() {
         ),
         (
             bifrost_types::ObjectId("readback".into()),
-            MutationBucket::PendingReadback(super::bulk::ReadbackOrigin::Reassertable),
+            MutationBucket::PendingReadback(
+                crate::mutation::campaign::ReadbackOrigin::Reassertable,
+            ),
         ),
     ]);
 

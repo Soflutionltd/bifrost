@@ -21,6 +21,7 @@
 //!   valid unsatisfied observations, sharing the retry budget and target slots.
 //!   Moves, caller guards and consumer dedupe guidance never authorize it.
 
+pub(crate) mod campaign;
 pub mod idempotency;
 pub mod readback;
 
@@ -65,27 +66,6 @@ pub struct MutationCounters {
     /// observed mismatches not reasserted, and inconclusive observations.
     pub pending_retry: u64,
     pub dedupe_by_client_id: u64,
-}
-
-impl MutationCounters {
-    pub fn record_applied(&mut self) {
-        self.applied = self.applied.saturating_add(1);
-    }
-    pub fn record_skipped(&mut self) {
-        self.skipped = self.skipped.saturating_add(1);
-    }
-    pub fn record_failed(&mut self) {
-        self.failed_terminal = self.failed_terminal.saturating_add(1);
-    }
-    pub fn record_blocked_by_engine(&mut self) {
-        self.blocked_by_engine = self.blocked_by_engine.saturating_add(1);
-    }
-    pub fn record_pending(&mut self) {
-        self.pending_retry = self.pending_retry.saturating_add(1);
-    }
-    pub fn record_dedupe_by_client_id(&mut self) {
-        self.dedupe_by_client_id = self.dedupe_by_client_id.saturating_add(1);
-    }
 }
 
 /// Cross-account fanout partitioner.

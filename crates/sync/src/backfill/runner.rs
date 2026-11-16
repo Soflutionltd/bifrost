@@ -44,18 +44,17 @@
 //! parked backfill.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::Mutex;
 
 use bifrost_types::{
-    Account, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, CursorScope,
-    InventoryEntry, InventoryPartition, ObjectChange, ObjectChangeKind, ObjectId, SyncEvent,
+    Account, BackfillCheckpoint, BackfillProgress, Checkpoint, CursorScope, InventoryEntry,
+    InventoryPartition, ObjectId,
 };
 use futures::stream::StreamExt;
 
-use crate::delivery::{EventScope, MultiplexerEvent};
+use crate::delivery::{EventScope, InventoryPublication};
 use crate::error::Error;
-use crate::inventory_walk::{InventoryWalk, WalkDecision, cross_waived_barriers, record_barriers};
+use crate::inventory_walk::{InventoryWalk, PageVerdict};
 
 use super::partitioner::partition_key;
 
@@ -327,10 +326,6 @@ impl BackfillRunner {
         let mut stream = account.inventory_partition_stream(scope.clone(), partition);
         let mut seen_total: u64 = 0;
         let mut kept_total: u64 = 0;
-        let mut complete = true;
-        // At most one page-level incompleteness warning per partition walk;
-        // the terminal summary reports the walk as a whole.
-        let mut warned_incomplete = false;
         let mut scope_walk = ScopeWalkStep::RequestNextPartition;
         let mut end = None;
         let mut walk = InventoryWalk::default();
@@ -390,73 +385,41 @@ impl BackfillRunner {
                         filter_inventory_supersedes(&batch.items, &batch.removed, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
-                    let projected_removals =
-                        match crate::inventory_walk::removals(&scope, kept_removed.iter().copied())
-                        {
-                            Ok(removals) => removals,
-                            Err(error) => {
-                                delivery.publish_terminated(
-                                    EventScope::Cursor(scope.clone()),
-                                    error.clone(),
-                                );
-                                return Err(Error::Account(error));
+                    let verdict = walk.judge(&batch.coverage, publisher, generation).await?;
+                    if verdict == PageVerdict::Stop {
+                        match publisher.publish_inventory(
+                            &scope,
+                            &batch,
+                            kept.iter().map(|entry| &entry.id),
+                            kept_removed.iter().copied(),
+                            None,
+                            generation,
+                            walk_fence,
+                        )? {
+                            InventoryPublication::Refused(claim) => {
+                                if let Err(error) = crate::inventory_walk::record_refused_debt(
+                                    Some(writer_tx),
+                                    claim,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%error, "could not record refused page debt");
+                                }
+                                return Err(Error::Superseded);
                             }
-                        };
-
-                    let crossed = if batch.coverage.has_barrier() {
-                        cross_waived_barriers(Some(writer_tx), &batch.coverage, generation).await?
-                    } else {
-                        false
-                    };
-                    if !batch.coverage.is_complete() && !crossed {
-                        complete = false;
-                    }
-                    if !crossed
-                        && let WalkDecision::StopAtBarrier { resume_from } =
-                            walk.inspect(&batch.coverage)
-                    {
-                        // Announce nothing the writer could not durably record:
-                        // a barrier that only exists in this process is one a
-                        // restart forgets and no operator can act on. Failing
-                        // the partition instead leaves the scope Pending and
-                        // re-walks it, which is recoverable.
-                        record_barriers(Some(writer_tx), &batch.coverage, generation, resume_from)
-                            .await?;
-                        let changes = kept
-                            .into_iter()
-                            .map(|entry| {
-                                Change::ObjectChange(ObjectChange {
-                                    id: entry.id.clone(),
-                                    kind: ObjectChangeKind::Created,
-                                })
-                            })
-                            .chain(projected_removals)
-                            .collect();
-                        let synthetic = Batch {
-                            items: changes,
-                            page_boundary: batch.page_boundary,
-                            server_latency: batch.server_latency,
-                            bytes_in: batch.bytes_in,
-                            checkpoint: None,
-                        };
-                        // This checkpoint-free barrier never completes the walk,
-                        // regardless of whether an advisory batch has a receiver.
-                        let _ = delivery.publish_unacked(MultiplexerEvent::unacked(
-                            EventScope::Cursor(scope.clone()),
-                            Arc::new(SyncEvent::Batch(synthetic)),
-                        ));
-                        warn_barrier(delivery, &scope, &batch.coverage);
+                            // A barrier never completes the scope, including when
+                            // its advisory data reached no numbered subscriber.
+                            InventoryPublication::Published | InventoryPublication::Undelivered => {
+                            }
+                        }
+                        walk.warn_coverage(delivery, &scope, &batch.coverage, verdict, false);
                         return Ok(BackfillPartitionOutcome {
                             seen: seen_total,
                             kept: kept_total,
                             verdict: PartitionVerdict::StoppedAtBarrier,
                         });
                     }
-
-                    if !crossed && !warned_incomplete && !batch.coverage.is_complete() {
-                        warn_incomplete(delivery, &scope, &batch.coverage);
-                        warned_incomplete = true;
-                    }
+                    walk.warn_coverage(delivery, &scope, &batch.coverage, verdict, false);
                     // Forward the page as a synthetic Batch carrying a
                     // BackfillCheckpoint. Durable persistence awaits the
                     // consumer ack (see module docs); the runner never
@@ -503,48 +466,19 @@ impl BackfillRunner {
                             },
                             envelope_version,
                         };
-                        let changes: Vec<Change> = kept
-                            .into_iter()
-                            .map(|entry| {
-                                Change::ObjectChange(ObjectChange {
-                                    id: entry.id.clone(),
-                                    kind: ObjectChangeKind::Created,
-                                })
-                            })
-                            .chain(projected_removals)
-                            .collect();
-                        let synthetic = Batch {
-                            items: changes,
-                            page_boundary: batch.page_boundary,
-                            server_latency: batch.server_latency,
-                            bytes_in: batch.bytes_in,
-                            checkpoint: Some(Checkpoint::Backfill(bf.clone())),
-                        };
-                        // REGISTER THE COVERAGE CLAIM. Without this the page's
-                        // obligations never reach the durable record at all:
-                        // the runner used to read `batch.coverage` only to
-                        // clear its local `complete` flag, so an acknowledged
-                        // degraded page persisted a record asserting complete
-                        // coverage over objects nothing had recorded - the
-                        // exact invariant this machinery exists to enforce.
-                        //
-                        // Note the claim rides the PUBLICATION, not the scope.
-                        // Two partitions of one scope are in flight at once, so
-                        // a scope-keyed claim would let partition B's report be
-                        // persisted under partition A's acknowledgement.
+                        // Accept only the minted positional checkpoint; the
+                        // publisher registers it and its claim in one transition.
                         let expected = Checkpoint::Backfill(bf);
                         walk.accept(Some(expected.clone()));
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Cursor(scope.clone()),
-                            event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(expected),
-                            publication: None,
-                        };
-                        if let Err(claim) = publisher.publish_page(
-                            me,
-                            crate::cursor::CoverageClaim::new(batch.coverage.clone(), generation),
+                        if let InventoryPublication::Refused(claim) = publisher.publish_inventory(
+                            &scope,
+                            &batch,
+                            kept.iter().map(|entry| &entry.id),
+                            kept_removed.iter().copied(),
+                            Some(expected),
+                            generation,
                             walk_fence,
-                        ) {
+                        )? {
                             if let Err(error) =
                                 crate::inventory_walk::record_refused_debt(Some(writer_tx), claim)
                                     .await
@@ -574,31 +508,15 @@ impl BackfillRunner {
                         return Err(Error::Account(error));
                     }
                     end = Some(completion.end);
-                    let crossed = if completion.coverage.has_barrier() {
-                        cross_waived_barriers(Some(writer_tx), &completion.coverage, generation)
-                            .await?
-                    } else {
-                        false
-                    };
-                    if !crossed
-                        && let WalkDecision::StopAtBarrier { resume_from } =
-                            walk.inspect(&completion.coverage)
-                    {
-                        complete = false;
-                        scope_walk = ScopeWalkStep::StopScopeWalk;
-                        record_barriers(
-                            Some(writer_tx),
-                            &completion.coverage,
-                            generation,
-                            resume_from,
-                        )
+                    let verdict = walk
+                        .judge(&completion.coverage, publisher, generation)
                         .await?;
-                        warn_barrier(delivery, &scope, &completion.coverage);
+                    walk.warn_coverage(delivery, &scope, &completion.coverage, verdict, true);
+                    if verdict == PageVerdict::Stop {
+                        scope_walk = ScopeWalkStep::StopScopeWalk;
                         break;
                     }
-                    if !completion.coverage.is_complete() && !crossed {
-                        warn_incomplete(delivery, &scope, &completion.coverage);
-                        complete = false;
+                    if !completion.coverage.is_complete() && !verdict.crossed() {
                         // The terminal summary has no checkpoint of its own to
                         // ride, so its obligations reach the ledger directly -
                         // as DEBT ONLY, never proof. Both current providers
@@ -645,7 +563,6 @@ impl BackfillRunner {
         // scope's completion marker over ground nothing covered, which made the
         // next attach skip the walk for good.
         if end.is_none() {
-            complete = false;
             delivery.publish_warning(
                 EventScope::Cursor(scope.clone()),
                 crate::inventory_walk::unannounced_end_warning(),
@@ -661,64 +578,16 @@ impl BackfillRunner {
             } else {
                 match end {
                     Some(bifrost_types::PartitionEnd::Exhausted) => PartitionVerdict::Exhausted {
-                        degraded: !complete,
+                        degraded: walk.degraded(),
                     },
                     Some(_) => PartitionVerdict::MoreBeyond {
-                        degraded: !complete,
+                        degraded: walk.degraded(),
                     },
                     None => PartitionVerdict::EndedUnannounced,
                 }
             },
         })
     }
-}
-
-// An enterprise mail user needs to know that a live folder is incomplete,
-// even when replay can eventually repair it. Report the FIRST incomplete page
-// of a partition walk (a provider may terminate before sending its terminal
-// summary) and the terminal summary itself, but not every page: one warning
-// per page of a large degraded folder is noise the user cannot act on.
-fn warn_incomplete(
-    tx: &crate::delivery::ChangeDelivery,
-    scope: &CursorScope,
-    coverage: &bifrost_types::InventoryCoverageReport,
-) {
-    if coverage.is_complete() {
-        return;
-    }
-    let warning = bifrost_types::Warning::user_safe(
-        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::DegradedCoverage {
-            obligations: coverage.obligations().len(),
-        }),
-        format!(
-            "inventory reported {} object(s) or region(s) it could not represent; \
-             the scope is live but incomplete",
-            coverage.obligations().len()
-        ),
-    );
-    tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
-}
-
-fn warn_barrier(
-    tx: &crate::delivery::ChangeDelivery,
-    scope: &CursorScope,
-    coverage: &bifrost_types::InventoryCoverageReport,
-) {
-    let count = coverage
-        .obligations()
-        .iter()
-        .filter(|obligation| obligation.is_barrier())
-        .count();
-    let warning = bifrost_types::Warning::user_safe(
-        bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::BarrierStop {
-            regions: count,
-        }),
-        format!(
-            "inventory stopped at {count} region(s) it cannot represent and cannot replay; \
-             the scope cannot advance past them until an operator waives them"
-        ),
-    );
-    tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
 }
 
 fn filter_inventory_supersedes<'a>(
@@ -756,6 +625,7 @@ fn filter_inventory_supersedes<'a>(
 mod tests {
     use super::*;
     use bifrost_types::{Fingerprint, InventoryEntry, ObjectId, ServerVersion};
+    use std::sync::Arc;
 
     fn entry(id: &str) -> InventoryEntry {
         InventoryEntry {
@@ -772,6 +642,75 @@ mod tests {
             references: Vec::new(),
             in_reply_to: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_barrier_page_under_a_moved_fence_is_not_forwarded() {
+        use bifrost_types::{
+            CoverageDomain, InventoryBatch, InventoryCoverageReport, InventoryEvent,
+            InventoryObligation, ObligationKey, PageBoundary, PageCheckpoint, RegionRecovery,
+        };
+        let scope = CursorScope::Account;
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _b) = tokio::sync::watch::channel(None);
+        let control = crate::control::SyncControl::new_with_publications(
+            bifrost_types::AccountId("barrier-fence".into()),
+            boundary,
+            priority,
+            bandwidth,
+            Arc::clone(&coverage),
+        );
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let publisher = crate::delivery::PagePublisher::new(
+            Arc::new(crate::delivery::ChangeDelivery::new(tx)),
+            control,
+            crate::engine::writer::WriterHandle::closed(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let events = Arc::new(Mutex::new(Some(vec![InventoryEvent::Batch(
+            InventoryBatch {
+                items: vec![entry("old-incarnation")],
+                removed: Vec::new(),
+                page_boundary: PageBoundary::Page,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: PageCheckpoint::Withheld(None),
+                coverage: InventoryCoverageReport::degraded(
+                    CoverageDomain::full(scope.clone()),
+                    vec![InventoryObligation::Region {
+                        key: ObligationKey(b"blocked".to_vec()),
+                        failure_label: "blocked".into(),
+                        error: crate::test_common::close_refused(),
+                        recovery: RegionRecovery::barrier(),
+                    }],
+                ),
+            },
+        )])));
+        let mut account = crate::test_common::StubAccount::new(vec![scope.clone()]);
+        account.partition_hook = Some(Arc::new(move |_, _| {
+            events.lock().expect("events").take().expect("one walk")
+        }));
+        let fence = coverage.scope_fence(&scope);
+        coverage.raise_scope_fence(&scope);
+        let outcome = BackfillRunner::run_partition(
+            &account,
+            scope,
+            InventoryPartition::Full,
+            &LiveSupersedes::new(),
+            bifrost_types::TraitEnvelopeVersion::new(1),
+            &publisher,
+            coverage.next_generation(),
+            None,
+            fence,
+        )
+        .await;
+        assert!(matches!(outcome, Err(Error::Superseded)), "{outcome:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale barrier page must not be sent"
+        );
     }
 
     #[test]

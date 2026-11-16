@@ -532,7 +532,7 @@ fn uidvalidity_mismatch_is_reported_not_fetched() {
         .expect_err("stale epoch refused");
     assert!(matches!(
         error.kind(),
-        AccountErrorKind::Request(RequestErrorKind::Malformed)
+        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
     ));
 }
 

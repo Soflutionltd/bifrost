@@ -10,8 +10,6 @@ pub(crate) struct ThreadConsumer<I = crate::types::Uid> {
     addressing: std::marker::PhantomData<I>,
     /// The THREAD response, if received.
     result: Option<Vec<ThreadNode<u32>>>,
-    /// Non-THREAD responses routed here.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl<I: crate::types::search::SearchAddress> Consumer for ThreadConsumer<I> {
@@ -22,13 +20,14 @@ impl<I: crate::types::search::SearchAddress> Consumer for ThreadConsumer<I> {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             UntaggedResponse::Thread(threads) if self.result.is_none() => {
                 self.result = Some(threads);
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -36,10 +35,8 @@ impl<I: crate::types::search::SearchAddress> Consumer for ThreadConsumer<I> {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Vec<ThreadNode<I>>> {
-        // `buffered` is `Either`-classified data that only the event stream
-        // carries, so it is surrendered on both arms.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         // RFC 5256 Section 4: an empty THREAD result (no matching
         // messages) may be represented by the server omitting the
@@ -50,7 +47,7 @@ impl<I: crate::types::search::SearchAddress> Consumer for ThreadConsumer<I> {
             .into_iter()
             .map(ThreadNode::addressed)
             .collect();
-        Finalized::success(threads, self.buffered)
+        Finalized::success(threads, Vec::new())
     }
 }
 
@@ -62,8 +59,6 @@ pub(crate) struct SortConsumer<I = crate::types::Uid> {
     addressing: std::marker::PhantomData<I>,
     /// The SORT response, if received.
     result: Option<(Vec<u32>, Option<crate::types::ModSeq>)>,
-    /// Non-SORT responses routed here.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl<I: crate::types::search::SearchAddress> Consumer for SortConsumer<I> {
@@ -74,13 +69,14 @@ impl<I: crate::types::search::SearchAddress> Consumer for SortConsumer<I> {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             UntaggedResponse::Sort { nums, mod_seq } if self.result.is_none() => {
                 self.result = Some((nums, mod_seq));
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -88,16 +84,14 @@ impl<I: crate::types::search::SearchAddress> Consumer for SortConsumer<I> {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<SearchResult<I>> {
-        // `buffered` is `Either`-classified data that only the event stream
-        // carries, so it is surrendered on both arms.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         // RFC 5256 Section 4: an empty SORT result (no matching
         // messages) may be represented by the server omitting the
         // untagged SORT response entirely and sending only tagged OK.
         let (ids, mod_seq) = self.result.unwrap_or_default();
-        Finalized::success(SearchResult::new(ids, mod_seq), self.buffered)
+        Finalized::success(SearchResult::new(ids, mod_seq), Vec::new())
     }
 }
 
@@ -105,7 +99,7 @@ impl<I> Default for SortConsumer<I> {
     fn default() -> Self {
         Self {
             result: None,
-            buffered: Vec::new(),
+
             addressing: std::marker::PhantomData,
         }
     }
@@ -115,7 +109,7 @@ impl<I> Default for ThreadConsumer<I> {
     fn default() -> Self {
         Self {
             result: None,
-            buffered: Vec::new(),
+
             addressing: std::marker::PhantomData,
         }
     }

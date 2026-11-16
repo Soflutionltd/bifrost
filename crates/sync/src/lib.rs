@@ -75,7 +75,7 @@ pub use cursor::{
     CursorRegistry, DebtLedger, DischargeEvidence, DynCheckpointStore, ENGINE_VERSION, EntryPolicy,
     InMemoryCheckpointStore, LEDGER_ENVELOPE_VERSION, LedgerEntry, LineageBudget, MIN_MIGRATABLE,
     MIN_MIGRATABLE_LEDGER, OperatorId, PendingCoverage, ProofStatus, PublicationReceipt,
-    Publications, UnixSeconds, decode_ack_token, decode_envelope, decode_ledger, encode_ack_token,
+    UnixSeconds, decode_ack_token, decode_envelope, decode_ledger, encode_ack_token,
     encode_envelope, encode_ledger,
 };
 

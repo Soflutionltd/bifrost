@@ -1893,6 +1893,40 @@ async fn container_delete_deselects_a_target_left_selected_in_the_pool() {
     let _server = script.await.unwrap();
 }
 
+/// A mailbox that still holds messages refuses deletion as a precondition the
+/// user can resolve by emptying it, not as a malformed request, and no DELETE
+/// is written.
+#[tokio::test]
+async fn container_delete_of_a_non_empty_mailbox_is_a_precondition_failure() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev2")).await;
+    let account = scripted_account(conn, 1);
+
+    let script = tokio::spawn(async move {
+        let status = read_line(&mut server).await;
+        assert!(status.contains("STATUS"), "expected STATUS, got {status}");
+        respond(
+            &mut server,
+            &format!(
+                "* STATUS Archive (MESSAGES 3)\r\n{} OK STATUS done\r\n",
+                tag_of(&status)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let error =
+        super::containers::container_delete(account.clone(), ContainerId("Archive".to_owned()))
+            .await
+            .expect_err("a non-empty mailbox must not be deleted");
+    assert_eq!(
+        error.kind(),
+        &AccountErrorKind::Request(bifrost_types::RequestErrorKind::PreconditionFailed)
+    );
+    assert_eq!(error.operation(), Some(AccountOperation::ContainerDelete));
+    let _server = script.await.unwrap();
+}
+
 fn rev2_select_ok(tag: &str, mailbox: &str) -> String {
     format!(
         "* FLAGS (\\Deleted \\Seen)\r\n\

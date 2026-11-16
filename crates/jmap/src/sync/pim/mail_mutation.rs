@@ -64,7 +64,8 @@ pub(crate) fn set_keyword<T: HttpTransport>(
         // prefix and give an Outlook user an unroutable reconciliation target.
         let owner = mail.owner().shared().map(str::to_owned);
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
-        let batch_size = crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set);
+        let batch_size =
+            crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set.get());
         let mut progress = SetProgress::default().with_owner(owner);
         for chunk in ids.chunks(batch_size) {
             let keyword_for_set = keyword.clone();
@@ -417,7 +418,7 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
 
     // A conversation can exceed maxObjectsInGet; keep every Email/get
     // within the account's advertised per-call bound.
-    let batch_size = mail.limits.max_objects_in_get.max(1);
+    let batch_size = mail.limits.max_objects_in_get.get();
     let mut in_mailbox = Vec::new();
     let mut selected = HashSet::new();
     let mut read_state = None;
@@ -485,7 +486,8 @@ pub(super) async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     }
     let read_state = read_state
         .ok_or_else(|| to_acct_err(op)(crate::Error::MissingResponseField("Email/get.state")))?;
-    let batch_size = crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set);
+    let batch_size =
+        crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set.get());
     let mut if_in_state = read_state;
     // The owner must be known before the first item is classified: each
     // failed id's own error scope is minted in `item`, not at `finish`.
@@ -571,7 +573,8 @@ pub(super) async fn patch_mailbox_membership_of<T: HttpTransport>(
     // same account as the target, so the only work left is stripping the
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(mail.wire(&container.0).to_owned());
-    let batch_size = crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set);
+    let batch_size =
+        crate::sync::capabilities::set_batch_size(mail.limits.max_objects_in_set.get());
     let mut progress = SetProgress::default().with_owner(mail.owner().shared().map(str::to_owned));
     for chunk in ids.chunks(batch_size) {
         let ids_for_set = chunk.to_vec();
@@ -646,6 +649,7 @@ async fn resolve_target<T: HttpTransport>(
         _ => Err(crate::sync::error::unsupported_error(
             op,
             None,
+            bifrost_types::UnsupportedReason::RequestShape,
             "JMAP does not support this mutation target",
         )),
     }

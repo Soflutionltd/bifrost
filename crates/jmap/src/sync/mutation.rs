@@ -39,6 +39,7 @@ pub(crate) fn set_flags<T: HttpTransport>(
             yield super::error::terminated_unsupported(
                 AccountOperation::UpdateFlags,
                 None,
+                bifrost_types::UnsupportedReason::FlagOperation,
                 "JMAP does not support this FlagOp variant",
             );
         }),
@@ -58,6 +59,7 @@ pub(crate) fn move_to<T: HttpTransport>(
                 yield super::error::terminated(super::error::unsupported_error(
                     bifrost_types::AccountOperation::BulkMove,
                     None,
+                    bifrost_types::UnsupportedReason::RequestShape,
                     "JMAP bulk_move only supports MembershipScope::Mailbox",
                 ));
             });
@@ -110,7 +112,7 @@ pub(super) fn versioned_stream<T: HttpTransport>(
         // within the advertised object limit, without advancing caller tokens.
         // ready_chunks flushes when input is pending, so a live producer does
         // not have to fill the limit before seeing a result.
-        let mut chunks = targets.ready_chunks(super::capabilities::set_batch_size(limits.max_objects_in_set));
+        let mut chunks = targets.ready_chunks(super::capabilities::set_batch_size(limits.max_objects_in_set.get()));
         while let Some(chunk) = chunks.next().await {
             let mut groups: Vec<(String, Option<String>, Vec<ObjectId>)> = Vec::new();
             let mut rejected = Vec::new();
@@ -341,7 +343,7 @@ fn mutation_stream<T: HttpTransport>(
     let limits = mail.limits;
 
     Box::pin(async_stream::stream! {
-        let batch_size = super::capabilities::set_batch_size(limits.max_objects_in_set);
+        let batch_size = super::capabilities::set_batch_size(limits.max_objects_in_set.get());
         let mut buffers = RouteBuffers::new(batch_size);
 
         loop {
@@ -661,7 +663,7 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
         // mutation stream. Retain a second refusal here so a future internal
         // caller cannot turn an unhandled operation into a successful no-op.
         _ => {
-            return Err(crate::Error::UnsupportedOperation(
+            return Err(crate::Error::UnsupportedFlagOperation(
                 "JMAP flag patch received an unsupported FlagOp variant",
             ));
         }
@@ -672,7 +674,7 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::capabilities::CoreLimits;
+    use crate::sync::capabilities::ObjectLimits;
     use bifrost_types::{AccountErrorKind, RecoveryClass, RetryDisposition};
     use futures::StreamExt;
     use std::sync::Mutex as StdMutex;
@@ -979,9 +981,9 @@ mod tests {
                     std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                         primary,
                         foreign,
-                        CoreLimits {
-                            max_objects_in_get: 256,
-                            max_objects_in_set: 10,
+                        ObjectLimits {
+                            max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                            max_objects_in_set: std::num::NonZeroUsize::new(10).unwrap(),
                         },
                         crate::sync::state_cache::seeded(std::collections::HashMap::new()),
                     )),
@@ -1051,9 +1053,9 @@ mod tests {
                 std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                     primary,
                     foreign,
-                    CoreLimits {
-                        max_objects_in_get: 256,
-                        max_objects_in_set: 10,
+                    ObjectLimits {
+                        max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                        max_objects_in_set: std::num::NonZeroUsize::new(10).unwrap(),
                     },
                     states,
                 )),
@@ -1102,9 +1104,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 foreign,
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 10,
+                ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(10).unwrap(),
                 },
                 states,
             )),
@@ -1140,9 +1142,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 foreign,
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 10,
+                ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(10).unwrap(),
                 },
                 crate::sync::state_cache::seeded(std::collections::HashMap::new()),
             )),
@@ -1412,9 +1414,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 foreign,
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 3,
+                ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(3).unwrap(),
                 },
                 states,
             )),

@@ -323,3 +323,6 @@ impl QueryObject for Email {
 
     type Sort = Comparator;
 }
+
+#[cfg(test)]
+mod wire_tests;

@@ -326,7 +326,11 @@ pub(super) fn route_pipeline_response(
                         &routing.tags[owner],
                     );
                     if let Some(ref mut consumer) = routing.consumers[owner] {
-                        consumer.on_response(*u, notify_before, &ctx);
+                        super::emit_declined(
+                            event_sink,
+                            consumer.on_response(*u, notify_before, &ctx),
+                            code_emitted,
+                        );
                     }
                     return Ok(Routed::Continue);
                 }
@@ -362,7 +366,11 @@ pub(super) fn route_pipeline_response(
                         &routing.tags[idx],
                     );
                     if let Some(ref mut consumer) = routing.consumers[idx] {
-                        consumer.on_response(*u, notify_before, &ctx);
+                        super::emit_declined(
+                            event_sink,
+                            consumer.on_response(*u, notify_before, &ctx),
+                            code_emitted,
+                        );
                     }
                 }
                 SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
@@ -401,7 +409,11 @@ pub(super) fn route_pipeline_response(
                                     &routing.tags[later],
                                 );
                                 if let Some(ref mut consumer) = routing.consumers[later] {
-                                    consumer.on_response(*taken, notify_before, &ctx);
+                                    super::emit_declined(
+                                        event_sink,
+                                        consumer.on_response(*taken, notify_before, &ctx),
+                                        code_emitted,
+                                    );
                                 }
                             }
                             break;

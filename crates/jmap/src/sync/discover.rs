@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::transport::HttpTransport;
 use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 
-use super::capabilities::CoreLimits;
+use super::capabilities::ObjectLimits;
 use super::state_walk::ChangesWalk;
 
 /// Only the primary account is polled, so this topology owns one position.
@@ -143,7 +142,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 pub(crate) fn scope_lifecycle<T: HttpTransport>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
     topology: Topology,
     shutdown: CancellationToken,
     client: crate::client::Client<T>,
@@ -188,10 +187,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                 )
             });
 
-            let max_changes = NonZeroUsize::new(limits.max_objects_in_get.max(1));
-            let Some(max_changes) = max_changes else {
-                break;
-            };
+            let max_changes = limits.max_objects_in_get;
 
             let response = mail
                 .call(MailboxChanges::new(since_state.clone()).max_changes(max_changes))
@@ -494,7 +490,7 @@ struct FetchedMailboxes {
 /// batching is done here, where the limit is known.
 async fn fetch_mailboxes<'a, T: HttpTransport>(
     mail: &MailAccount<T>,
-    limits: &CoreLimits,
+    limits: &ObjectLimits,
     ids: impl Iterator<Item = &'a MailboxId>,
 ) -> crate::Result<FetchedMailboxes> {
     let ids = ids.cloned().collect::<Vec<_>>();
@@ -506,7 +502,7 @@ async fn fetch_mailboxes<'a, T: HttpTransport>(
         return Ok(fetched);
     }
 
-    for chunk in ids.chunks(limits.max_objects_in_get.max(1)) {
+    for chunk in ids.chunks(limits.max_objects_in_get.get()) {
         let response = mail
             .call(
                 MailboxGet::new()
@@ -750,9 +746,9 @@ mod tests {
         let shutdown = CancellationToken::new();
         let stream = scope_lifecycle(
             mail,
-            CoreLimits {
-                max_objects_in_get,
-                max_objects_in_set: 256,
+            ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(max_objects_in_get).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(256).unwrap(),
             },
             Arc::clone(&states),
             shutdown.clone(),
@@ -979,9 +975,9 @@ mod tests {
         let open_stream = || {
             skip_polled(scope_lifecycle(
                 mail.clone(),
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 256,
+                ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(256).unwrap(),
                 },
                 Arc::clone(&states),
                 shutdown.clone(),
@@ -1044,9 +1040,9 @@ mod tests {
         let open_stream = || {
             skip_polled(scope_lifecycle(
                 mail.clone(),
-                CoreLimits {
-                    max_objects_in_get: 256,
-                    max_objects_in_set: 256,
+                ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(256).unwrap(),
                 },
                 Arc::clone(&states),
                 shutdown.clone(),

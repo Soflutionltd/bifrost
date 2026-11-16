@@ -73,6 +73,7 @@ pub(crate) fn container_create<T: HttpTransport>(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::ContainerCreate,
                 None,
+                bifrost_types::UnsupportedReason::ContainerKind,
                 "JMAP only supports folder containers",
             ));
         }
@@ -222,7 +223,12 @@ pub(super) async fn role_mailboxes<T: HttpTransport>(
 }
 
 pub(super) fn missing_role_mailbox(op: AccountOperation) -> AccountError {
-    crate::sync::error::unsupported_error(op, None, "JMAP required mailbox role not found")
+    crate::sync::error::unsupported_error(
+        op,
+        None,
+        bifrost_types::UnsupportedReason::MissingMailboxRole,
+        "JMAP required mailbox role not found",
+    )
 }
 
 async fn fetch_containers<T: HttpTransport>(

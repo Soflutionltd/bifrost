@@ -101,3 +101,6 @@ crate::define_get_method!(QuotaGet, Quota);
 crate::define_changes_method!(QuotaChanges, Quota);
 crate::define_query_method!(QuotaQuery, Quota);
 crate::define_query_changes_method!(QuotaQueryChanges, Quota);
+
+#[cfg(test)]
+mod wire_tests;

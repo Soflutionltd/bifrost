@@ -401,19 +401,18 @@ pub(in crate::engine) async fn reattach_account_paced(
             // does delete (and its rows are also deleted by the owning
             // account's `close()`). `unsubscribe_push` retries on the same
             // terms.
-            let teardown = previous.push_unsubscribe(record.handle.clone()).await;
-            if let Err(error) = &teardown {
-                pacing.observe(ctx, error);
+            let service = ctx.subscriptions.teardown(&ctx.account_id, &ctx.throttles);
+            let teardown = service
+                .delete(previous.as_ref().as_ref(), &record.handle)
+                .await;
+            if let Err(refusal) = &teardown {
+                pacing.observed = true;
+                pacing.local_deadline = pacing.local_deadline.max(refusal.local_deadline);
             }
+            service.settle_registered(record, &teardown);
             match teardown {
-                Ok(()) => {
-                    // Recorded immediately, with no await between the delete
-                    // returning and the registry write, so an abort later in
-                    // this pass (or this future being dropped) cannot leave a
-                    // deleted handle registered as live for the next attempt.
-                    ctx.subscriptions.mark_torn_down(&record.handle);
-                }
-                Err(error) if record.teardown_unconfirmed() => {
+                Ok(()) => {}
+                Err(refusal) if record.teardown_unconfirmed() => {
                     // Its teardown already failed once. The handle may belong
                     // to a connection that is long gone, so a repeated failure
                     // must not block the swap; keep carrying it so the next
@@ -429,17 +428,16 @@ pub(in crate::engine) async fn reattach_account_paced(
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
                         account = ?&ctx.account_id,
-                        error = %error,
+                        error = %refusal.error,
                         "carrying push subscription whose teardown is still unconfirmed"
                     );
                     carried_unconfirmed.push(record.clone().into_orphan());
                 }
-                Err(error) => {
+                Err(refusal) => {
                     // Still live and wanted on the old account, which stays
                     // installed if this pass aborts: flag it so the retry
                     // carries it instead of aborting on it again.
-                    ctx.subscriptions.mark_unconfirmed(&record.handle);
-                    first_refusal.get_or_insert(error);
+                    first_refusal.get_or_insert(refusal.error);
                 }
             }
         }

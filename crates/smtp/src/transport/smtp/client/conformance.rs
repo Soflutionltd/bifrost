@@ -1,17 +1,23 @@
-//! Every session transcript is defined once and driven through both adapters.
+//! Every session and send transcript is defined once and driven through both adapters.
 
 #[cfg(feature = "tokio")]
 use super::async_connection::AsyncSmtpConnection;
 use super::{TlsParameters, connection::SmtpConnection};
+use crate::address::{Address, Envelope};
 use crate::transport::smtp::{
     Dialect,
     account_error::{SmtpErrorContext, into_account_error},
     authentication::{Credentials, Mechanism},
-    error::{Error, SmtpCommandPhase},
-    extension::{ClientId, Extension, ServerInfo},
+    batch::{SendProgress, SmtpBatchRecipient},
+    error::{Error, SmtpCommandPhase, SmtpTransmissionState},
+    extension::{
+        ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter, MailParameter,
+        SendOptions, ServerInfo,
+    },
     response::Response,
     test_support::{Transcript, scram_enhanced_success_reply, scram_server_first_reply},
 };
+use bifrost_types::error::BatchItemId;
 use std::fmt::Display;
 const HELLO: &str = "EHLO client.example\r\n";
 
@@ -33,6 +39,153 @@ enum Connection {
 }
 
 impl Connection {
+    fn should_retire(&self) -> bool {
+        match self {
+            Self::Blocking(connection) => connection.should_retire(),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.should_retire(),
+        }
+    }
+
+    async fn test_connected(&mut self) -> bool {
+        match self {
+            Self::Blocking(connection) => connection.test_connected(),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.test_connected().await,
+        }
+    }
+
+    async fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
+        match self {
+            Self::Blocking(connection) => connection.message(message),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.message(message).await,
+        }
+    }
+
+    async fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
+    where
+        I: Iterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        match self {
+            Self::Blocking(connection) => connection.message_iter(message),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.message_iter(message).await,
+        }
+    }
+
+    async fn send(&mut self, envelope: &Envelope, body: &[u8]) -> Result<Response, Error> {
+        match self {
+            Self::Blocking(connection) => connection.send(envelope, body),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.send(envelope, body).await,
+        }
+    }
+
+    async fn send_with_options(
+        &mut self,
+        envelope: &Envelope,
+        body: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        match self {
+            Self::Blocking(connection) => connection.send_with_options(envelope, body, options),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.send_with_options(envelope, body, options).await,
+        }
+    }
+
+    async fn send_bdat_with_options(
+        &mut self,
+        envelope: &Envelope,
+        body: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        match self {
+            Self::Blocking(connection) => {
+                connection.send_bdat_with_options(envelope, body, options)
+            }
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => {
+                connection
+                    .send_bdat_with_options(envelope, body, options)
+                    .await
+            }
+        }
+    }
+
+    async fn send_lmtp(
+        &mut self,
+        envelope: &Envelope,
+        body: &[u8],
+    ) -> Result<Vec<Response>, Error> {
+        match self {
+            Self::Blocking(connection) => connection.send_lmtp(envelope, body),
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => connection.send_lmtp(envelope, body).await,
+        }
+    }
+
+    async fn send_lmtp_bdat_with_options(
+        &mut self,
+        envelope: &Envelope,
+        body: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error> {
+        match self {
+            Self::Blocking(connection) => {
+                connection.send_lmtp_bdat_with_options(envelope, body, options)
+            }
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => {
+                connection
+                    .send_lmtp_bdat_with_options(envelope, body, options)
+                    .await
+            }
+        }
+    }
+
+    async fn send_smtp_batch(
+        &mut self,
+        from: Option<Address>,
+        recipients: Vec<SmtpBatchRecipient>,
+        body: &[u8],
+        options: &SendOptions,
+    ) -> Result<SendProgress, (Error, SendProgress)> {
+        match self {
+            Self::Blocking(connection) => {
+                connection.send_smtp_batch(from, recipients, body, options)
+            }
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => {
+                connection
+                    .send_smtp_batch(from, recipients, body, options)
+                    .await
+            }
+        }
+    }
+
+    async fn send_lmtp_batch(
+        &mut self,
+        from: Option<Address>,
+        recipients: Vec<SmtpBatchRecipient>,
+        body: &[u8],
+        options: &SendOptions,
+    ) -> Result<SendProgress, (Error, SendProgress)> {
+        match self {
+            Self::Blocking(connection) => {
+                connection.send_lmtp_batch(from, recipients, body, options)
+            }
+            #[cfg(feature = "tokio")]
+            Self::Async(connection) => {
+                connection
+                    .send_lmtp_batch(from, recipients, body, options)
+                    .await
+            }
+        }
+    }
+
     async fn from_transcript(
         adapter: Adapter,
         transcript: Transcript,
@@ -923,5 +1076,1789 @@ async fn peer_eof_carries_transport_and_actual_body_evidence() {
             assert!(connection.has_broken());
             transcript.assert_exhausted();
         }
+    }
+}
+
+#[tokio::test]
+async fn batch_mail_construction_failure_is_stamped_before_mail_from() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let recipients = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "recipient@example.com".parse().unwrap(),
+        }];
+
+        let Err((error, _progress)) = connection
+            .send_smtp_batch(
+                Some(Address::new_dangerous("sender\r\nRSET", "example.com")),
+                recipients,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+        else {
+            panic!("hostile sender should fail MAIL construction");
+        };
+
+        assert_eq!(error.attempt(), Some(SmtpTransmissionState::Unsent));
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+        assert!(!connection.has_broken(), "validation must precede wire I/O");
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn all_recipient_rejection_resets_every_direct_and_batch_transaction() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        for chunking in [false, true] {
+            let greeting = if chunking {
+                "250-lmtp.example\r\n250 CHUNKING\r\n"
+            } else {
+                "250 lmtp.example\r\n"
+            };
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", greeting)
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let mut connection =
+                Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                    .await
+                    .unwrap();
+            let statuses = if chunking {
+                connection
+                    .send_lmtp_bdat_with_options(&envelope, b"body", &Default::default())
+                    .await
+                    .unwrap()
+            } else {
+                connection.send_lmtp(&envelope, b"body").await.unwrap()
+            };
+            assert_eq!(statuses.len(), 1);
+            assert!(!statuses[0].is_positive());
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+
+        for protocol in [Dialect::Smtp, Dialect::Lmtp] {
+            let hello_command = if protocol == Dialect::Smtp {
+                "EHLO client.example\r\n"
+            } else {
+                "LHLO client.example\r\n"
+            };
+            let transcript = Transcript::new("220 server.example\r\n")
+                .expect(hello_command, "250 server.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let batch = vec![SmtpBatchRecipient {
+                id: BatchItemId("item-0".to_owned()),
+                address: "recipient@example.com".parse().unwrap(),
+            }];
+            let mut connection =
+                Connection::from_transcript(adapter, transcript.clone(), &hello, protocol)
+                    .await
+                    .unwrap();
+            let progress = if protocol == Dialect::Smtp {
+                connection
+                    .send_smtp_batch(
+                        Some("sender@example.com".parse().unwrap()),
+                        batch,
+                        b"body",
+                        &Default::default(),
+                    )
+                    .await
+            } else {
+                connection
+                    .send_lmtp_batch(
+                        Some("sender@example.com".parse().unwrap()),
+                        batch,
+                        b"body",
+                        &Default::default(),
+                    )
+                    .await
+            }
+            .unwrap();
+            assert_eq!(progress.resolve().failed().len(), 1);
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipelined_server_rejections_carry_their_command_phase() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let window = "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "550 sender rejected\r\n250 recipient ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+
+        // RCPT TO rejected.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+
+        // DATA rejected before the body.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::DataCommand));
+    }
+}
+
+/// Finding 2: without PIPELINING, a routine negative reply must be handled
+/// exactly as the pipelined path handles it - RSET (or nothing, for a
+/// rejected MAIL FROM) and a reusable connection - not `abort()`.
+#[tokio::test]
+async fn unpipelined_server_rejections_keep_the_connection_reusable() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mail = "MAIL FROM:<sender@example.com>\r\n";
+        let rcpt = "RCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "550 sender rejected\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // RCPT TO rejected: RSET clears the open transaction.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // DATA rejected before the body: RSET, connection survives.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::DataCommand));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // The BDAT path shares the same envelope runner.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn pipelined_body_failure_carries_data_body_phase() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect_then_close("body", "");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::DataBody));
+    }
+}
+
+fn recipients(count: usize) -> Vec<crate::address::Address> {
+    (0..count)
+        .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+        .collect()
+}
+
+fn recipient_commands(recipients: &[crate::address::Address]) -> String {
+    recipients
+        .iter()
+        .map(|recipient| format!("RCPT TO:<{recipient}>\r\n"))
+        .collect()
+}
+
+/// RFC 5321 4.1.1.4: the terminator's leading CRLF is the message's own
+/// final CRLF. Both adapters must reuse an existing one rather than
+/// appending an empty line the sender never wrote, and the chunked writer
+/// must carry the last two bytes across iterator items so a CRLF
+/// straddling a chunk boundary is still recognized.
+#[tokio::test]
+async fn data_terminator_preserves_exact_message_bytes() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"body\r\n", b".\r\n"),
+            (b"body", b"\r\n.\r\n"),
+            (b"", b"\r\n.\r\n"),
+            (b"body\r", b"\r\n.\r\n"),
+            (b"body\n", b"\r\n.\r\n"),
+        ];
+
+        for &(body, terminator) in cases {
+            let mut transcript =
+                Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+            if !body.is_empty() {
+                transcript = transcript.expect(body, "");
+            }
+            transcript = transcript.expect(terminator, "250 queued\r\n");
+            let mut connection =
+                Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                    .await
+                    .unwrap();
+
+            connection.message(body).await.unwrap();
+            transcript.assert_exhausted();
+        }
+
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("body\r", "")
+            .expect("\n", "")
+            .expect(".\r\n", "250 queued\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        connection
+            .message_iter([b"body\r".as_slice(), b"\n".as_slice()].into_iter())
+            .await
+            .unwrap();
+        transcript.assert_exhausted();
+
+        // `write_body` is the single-buffer writer the LMTP batch path uses,
+        // and it must reuse the caller's final CRLF too. The SIZE declaration
+        // is pinned alongside it so the RFC 1870 count stays honest.
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect(
+                "LHLO client.example\r\n",
+                "250-lmtp.example\r\n250 SIZE 1024\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=6\r\n",
+                "250 sender ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body\r\n", "")
+            .expect(".\r\n", "250 delivered\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "recipient@example.com".parse().unwrap(),
+        }];
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_lmtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body\r\n",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 1);
+        transcript.assert_exhausted();
+
+        // `message_lmtp_iter` is the chunked LMTP writer behind `send_lmtp`.
+        // It carries the same last-two-bytes state, so a CRLF ending the final
+        // chunk is reused rather than duplicated.
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body\r\n", "")
+            .expect(".\r\n", "250 delivered\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+
+        let statuses = connection.send_lmtp(&envelope, b"body\r\n").await.unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].is_positive());
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn pipelining_drains_each_recipient_window_before_writing_the_next() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&recipients[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(32));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", recipients[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        connection.send(&envelope, b"body").await.unwrap();
+        transcript.assert_exhausted();
+    }
+}
+
+/// A 550 followed by a 421 inside one pipelined RCPT window reports the 550
+/// (the first refusal) but still retires the connection, and no RSET is
+/// scripted or written into the channel the peer said it is closing. The
+/// biting assertion on the exact op stream is
+/// `a_421_later_in_an_rcpt_window_aborts_and_reports_the_first_refusal`
+/// in the core tests; this one pins the same exchange through the driver.
+#[tokio::test]
+async fn a_421_after_a_550_in_one_rcpt_window_retires_the_connection() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = recipients(2);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&recipients));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                window,
+                "250 sender ok\r\n550 recipient rejected\r\n421 closing transmission channel\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(550)),
+            "the first refusal is the reported one: {error:?}"
+        );
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn pipelined_batch_keeps_original_indexes_across_a_window_boundary() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&addresses[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        first_replies.push_str("550 recipient rejected\r\n");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", addresses[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let recipients = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                recipients,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "item-31");
+        assert_eq!(outcome.succeeded().last().unwrap().item.0, "item-32");
+        transcript.assert_exhausted();
+    }
+}
+
+/// A real PIPELINING peer answers the whole window in one TCP segment, so
+/// after the MAIL reply is parsed the buffer still holds every RCPT reply.
+/// The window drain must defer the surplus-bytes check to
+/// `finish_reply_group`, exactly like the envelope pipelined path; a per-reply surplus check misreads a healthy exchange as an
+/// unsolicited reply and fails the batch.
+#[tokio::test]
+async fn pipelined_batch_drains_coalesced_window_replies() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(3);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&addresses));
+        let mut replies = "250 sender ok\r\n".to_owned();
+        replies.push_str(&"250 recipient ok\r\n".repeat(3));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect_coalesced(window, replies)
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 3);
+        assert!(outcome.failed().is_empty());
+        assert!(outcome.uncertain().is_empty());
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+}
+
+/// A later recipient window fails to write. `DATA` was never issued, so no
+/// content can have reached the peer: every still-open recipient must land
+/// in the `failed` lane with `Unsent` evidence, and the RCPT rejection the
+/// server already gave must survive. `uncertain` here would be a false
+/// claim that the message might have been delivered.
+#[tokio::test]
+async fn later_window_write_failure_reports_unsent_not_uncertain() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&addresses[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        first_replies.push_str("550 recipient rejected\r\n");
+        // No step for the second window: its write fails at the transport.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies);
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(
+            outcome.uncertain().is_empty(),
+            "DATA was never issued, so nothing may be reported as uncertain"
+        );
+        assert_eq!(outcome.succeeded().len(), 0);
+        assert_eq!(outcome.failed().len(), 33);
+        assert_eq!(outcome.failed()[31].item.0, "item-31");
+    }
+}
+
+#[tokio::test]
+async fn rcpt_reply_read_failure_reports_unsent_not_uncertain() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = [
+            "accepted@example.com",
+            "rejected@example.com",
+            "unanswered@example.com",
+        ]
+        .into_iter()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<accepted@example.com>\r\n", "250 accepted\r\n")
+            .expect("RCPT TO:<rejected@example.com>\r\n", "550 rejected\r\n")
+            .expect("RCPT TO:<unanswered@example.com>\r\n", "");
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 3);
+        assert_eq!(outcome.failed()[1].item.0, "item-1");
+        assert!(outcome.failed()[0].error.scope().is_none());
+        assert!(outcome.failed()[2].error.scope().is_none());
+    }
+}
+
+#[tokio::test]
+async fn lmtp_drains_one_final_status_per_accepted_recipient() {
+    for &adapter in ADAPTERS {
+        for second_status in [250, 550] {
+            let hello = ClientId::Domain("client.example".to_owned());
+            let recipients = vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ];
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect(
+                    "\r\n.\r\n",
+                    format!("250 first delivered\r\n{second_status} second status\r\n"),
+                );
+            let envelope =
+                Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+            let mut connection =
+                Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                    .await
+                    .unwrap();
+            let statuses = connection.send_lmtp(&envelope, b"body").await.unwrap();
+
+            assert_eq!(statuses.len(), 2);
+            assert!(statuses[0].is_positive());
+            assert!(statuses[1].has_code(second_status));
+            // Surplus bytes below the read buffer are undetectable without a
+            // blocking read, so a completed LMTP drain retires the connection.
+            assert!(connection.should_retire());
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+    }
+}
+
+#[tokio::test]
+async fn lmtp_too_few_final_statuses_breaks_the_connection() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 first delivered\r\n");
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+        assert!(connection.send_lmtp(&envelope, b"body").await.is_err());
+        // `has_broken()` after an abort is sharp against the adapter
+        // dropping the `Op::Abort` arm entirely, and only that: it does NOT
+        // bite against removing `abort()`'s own `set_state(Broken)`, because
+        // the shutdown `abort()` also performs sets `Closed`, which fails
+        // `verify()` just as well. The same holds for every abort assertion
+        // through both adapters.
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn lmtp_too_many_final_statuses_breaks_the_connection() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            // One segment: the `BufReader` prefetches the surplus reply along
+            // with the last expected one, which is what production sees.
+            .expect_coalesced(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n250 surplus response\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+        let error = connection
+            .send_lmtp(&envelope, b"body")
+            .await
+            .expect_err("a surplus final status desynchronizes the stream");
+        assert!(
+            error.to_string().contains("more final statuses"),
+            "expected an honest LMTP final-status error, got: {error}"
+        );
+        assert!(connection.has_broken());
+        assert!(connection.should_retire());
+    }
+}
+
+#[tokio::test]
+async fn lmtp_batch_surplus_final_status_retires_the_connection_and_keeps_outcomes() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect_coalesced(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n250 surplus response\r\n",
+            );
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_lmtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        // Both deliveries are known, so the batch result stands; the stream is
+        // what cannot be reused.
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert!(outcome.uncertain().is_empty());
+        assert!(connection.has_broken());
+        assert!(connection.should_retire());
+    }
+}
+
+/// `Op::Abort` is a request until the adapter performs it. The core's
+/// batch `MAIL FROM` rejection asks for one; what has to be true at the
+/// wire afterwards is that the stream can never be handed out again.
+#[tokio::test]
+async fn an_aborting_batch_failure_leaves_the_stream_broken() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        // Nothing follows the rejection: an abort writes no QUIT.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(
+                "MAIL FROM:<sender@example.com>\r\n",
+                "550 sender rejected\r\n",
+            );
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .expect_err("a rejected batch MAIL FROM is a batch-level failure");
+
+        assert!(
+            connection.has_broken(),
+            "an aborted connection must never pass state().verify() again"
+        );
+        assert!(
+            !connection.should_retire(),
+            "retirement is the LMTP drain's flag, not an abort's"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+/// `OpenReplyGroup` holds the stream `Broken` for the whole window and
+/// `CloseReplyGroup` restores it. A rejected pipelined `MAIL FROM` is the
+/// case that proves the restore happens at the close: the window still
+/// drains, no RSET is sent, nothing is aborted, and the connection is
+/// reusable at the end even though the send failed.
+#[tokio::test]
+async fn a_rejected_pipelined_mail_from_restores_the_stream_at_the_group_close() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(2);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&addresses));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect_coalesced(
+                window,
+                "550 sender rejected\r\n250 recipient ok\r\n250 recipient ok\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), addresses).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        connection
+            .send_with_options(&envelope, b"body", &SendOptions::default())
+            .await
+            .expect_err("MAIL FROM was rejected");
+
+        assert!(
+            !connection.has_broken(),
+            "the group close restores a stream whose replies all drained"
+        );
+        assert!(!connection.should_retire());
+        transcript.assert_exhausted();
+    }
+}
+
+/// `CloseLmtpDrain { restore_ok: false }` is the batch LMTP drain, and the
+/// `false` has to reach the wire: unlike a direct LMTP send, a clean batch
+/// drain leaves the stream `Broken` as well as retired.
+#[tokio::test]
+async fn a_clean_lmtp_batch_drain_leaves_the_stream_broken_and_retired() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n",
+            );
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Lmtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_lmtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert!(connection.should_retire());
+        assert!(
+            connection.has_broken(),
+            "an LMTP batch drain never restores the stream"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn send_with_options_pipelines_envelope_parameters_in_one_window() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-FUTURERELEASE 3600\r\n250-DELIVERBY 240\r\n250-MT-PRIORITY\r\n250 DSN\r\n",
+            )
+            .expect(
+                concat!(
+                    "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
+                    "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                    "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                ),
+                "250 sender ok\r\n250 first ok\r\n250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHello", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+
+        let first_recipient: crate::address::Address = "first@example.com".parse().unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                first_recipient.clone(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let options = SendOptions::new()
+            .hold_for(60)
+            .deliver_by(300, DeliverByMode::Return, false)
+            .unwrap()
+            .mt_priority(-1)
+            .unwrap()
+            .dsn_return(DsnReturn::Headers)
+            .envelope_id("env=1")
+            .notify([DsnNotify::Failure, DsnNotify::Delay])
+            .unwrap()
+            .recipient_original_recipient(first_recipient, "rfc822", "alias=first@example.com");
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let response = connection
+            .send_with_options(&envelope, b"Subject: test\r\n\r\nHello", &options)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn pipelined_send_rsets_when_a_recipient_is_rejected() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        // DATA is no longer pipelined, so a rejected RCPT is cleaned up with
+        // RSET before any DATA command is issued, and the connection stays
+        // reusable.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250 SIZE 1024\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=24\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n550 recipient rejected\r\n",
+            )
+            .expect("RSET\r\n", "250 reset ok\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .await
+                .is_err()
+        );
+        assert!(!connection.has_broken());
+        assert!(connection.test_connected().await);
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn explicit_mail_parameters_are_not_duplicated() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\nRCPT TO:<recipient@exämple.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHéllo", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![crate::address::Address::new_dangerous(
+                "recipient",
+                "exämple.com",
+            )],
+        )
+        .unwrap();
+        let options = SendOptions::new()
+            .mail_parameter(MailParameter::SmtpUtfEight)
+            .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let response = connection
+            .send_with_options(&envelope, "Subject: test\r\n\r\nHéllo".as_bytes(), &options)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn batch_eai_recipient_requires_smtputf8_before_mail_from() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: crate::address::Address::new_dangerous("üser", "example.com"),
+        }];
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        let (error, _) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect_err("EAI recipient must be rejected before MAIL FROM");
+
+        assert!(error.to_string().contains("SMTPUTF8"));
+        assert!(connection.test_connected().await);
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn hostile_unchecked_sender_never_reaches_the_wire() {
+    for &adapter in ADAPTERS {
+        // `is_err()` alone would hold even without the guard, because the
+        // transcript has no expectation for the smuggled `MAIL FROM` and would
+        // fail the write instead. The load-bearing assertions are that nothing
+        // was written and the connection is still clean.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 ok\r\n");
+        let envelope = Envelope::new(
+            Some(crate::address::Address::new_dangerous(
+                "sender\r\nRSET",
+                "example.com",
+            )),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .await
+                .is_err()
+        );
+        assert!(
+            !connection.has_broken(),
+            "a rejected sender must not break the connection"
+        );
+        assert!(
+            connection.test_connected().await,
+            "the connection stays reusable"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn hostile_unchecked_recipient_leaves_no_open_transaction() {
+    for &adapter in ADAPTERS {
+        // The sender is well-formed, so validation cannot short-circuit before
+        // `MAIL FROM` for the reason the sender test covers. What must hold is
+        // that the recipient is rejected while the connection is still clean:
+        // no `MAIL FROM` on the wire, no abort needed, and the connection is
+        // still usable afterwards rather than being pooled mid-transaction.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "good@example.com".parse().unwrap(),
+                crate::address::Address::new_dangerous("hostile\r\nRSET", "example.com"),
+            ],
+        )
+        .unwrap();
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .await
+                .is_err()
+        );
+        assert!(
+            !connection.has_broken(),
+            "a rejection before MAIL FROM must not break the connection"
+        );
+        assert!(
+            connection.test_connected().await,
+            "the connection must still be reusable, not stranded in a transaction"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn send_bdat_uses_chunking_without_dot_stuffing() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let message = b"Subject: test\r\n\r\n.Line\r\nBinary\0";
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-CHUNKING\r\n250 BINARYMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> BODY=BINARYMIME\r\n",
+                "250 sender ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect(format!("BDAT {} LAST\r\n", message.len()), "")
+            // The leading dot is transmitted verbatim: BDAT is length-framed,
+            // so dot-stuffing would corrupt the body.
+            .expect(message, "250 queued\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let options =
+            SendOptions::new().mail_parameter(MailParameter::Body(MailBodyParameter::BinaryMime));
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let response = connection
+            .send_bdat_with_options(&envelope, message, &options)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+}
+
+/// The peer closes right after accepting `DATA`. The body write fails, so
+/// the message may or may not have been seen: every recipient must land in
+/// the `uncertain` lane, never `succeeded`.
+#[tokio::test]
+async fn peer_closing_after_the_data_command_leaves_recipients_uncertain() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect_then_close("DATA\r\n", "354 send body\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("a mid-body drop is a per-recipient outcome, not a batch-level error")
+            .resolve();
+
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.uncertain().len(), 1);
+        assert_eq!(outcome.uncertain()[0].item.0, "item-0");
+        assert!(connection.has_broken());
+    }
+}
+
+/// DSN RCPT parameters are refused before `MAIL FROM` when the server did
+/// not advertise DSN. The refusal must be local: no envelope byte may hit
+/// the wire, so the transaction can be retried on the same connection.
+#[tokio::test]
+async fn dsn_rcpt_parameters_are_refused_before_any_envelope_byte() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["first@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let options = SendOptions::new().notify([DsnNotify::Failure]).unwrap();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let error = connection
+            .send_with_options(&envelope, b"body", &options)
+            .await
+            .expect_err("DSN parameters must not be emitted to a server without DSN");
+        assert!(
+            error.to_string().contains("require server DSN support"),
+            "expected a local DSN refusal, got: {error}"
+        );
+        // A server that lacks the extension the request needs: `Unsupported`,
+        // not the caller's malformed input, per the local-refusal rule in
+        // `reference/error-model.md`.
+        assert_eq!(
+            error.kind(),
+            &crate::transport::smtp::error::ErrorKind::FeatureUnsupported
+        );
+
+        // Nothing was written: the next scripted step is still NOOP.
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .await
+            .unwrap();
+        transcript.assert_exhausted();
+    }
+}
+
+/// Recipient-specific parameters are keyed by address. A parameter naming
+/// an address that is not in the batch is a caller bug and must be caught
+/// before `MAIL FROM`, never silently dropped.
+#[tokio::test]
+async fn batch_rcpt_parameters_for_an_unknown_recipient_fail_before_mail_from() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let options = SendOptions::new()
+            .recipient_notify("stranger@example.com".parse().unwrap(), [DsnNotify::Never])
+            .unwrap();
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let (error, progress) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .await
+            .expect_err("unmatched recipient parameters are a pre-wire input error");
+        assert!(
+            error
+                .to_string()
+                .contains("do not match an envelope recipient"),
+            "expected an unmatched-recipient refusal, got: {error}"
+        );
+        let outcome = progress.resolve();
+        assert!(outcome.succeeded().is_empty());
+
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .await
+            .unwrap();
+        transcript.assert_exhausted();
+    }
+}
+
+/// Per-recipient DSN parameters override the uniform ones on the matching
+/// RCPT line only, and the batch path emits the same wire shape as the
+/// envelope path. Sequential (non-PIPELINING) peer, so each RCPT line is
+/// pinned as its own write.
+#[tokio::test]
+async fn batch_rcpt_options_are_emitted_per_recipient_in_order() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<first@example.com> NOTIFY=NEVER ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                "250 first ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                "250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let first: crate::address::Address = "first@example.com".parse().unwrap();
+        let options = SendOptions::new()
+            .notify([DsnNotify::Failure, DsnNotify::Delay])
+            .unwrap()
+            .recipient_never_notify(first.clone())
+            .recipient_original_recipient(first.clone(), "rfc822", "alias=first@example.com");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .await
+            .expect("the transaction completes")
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
+        transcript.assert_exhausted();
+    }
+}
+
+/// A negative reply to the end-of-data terminator is an ANSWER, not a
+/// transport failure: the server read the whole message and refused it, so
+/// the transaction is complete (RFC 5321 4.1.1.4), every accepted
+/// recipient is a `failed` lane classified under `DataFinal`, and the
+/// connection stays reusable. Routing it through the `Failed` arm put the
+/// recipients in `uncertain` (asking the caller to reconcile a delivery the
+/// server explicitly refused) and threw away a healthy connection.
+#[tokio::test]
+async fn a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection() {
+    for &adapter in ADAPTERS {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(outcome.succeeded().is_empty());
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) })
+        ));
+        // An SMTP 5xx is permanent (RFC 5321 4.2.1). Before the protocol-aware
+        // row in `derive_server` this lane derived `Retry(SameRequest)` - an
+        // instruction to resend the whole body to a server that had just
+        // permanently refused it.
+        assert_eq!(
+            outcome.failed()[0].error.recovery(),
+            &bifrost_types::RecoveryClass::ProviderRefused,
+            "a permanent SMTP refusal must not be advice to resend"
+        );
+        assert!(
+            !connection.has_broken(),
+            "the transaction completed; the connection is still clean"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+/// The direct path takes the same rule: a refused message on an answered
+/// transaction is a status error on a reusable connection, not an abort.
+#[tokio::test]
+async fn a_rejected_data_final_reply_keeps_the_direct_connection_reusable() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(554));
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::DataFinal));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+}
+
+/// The end-of-data completion rule is RFC 5321's, and it is about DATA.
+/// `BDAT ... LAST` reaches the same `FinalReply` stage, but RFC 3030
+/// promises nothing about the transaction after a refused chunk - its own
+/// failure example sends RSET after the negative reply - so a strict peer
+/// may still consider the transaction open. Finishing without a reset
+/// parked such a connection `Ok`, and the next checkout's `MAIL FROM`
+/// landed inside a live transaction. RSET-and-keep instead: the reset must
+/// appear on the wire and the connection survives only because the peer
+/// acknowledged it.
+#[tokio::test]
+async fn a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("BDAT 4 LAST\r\n", "")
+            .expect("body", "452 4.3.1 out of storage\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(452));
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::BdatBody));
+        assert!(
+            !connection.has_broken(),
+            "the peer acknowledged the reset, so the connection is reusable"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+/// A rejected end-of-data reply keeps the connection - unless the peer
+/// said it is going away. 421 is "closing transmission channel", so
+/// parking it would hand the next checkout a dead socket. The status
+/// error is still what the caller sees.
+#[tokio::test]
+async fn a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(421));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a reusable connection"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+/// The batch machine takes the same 421 rule, and it is the path that
+/// matters most: `send_smtp_batch` is the account-level send, so a
+/// connection parked after the peer announced it is closing goes back
+/// into the pool, and the next checkout under `test_on_checkout(false)`
+/// writes `MAIL FROM` into a dead socket. The lanes still resolve from
+/// the answer - `DataFinal` `failed`, never `uncertain` - only the
+/// connection is retired.
+#[tokio::test]
+async fn a_421_data_final_reply_aborts_the_batch_connection_too() {
+    for &adapter in ADAPTERS {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript.clone(), &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+        ));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a poolable connection"
+        );
+        transcript.assert_exhausted();
+    }
+}
+
+#[tokio::test]
+async fn pipelined_rcpt_reply_read_failure_reports_unsent_not_uncertain() {
+    for &adapter in ADAPTERS {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = (0..32)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect();
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.extend(
+            addresses
+                .iter()
+                .map(|recipient| format!("RCPT TO:<{recipient}>\r\n")),
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                window,
+                "250 sender ok\r\n250 first accepted\r\n550 second rejected\r\n",
+            );
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            Connection::from_transcript(adapter, transcript, &hello, Dialect::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 32);
+        assert_eq!(outcome.failed()[1].item.0, "item-1");
     }
 }

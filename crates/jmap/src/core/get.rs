@@ -162,3 +162,6 @@ impl<O: Object> GetResponse<O> {
         self.not_found
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

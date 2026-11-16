@@ -1173,3 +1173,6 @@ mod mail_capability_tests {
         assert_eq!(empty.max_mailbox_depth(), None);
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

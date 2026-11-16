@@ -751,49 +751,43 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         }
         Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit { size, limit }) => {
             Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
+                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                Cause::Request(RequestCause::PayloadTooLarge {
                     detail: DiagnosticText::support_only(format!(
                         "message size {size} exceeds server APPENDLIMIT of {limit}"
                     )),
                 }),
             )
         }
+        // These budgets protect the implementation's retained results. An
+        // Outlook user did not submit malformed data by opening a large mail.
         Error::ResultLimit(crate::error::ResultLimit::Fetch {
             estimated, limit, ..
         }) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(format!(
-                        "FETCH estimated size {estimated} exceeds caller budget {limit}"
-                    )),
-                }),
+            let mut t = internal(
+                InternalErrorKind::LimitExceeded,
+                format!("FETCH estimated size {estimated} exceeds caller budget {limit}"),
             );
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
         Error::ResultLimit(crate::error::ResultLimit::FetchLiteral { estimated, limit }) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(format!(
-                        "FETCH literal bytes {estimated} exceed caller budget {limit}"
-                    )),
-                }),
+            let mut t = internal(
+                InternalErrorKind::LimitExceeded,
+                format!("FETCH literal bytes {estimated} exceed caller budget {limit}"),
             );
-            t.attempt = Some(TransmissionState::Acknowledged);
+            // The literal was refused before its bytes and tagged completion
+            // were read; no complete server answer has been acknowledged.
+            t.attempt = Some(TransmissionState::InFlight);
             t
         }
         Error::ResultLimit(crate::error::ResultLimit::SearchTruncated { returned, omitted }) => {
-            let mut t = Translation::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only(format!(
-                        "UID SEARCH result exceeded the local expansion limit after {returned} IDs; \
+            let mut t = internal(
+                InternalErrorKind::LimitExceeded,
+                format!(
+                    "UID SEARCH result exceeded the local expansion limit after {returned} IDs; \
                          omitted {omitted:?}"
-                    )),
-                }),
+                ),
             );
             // The server answered the search. The account boundary must not
             // return a partial Page as a successful result.
@@ -856,8 +850,8 @@ fn classify_sieve(
         // Deleting or overwriting the active script. A precondition the
         // caller must satisfy (deactivate first), not a server fault.
         Some(Sc::Active) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+            Cause::Request(RequestCause::PreconditionFailed {
                 detail: DiagnosticText::support_only(
                     "ManageSieve refused the operation on the ACTIVE script",
                 ),
@@ -1160,8 +1154,8 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::MaxConvertMessages(_)
         | ResponseCode::MaxConvertParts(_)
         | ResponseCode::MetadataMaxSize(_) => Translation::new(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(
                     ImapResponseCode::from(code).code().to_owned(),
                 ),
@@ -1372,15 +1366,19 @@ pub(super) fn concurrency_conflict_error(
     .expect("valid account error classification")
 }
 
-/// Build a generic `Request(Malformed)` for UIDVALIDITY mismatch before mutation.
+/// Refuse a stale-epoch target before access. An Outlook user must refresh
+/// the target; retrying its old UID could modify a different message. This is
+/// a failed precondition, not malformed input or a retryable concurrency race.
 pub(super) fn uidvalidity_changed_error(
     operation: AccountOperation,
     folder: &MailboxName,
 ) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("UIDVALIDITY changed before mutation"),
+        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+        Cause::Request(RequestCause::PreconditionFailed {
+            detail: DiagnosticText::support_only(
+                "target UIDVALIDITY no longer matches the selected mailbox",
+            ),
         }),
     )
     .protocol(Protocol::Imap)
@@ -1430,22 +1428,7 @@ pub(super) fn finish_partial(
 }
 
 pub(super) fn hydration_uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("UIDVALIDITY changed before hydration"),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::Hydrate)
-    // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder producers'
-    // documented scope shape, so scope readers matching one shape do not
-    // silently degrade (mutate.rs builds the identical condition this way).
-    .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-    ))
-    .try_build()
-    .expect("valid account error classification")
+    uidvalidity_changed_error(AccountOperation::Hydrate, folder)
 }
 
 pub(super) fn message_not_found_error(id: &super::envelope::DecodedObjectId) -> AccountError {
@@ -1511,6 +1494,24 @@ pub(super) fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -
 /// The server answered, so the attempt is `Acknowledged`.
 pub(super) fn expunged_message(id: bifrost_types::ObjectId) -> AccountError {
     fetched_message_not_found(&id, AccountOperation::HydrateMessage)
+}
+
+/// Deleting a non-empty mailbox needs an explicit caller decision. An Outlook
+/// user expects to empty it first, not a bug report or an automatic retry.
+pub(super) fn non_empty_mailbox(folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+        Cause::Request(RequestCause::PreconditionFailed {
+            detail: DiagnosticText::support_only("refusing to delete non-empty IMAP mailbox"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::ContainerDelete)
+    .scope(ErrorScope::Cursor(CursorScope::Folder(
+        bifrost_types::FolderId(folder.account_id()),
+    )))
+    .try_build()
+    .expect("valid mailbox precondition classification")
 }
 
 /// Build a `Request(Malformed)` `AccountError` for local PIM failures
@@ -1657,17 +1658,7 @@ pub(super) fn schema_incompatible(detail: &str) -> AccountError {
 
 /// A raw read refused because the selected mailbox changed epoch.
 pub(super) fn raw_uidvalidity_changed(folder: &MailboxName) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
-        }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(AccountOperation::OpenRawRfc822)
-    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
-    .try_build()
-    .expect("valid account error classification")
+    uidvalidity_changed_error(AccountOperation::OpenRawRfc822, folder)
 }
 
 pub(super) fn search_folders_conflict(

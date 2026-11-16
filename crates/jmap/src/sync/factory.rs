@@ -714,7 +714,7 @@ async fn seed_foreign_account<T: HttpTransport>(
 /// The installer is generic over transport so tests probe and inspect the real slot.
 fn foreign_seed_slot<T: HttpTransport>(
     mail: JmapMailAccount<T>,
-    limits: capabilities::CoreLimits,
+    limits: capabilities::ObjectLimits,
     seed: ForeignSeed,
     submission: bool,
 ) -> Slot<T> {
@@ -807,15 +807,11 @@ async fn batched_open_probes<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<Option<OpenProbeResponses>> {
     let session = mail.client().session();
-    // A session with no advertised core capability tells us nothing
-    // about its limits, and `capabilities::build` rejects it later in
-    // open anyway. Take the conservative shape rather than guessing.
-    let Some(core) = session.core_capabilities() else {
-        return Ok(None);
-    };
-    // An omitted call/size limit is not a licence to batch: the server
-    // told us nothing, and the conservative shape is one call per request.
-    let (Some(max_calls), Some(max_size)) = (core.max_calls_in_request(), core.max_size_request())
+    // Opening validates before probes. Bare protocol tests can still reach
+    // this helper with an incomplete session, so batch only known bounds.
+    let limits = session.core_limits();
+    let (Some(max_calls), Some(max_size)) =
+        (limits.max_calls_in_request(), limits.max_size_request())
     else {
         return Ok(None);
     };
@@ -2028,9 +2024,9 @@ mod tests {
         let owner = Some(bifrost_types::PrincipalId("shared".to_string()));
         let mut stream = crate::sync::inventory::stream(
             shared,
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 4,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             scope,
             owner,
@@ -2116,9 +2112,9 @@ mod tests {
             .expect("primary mail account");
         let mut stream = crate::sync::inventory::stream(
             primary,
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 4,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             CursorScope::Type(ObjectType::Email),
             None,
@@ -2189,9 +2185,9 @@ mod tests {
             .expect("primary mail account");
         let mut stream = crate::sync::inventory::stream(
             primary,
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 4,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             CursorScope::Type(ObjectType::Email),
             None,
@@ -2253,9 +2249,9 @@ mod tests {
             .expect("primary mail account");
         let mut stream = crate::sync::inventory::stream_partition(
             primary,
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 99,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(99).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             CursorScope::Type(ObjectType::Email),
             bifrost_types::InventoryPartition::Page(
@@ -2321,9 +2317,9 @@ mod tests {
             .expect("primary mail account");
         let mut stream = crate::sync::inventory::stream_partition(
             primary,
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 99,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(99).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             CursorScope::Type(ObjectType::Email),
             bifrost_types::InventoryPartition::Page(
@@ -2383,9 +2379,9 @@ mod tests {
         let owner = bifrost_types::PrincipalId("shared".to_string());
         let mut stream = crate::sync::inventory::stream(
             crate::account::Account::new(client.clone(), JmapAccountId::new("shared")),
-            super::capabilities::CoreLimits {
-                max_objects_in_get: 4,
-                max_objects_in_set: 4,
+            super::capabilities::ObjectLimits {
+                max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+                max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
             },
             CursorScope::Folder(foreign::encode_foreign_account("shared")),
             Some(owner.clone()),
@@ -2460,9 +2456,9 @@ mod tests {
                     primary,
                     Arc::new(HashMap::from([("shared".into(), shared)])), // A batch bound of one forces the per-owner flush path
                     // rather than a single end-of-input drain.
-                    super::capabilities::CoreLimits {
-                        max_objects_in_get: 1,
-                        max_objects_in_set: 1,
+                    super::capabilities::ObjectLimits {
+                        max_objects_in_get: std::num::NonZeroUsize::new(1).unwrap(),
+                        max_objects_in_set: std::num::NonZeroUsize::new(1).unwrap(),
                     }, // Deliberately empty: a skip must not consult, probe, or
                     // populate the Email-state cache.
                     crate::sync::state_cache::seeded(std::collections::HashMap::new()),
@@ -2518,9 +2514,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 Arc::new(HashMap::from([("shared".into(), shared)])),
-                super::capabilities::CoreLimits {
-                    max_objects_in_get: 1,
-                    max_objects_in_set: 1,
+                super::capabilities::ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(1).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(1).unwrap(),
                 },
                 states,
             )),
@@ -2654,9 +2650,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 Arc::new(HashMap::from([("shared".into(), shared)])),
-                super::capabilities::CoreLimits {
-                    max_objects_in_get: 1,
-                    max_objects_in_set: 1,
+                super::capabilities::ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(1).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(1).unwrap(),
                 },
                 states,
             )),
@@ -2740,9 +2736,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 Arc::new(HashMap::from([("shared".into(), shared)])),
-                super::capabilities::CoreLimits {
-                    max_objects_in_get: 1,
-                    max_objects_in_set: 1,
+                super::capabilities::ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(1).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(1).unwrap(),
                 },
                 states,
             )),
@@ -2834,9 +2830,9 @@ mod tests {
             std::sync::Arc::new(crate::sync::registry::Registry::from_test_states(
                 primary,
                 Arc::new(HashMap::from([("shared".into(), shared)])),
-                super::capabilities::CoreLimits {
-                    max_objects_in_get: 1,
-                    max_objects_in_set: 2,
+                super::capabilities::ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(1).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(2).unwrap(),
                 },
                 states,
             )),
@@ -3367,9 +3363,9 @@ mod tests {
                     primary,
                     state_map(&[("primary", "s1")]),
                 );
-                slot.limits = super::capabilities::CoreLimits {
-                    max_objects_in_get: 4,
-                    max_objects_in_set: 4,
+                slot.limits = super::capabilities::ObjectLimits {
+                    max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+                    max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
                 };
                 slot
             },
@@ -3410,9 +3406,9 @@ mod tests {
     /// drops every backfill checkpoint and forces a full re-hydration.
     #[tokio::test]
     async fn a_mis_keyed_cursor_restarts_its_scope_instead_of_reseeding_the_account() {
-        let limits = super::capabilities::CoreLimits {
-            max_objects_in_get: 4,
-            max_objects_in_set: 4,
+        let limits = super::capabilities::ObjectLimits {
+            max_objects_in_get: std::num::NonZeroUsize::new(4).unwrap(),
+            max_objects_in_set: std::num::NonZeroUsize::new(4).unwrap(),
         };
         let scope = CursorScope::Type(ObjectType::Email);
 

@@ -18,6 +18,7 @@ pub mod ingress;
 pub mod reconciler;
 pub mod subscription;
 pub(crate) mod supervisor;
+mod teardown;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};

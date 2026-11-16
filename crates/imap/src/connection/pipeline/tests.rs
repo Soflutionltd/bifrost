@@ -6,6 +6,31 @@ use super::*;
 use crate::error::Error;
 use crate::types::{Capability, SequenceSet};
 
+#[tokio::test]
+async fn typed_list_pipeline_returns_the_consumer_value() {
+    use crate::connection::test_support;
+    let (conn, mut peer) =
+        test_support::driver_pair(&test_support::preauth_greeting("IMAP4rev1")).await;
+    let request = conn
+        .pipeline()
+        .list(String::new(), "*".into())
+        .execute(std::time::Duration::from_secs(1));
+    let script = async {
+        let line = test_support::read_line(&mut peer).await;
+        test_support::respond(
+            &mut peer,
+            &format!(
+                "* LIST () \"/\" INBOX\r\n{} OK listed\r\n",
+                test_support::tag_of(&line)
+            ),
+        )
+        .await;
+    };
+    let (result, ()) = tokio::join!(request, script);
+    let (mailboxes,) = result.unwrap();
+    assert_eq!(mailboxes.unwrap()[0].name.as_str(), "INBOX");
+}
+
 /// Verify that a 2-command pipeline builds correctly at the type level.
 ///
 /// The test constructs a `Pipeline` with `noop` then `capability` but

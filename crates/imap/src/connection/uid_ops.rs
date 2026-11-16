@@ -21,14 +21,12 @@ impl ImapConnection {
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.fetch_impl(
-            Command::UidFetch {
+        self.execute_request(
+            super::request::UidFetch {
                 sequence_set: sequence_set.clone(),
                 items: items.to_vec().into(),
                 changed_since: None,
-                vanished: false,
             },
-            None,
             timeout,
         )
         .await
@@ -45,14 +43,12 @@ impl ImapConnection {
         mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.fetch_impl(
-            Command::UidFetch {
+        self.execute_request(
+            super::request::UidFetch {
                 sequence_set: sequence_set.clone(),
                 items: items.to_vec().into(),
                 changed_since: Some(mod_seq),
-                vanished: false,
             },
-            Some(mod_seq),
             timeout,
         )
         .await
@@ -85,24 +81,6 @@ impl ImapConnection {
         Ok((rx, fut))
     }
 
-    /// Shared implementation for FETCH and UID FETCH (RFC 3501 Section 6.4.5).
-    ///
-    /// When `changed_since` is `Some`, validates that the server supports
-    /// CONDSTORE (RFC 7162 Section 3.1.4) before issuing the command.
-    pub(super) async fn fetch_impl(
-        &self,
-        cmd: Command,
-        _changed_since: Option<crate::types::ModSeq>,
-        timeout: Duration,
-    ) -> Result<Vec<FetchResponse>, Error> {
-        self.submit_regular(
-            cmd,
-            dispatch::FetchConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
-    }
-
     /// UID FETCH with CHANGEDSINCE and VANISHED modifiers (RFC 7162 Section 3.2.6).
     ///
     /// Issues `UID FETCH <set> (<items>) (CHANGEDSINCE <mod_seq> VANISHED)`.
@@ -132,19 +110,13 @@ impl ImapConnection {
         // Parse the requested set for defensive filtering of VANISHED (EARLIER)
         // UIDs. Returns None when the set contains `$` (RFC 5182), in which case
         // filtering is skipped inside the consumer.
-        let parsed_set = UidSet::from_expression(sequence_set);
-        let cmd = Command::UidFetch {
+        let cmd = super::request::UidFetchWithVanished {
             sequence_set: sequence_set.clone(),
             items: items.to_vec().into(),
             changed_since: Some(mod_seq),
             vanished: true,
         };
-        self.submit_regular(
-            cmd,
-            dispatch::FetchVanishedConsumer::new(parsed_set),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// UID FETCH with CHANGEDSINCE and VANISHED as a bounded stream.
@@ -328,26 +300,8 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.into();
-        self.search_impl(Command::UidSearch { criteria }, "UID SEARCH", timeout)
+        self.execute_request(super::request::UidSearch { criteria }, timeout)
             .await
-    }
-
-    /// Shared implementation for SEARCH and UID SEARCH (RFC 3501 Section 6.4.4).
-    pub(super) async fn search_impl<I: crate::types::search::SearchAddress>(
-        &self,
-        cmd: Command,
-        _label: &str,
-        timeout: Duration,
-    ) -> Result<SearchResult<I>, Error> {
-        // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
-        // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
-        self.check_utf8_only_enforced()?;
-        self.submit_regular(
-            cmd,
-            dispatch::SearchConsumer::<I>::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
     }
 
     /// UID SEARCH with RETURN options (RFC 4731 Section 3.2).
@@ -367,40 +321,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
         let criteria = criteria.into();
-        self.search_esearch_impl(
-            Command::UidSearchReturn {
+        self.execute_request(
+            super::request::UidSearchReturn {
                 criteria,
                 return_opts: return_opts.iter().map(|s| (*s).into()).collect(),
             },
-            "UID SEARCH RETURN",
             timeout,
-        )
-        .await
-    }
-
-    /// Shared implementation for SEARCH RETURN and UID SEARCH RETURN
-    /// (RFC 4731 Section 3.2).
-    ///
-    /// Requires the server to advertise the `ESEARCH` capability, or to be
-    /// running `IMAP4rev2` (RFC 9051 Section 6.4.4).
-    pub(super) async fn search_esearch_impl(
-        &self,
-        cmd: Command,
-        _label: &str,
-        timeout: Duration,
-    ) -> Result<EsearchResponse, Error> {
-        // RFC 6855 Section 6: ESEARCH is an extended SEARCH form and uses the
-        // same free-form criteria strings, so it must honor UTF8=ONLY too.
-        self.check_utf8_only_enforced()?;
-
-        // RFC 5182 Section 2 extends SEARCH RETURN with the SAVE result option.
-        // Generic ESEARCH callers can request SAVE through return_opts, so
-        // SEARCHRES remains mandatory unless IMAP4rev2 folds it into the base
-        // protocol (RFC 9051 Appendix E).
-        self.submit_regular(
-            cmd,
-            dispatch::EsearchConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
         )
         .await
     }
@@ -424,33 +350,14 @@ impl ImapConnection {
         // is not valid in STORE flag lists. Filter them out before encoding,
         // consistent with append() (RFC 3501 Section 6.3.11).
         let filtered_flags = filter_store_flags(flags);
-        self.store_impl(
-            Command::UidStore {
+        self.execute_request(
+            super::request::UidStore {
                 sequence_set: sequence_set.clone(),
                 operation,
                 flags: filtered_flags,
                 unchanged_since,
             },
-            unchanged_since,
             timeout,
-        )
-        .await
-    }
-
-    /// Shared implementation for STORE and UID STORE (RFC 3501 Section 6.4.6).
-    ///
-    /// Validates session state, optionally checks CONDSTORE, executes the
-    /// command, and collects the resulting FETCH responses and response code.
-    pub(super) async fn store_impl(
-        &self,
-        cmd: Command,
-        unchanged_since: Option<crate::types::ModSeqValzer>,
-        timeout: Duration,
-    ) -> Result<StoreResult, Error> {
-        self.submit_regular(
-            cmd,
-            dispatch::StoreConsumer::new(unchanged_since),
-            Some(tokio::time::Instant::now() + timeout),
         )
         .await
     }
@@ -493,8 +400,8 @@ impl ImapConnection {
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
         if has_move {
             let mbox = mailbox.mailbox_name()?;
-            self.move_native_impl(
-                Command::UidMove {
+            self.execute_request(
+                super::request::UidMove {
                     sequence_set: sequence_set.clone(),
                     mailbox: mbox,
                 },
@@ -558,23 +465,6 @@ impl ImapConnection {
         }
     }
 
-    /// Shared implementation for the native MOVE path used by both
-    /// `move_messages()` and `uid_move_messages()` (RFC 6851 Section 3).
-    ///
-    /// Executes the MOVE command and collects EXPUNGE/VANISHED responses.
-    pub(super) async fn move_native_impl(
-        &self,
-        cmd: Command,
-        timeout: Duration,
-    ) -> Result<MoveResult, Error> {
-        self.submit_regular(
-            cmd,
-            dispatch::MoveConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
-    }
-
     /// UID COPY (RFC 3501 Section 6.4.7, RFC 4315 Section 3).
     ///
     /// On success, returns a [`CopyResult`] carrying the tagged OK's response
@@ -588,30 +478,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
         let mbox = mailbox.mailbox_name()?;
-        self.copy_impl(
-            Command::UidCopy {
+        self.execute_request(
+            super::request::UidCopy {
                 sequence_set: sequence_set.clone(),
                 mailbox: mbox,
             },
             timeout,
-        )
-        .await
-    }
-
-    /// Shared implementation for COPY and UID COPY (RFC 3501 Section 6.4.7,
-    /// RFC 4315 Section 3).
-    ///
-    /// On success, returns a [`CopyResult`]; see [`uid_copy`](Self::uid_copy).
-    pub(super) async fn copy_impl(
-        &self,
-        cmd: Command,
-        timeout: Duration,
-    ) -> Result<CopyResult, Error> {
-        self.check_utf8_only_enforced()?;
-        self.submit_regular(
-            cmd,
-            dispatch::CopyConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
         )
         .await
     }
@@ -622,40 +494,28 @@ impl ImapConnection {
         sequence_set: &SequenceSet,
         timeout: Duration,
     ) -> Result<ExpungeResult, Error> {
-        let cmd = self.uid_expunge_command(sequence_set)?;
-        self.submit_regular(
-            cmd,
-            dispatch::ExpungeConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
+        self.execute_request(
+            super::request::UidExpunge {
+                sequence_set: sequence_set.clone(),
+            },
+            timeout,
         )
         .await
     }
 
-    /// UID EXPUNGE that also returns the tagged OK's response code, for the
-    /// UID MOVE fallback: under QRESYNC that is the source mailbox's new
-    /// `HIGHESTMODSEQ` (RFC 7162), the counterpart of the native MOVE's
-    /// tagged code.
+    /// Preserve the tagged code for the MOVE fallback's final HIGHESTMODSEQ.
     async fn uid_expunge_with_code(
         &self,
         sequence_set: &SequenceSet,
         timeout: Duration,
     ) -> Result<(ExpungeResult, Option<ResponseCode>), Error> {
-        let cmd = self.uid_expunge_command(sequence_set)?;
-        self.submit_regular(
-            cmd,
-            dispatch::ExpungeConsumer::with_tagged_code(),
-            Some(tokio::time::Instant::now() + timeout),
+        self.execute_request(
+            super::request::UidExpungeWithCode {
+                sequence_set: sequence_set.clone(),
+            },
+            timeout,
         )
         .await
-    }
-
-    /// The local admission checks for UID EXPUNGE, then the command.
-    fn uid_expunge_command(&self, sequence_set: &SequenceSet) -> Result<Command, Error> {
-        let command = Command::UidExpunge {
-            sequence_set: sequence_set.clone(),
-        };
-        self.admit_command(&command)?;
-        Ok(command)
     }
 
     /// EXPUNGE (RFC 3501 Section 6.4.3 / RFC 7162 Section 3.2.10).
@@ -666,12 +526,8 @@ impl ImapConnection {
     /// connection receives for a mailbox with persistent mod-sequences, RFC
     /// 7162 Section 3.2.10).
     pub async fn expunge(&self, timeout: Duration) -> Result<ExpungeResult, Error> {
-        self.submit_regular(
-            Command::Expunge,
-            dispatch::ExpungeConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(super::request::Expunge {}, timeout)
+            .await
     }
 }
 

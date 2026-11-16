@@ -11,11 +11,11 @@ use bifrost_types::{
 
 use crate::core::session::Session;
 
-pub(crate) use crate::core::session::CoreLimits;
+pub(crate) use crate::core::session::ObjectLimits;
 
 /// Bare protocol handles use the protocol-owned session interpretation.
 pub(super) fn max_objects_in_get(session: &Session) -> usize {
-    session.object_limits().max_objects_in_get
+    session.object_limits().max_objects_in_get.get()
 }
 
 /// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
@@ -65,8 +65,8 @@ pub(crate) struct PimSupport {
 /// stays in `build`.
 ///
 /// `build` calls this too, so the refusal does not depend on the caller
-/// having run it first; running it twice is pure session reads.
-pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountError> {
+/// having run it first; repeated calls read the cached core validation result.
+pub(crate) fn validate_session(session: &Session) -> Result<ObjectLimits, AccountError> {
     // Validate before seeding (factory::validate_and_seed), not after probes.
     // Keep account error classification at the error boundary: rejecting every bad core block
     // as a generic protocol error during SessionState derivation would erase
@@ -95,8 +95,8 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
 pub(crate) fn build(
     session: &Session,
     support: PimSupport,
-) -> Result<(AccountCapabilities, CoreLimits), AccountError> {
-    let CoreLimits {
+) -> Result<(AccountCapabilities, ObjectLimits), AccountError> {
+    let ObjectLimits {
         max_objects_in_get,
         max_objects_in_set,
     } = validate_session(session)?;
@@ -128,7 +128,7 @@ pub(crate) fn build(
         }
     };
 
-    let max_items = set_batch_size(max_objects_in_set);
+    let max_items = set_batch_size(max_objects_in_set.get());
     let caps = AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         // The existing JMAP transport exposes whole-blob downloads only.
@@ -250,7 +250,7 @@ pub(crate) fn build(
         discovers_foreign_namespaces_on_rediscovery: true,
     };
 
-    let limits = CoreLimits {
+    let limits = ObjectLimits {
         max_objects_in_get,
         max_objects_in_set,
     };
@@ -357,8 +357,8 @@ mod tests {
         assert!(caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.set_importance);
         assert!(caps.discovers_foreign_namespaces_on_rediscovery);
-        assert_eq!(limits.max_objects_in_get, 256);
-        assert_eq!(limits.max_objects_in_set, 700);
+        assert_eq!(limits.max_objects_in_get.get(), 256);
+        assert_eq!(limits.max_objects_in_set.get(), 700);
     }
 
     /// "Core limits zero" is a `Protocol(ContractViolation)`,
@@ -614,7 +614,7 @@ mod tests {
             );
             // The raw limit is passed through unclamped: it sizes the
             // per-request `/set` call, not the engine's batch window.
-            assert_eq!(limits.max_objects_in_set, advertised);
+            assert_eq!(limits.max_objects_in_set.get(), advertised);
         }
     }
 
@@ -910,7 +910,7 @@ mod tests {
         let (caps, limits) =
             build(&session, no_pim_support()).expect("optional families degrade, they do not fail");
         assert_eq!(caps.push, PushCapability::None);
-        assert_eq!(limits.max_objects_in_get, 256);
+        assert_eq!(limits.max_objects_in_get.get(), 256);
     }
 
     /// The `Error::MalformedCapability` the WebSocket door raises when the

@@ -212,3 +212,6 @@ impl EmailImportResponse {
         self.not_created.as_ref().map(|map| map.keys())
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

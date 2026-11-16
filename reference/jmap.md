@@ -183,33 +183,33 @@ raises `RequestSizeLimit` for an oversized encoded request;
 `send_methods_within` returns `Ok(None)` when the request exceeds either the
 caller-supplied bound or the snapshot's positive advertised bound.
 
-The snapshot is a three-state `CallLimit`, not a number: `Unadvertised` (no
-`urn:ietf:params:jmap:core` block, or a block that omits `maxCallsInRequest`),
-`Invalid` (the block advertises `maxCallsInRequest: 0`, which RFC 8620 forbids,
-or the block is present and does not parse at all), and `Advertised`, which is
-the only state that enforces.
+`core/session.rs::CoreLimits` interprets all core limits once per immutable
+session, including a cached validation result. `SessionState::derive` eagerly
+initializes that cache before an installed session configures its transport or
+becomes visible. The cache lives on `Session` so bare protocol handles, account
+validation, upload readers and concurrency fan-outs all share it. Requests retain
+their session snapshot through send, including its cached limits.
 
-Both halves of that widening are deliberate. Every core limit is an
-`Option<usize>`, so an OMITTED field reads as "advertised nothing" rather than
-as the zero a blanket `#[serde(default)]` used to fill in - two different server
-bugs with two different classifications. And a present-but-unparseable core
-block (`"maxCallsInRequest": "16"`) takes the `Capabilities::Malformed`
-variant, read through `Session::core_capability_state()` (`Absent` /
-`Malformed` / `Present`); falling back to `Capabilities::Other` made it
-indistinguishable from absent at every reader, so a server sending a
-string-typed limit was classified `SyncState(CapabilityChanged)` and the engine
-reopened forever against a session that will never change. `core_capabilities()`
-still collapses `Absent` and `Malformed` into `None`, which is correct for any
-reader that only declines to enforce a bound; every reader that CLASSIFIES a bad
-session must use the three-state. Treating the first two as a limit of zero would make
-every request unable to hold a single call - and any caller probing such a
-session would then see `Request(Malformed)` /
-`ClientBug`, preempting the classifications the engine actually needs:
-`SyncState(CapabilityChanged)` / `RestartAccount` for an absent core capability,
-`Protocol(ContractViolation)` for a zero-valued one. Account opening validates the session before seeding or foreign probes.
-Direct protocol requests can still precede account validation, which is
-the gate for both bad sessions; the request builder enforces only a limit the
-server actually advertised.
+Positive call-count and request-size bounds retain three states:
+`Unadvertised`, `Invalid`, and `Advertised(NonZeroUsize)`. Only the advertised
+state enforces a bound. Core object limits also validate as positive values;
+`ObjectLimits` carries `NonZeroUsize` through the account layer. Bare protocol
+handles use a conservative one-object batch for an unusable object limit.
+Upload size retains an advertised zero as an empty-only limit, and concurrency
+zero selects an explicit serial lane. Omitted upload size imposes no bound on
+bare protocol uploads; account opening still refuses the missing required field.
+
+The wire `CoreCapabilities` keeps `Option<usize>` to preserve missing fields.
+The cache also preserves the absent / malformed / present capability split.
+Missing core is `SyncState(CapabilityChanged)` / `RestartAccount`; malformed
+core or omitted required members, and zero positive bounds, are
+`Protocol(ContractViolation)`. Missing concurrency or collation algorithms is
+also a contract violation; zero concurrency and an empty collation array are
+valid. Cached errors remain data until `sync/error.rs` maps them, so deriving a
+snapshot cannot turn an absent core capability into the wrong recovery class.
+Account opening checks that result before seeding or foreign probes. Direct
+protocol requests can still use incomplete sessions and enforce only usable
+advertisements, without misreporting a bad session as a local request error.
 
 The method-generation macros are crate-private. They are re-exported
 inside the crate root only so sibling modules can keep the existing
@@ -400,8 +400,8 @@ mismatch in place.
 - `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty (`Error::InvalidUrl`, the caller's fault): a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).
 
-The session and everything derived from it (`apiUrl`, the upload / download /
-EventSource templates parsed into `URLPart`s) live
+The session and everything derived from it (`apiUrl`, cached core limits, and
+the upload / download / EventSource templates parsed into `URLPart`s) live
 together in one `Arc<SessionState>` behind a single lock. RFC 8620 §2 lets any
 Session property change, so `refresh_session` republishes the whole derived set
 atomically; readers take one `session_state()` snapshot and build a whole URL
@@ -538,6 +538,24 @@ falling through to a network. Despite the test module's location,
 `AccountFactory::open` itself is not hermetically reachable: its `connect()`
 call hardwires `ReqwestTransport`. The seam covers the generic sync request
 helpers beneath that boundary, not factory connection establishment.
+
+## Protocol test layout
+
+Wire tests live beside the object or core module they exercise, usually in a
+`wire_tests.rs` child module. Query, set, session, response, transport and request
+envelope tests therefore follow their production owners rather than a crate-wide
+review ledger. `core/test_support.rs` contains only the minimal object and method
+doubles shared by the core tests; the request transcript suite owns its own
+in-process transport.
+
+Feature-local tests inherit the owning module's feature gate. Calendar and
+contact membership, extension and query contracts run independently rather than
+requiring unrelated feature families. Root `data_type_tests.rs` and
+`push_tests.rs` cover types defined at the crate root. The small
+`wire_contract_tests.rs` keeps the cross-object empty-patch and create-default
+invariants together. Method-macro contracts live beside `core/method.rs`;
+the specialized-method tests pin wire names and explicit capability exceptions,
+not duplicate production metadata tables.
 
 ## Module pattern
 
@@ -701,7 +719,7 @@ This gate is shared across tasks using the same client. API requests continue
 to use `maxConcurrentRequests`, and downloads have no upload gate.
 
 `Client::upload_to` checks the byte length against `maxSizeUpload` before it
-calls the transport. An oversized upload returns `Request(Malformed)` with the
+calls the transport. An oversized upload returns `Request(PayloadTooLarge)` with the
 advertised and actual sizes, so the file body never reaches the server.
 `maxSizeUpload` remains an `Option<usize>` at the protocol layer so absence is
 distinguishable from an advertised zero, but account session validation
@@ -791,7 +809,7 @@ crates/jmap/src/sync/
                      JmapAccountFactoryBuilder, JmapCredentials, ReconnectPolicy)
   account.rs       - pub(crate) JmapAccount struct + impl Account
   factory.rs       - JmapAccountFactory + builder + JmapCredentials
-  capabilities.rs  - AccountCapabilities builder, CoreLimits
+  capabilities.rs  - AccountCapabilities builder, ObjectLimits
   state.rs         - cursor envelope (V1 tag/length format)
   state_cache.rs   - slot-owned typed Email StateCell observations
   registry.rs      - account slots, optional-family selection, owner routing and push topology
@@ -864,7 +882,7 @@ discarded every answer. The half of the validation that genuinely needs
 probe results - the `PimSupport` gates, which depend on which shares actually
 seeded - stays in `build`, which still calls `validate_session` itself so the
 refusal does not depend on the caller having run it. `build` then produces
-`AccountCapabilities` + `CoreLimits`. It builds the push state (`WsState::new`,
+`AccountCapabilities` + `ObjectLimits`. It builds the push state (`WsState::new`,
 which spawns nothing: the engine opens push sessions after attach) with a
 `CancellationToken`, and returns `OpenedAccount` (the handle plus the
 foreign-account skip lane; see Foreign accounts below).
@@ -939,7 +957,12 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 - `filter_rule_shape: Scripts` and every filter flag true with a primary Sieve account; without Sieve they are false and the shape is `None`.
 - `conveniences`: `starred = Keyword`, `replied`/`forwarded`/`mdn_sent` via keyword true, extended-property routes false. `set_starred`/`mark_replied`/`mark_forwarded`/`mark_mdn_sent` map to `$flagged`/`$answered`/`$forwarded`/`$MDNSent`. `set_importance` is two-valued: `High` sets `$important`, else clears; read maps `$important` presence onto `Message.importance`.
 
-`CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` reads the three-state `core_capability_state()` and refuses on three grounds, in two different lanes: an ABSENT core block is `SyncState(CapabilityChanged)` -> `RestartAccount` (the server dropped a capability it used to advertise, so a reopen may fix it), while a PRESENT block that does not parse, and a present block whose `maxCallsInRequest` / `maxObjectsInGet` / `maxObjectsInSet` / `maxSizeRequest` is zero OR omitted, are both `Protocol(ContractViolation)`. Omitted counts because RFC 8620 §2 makes every one of those a mandatory member; classifying either as a capability change would buy a reopen loop against a session that will come back identical. `maxCallsInRequest` and `maxSizeRequest` are validated and discarded.
+`ObjectLimits` holds positive `maxObjectsInGet` and `maxObjectsInSet` for
+account batching. `build` and the pre-probe gate read the cached core validation
+result rather than decoding or validating the fields again. Call-count,
+request-size, upload-size and concurrency enforcement read the same session's
+cached interpretation. Required mail-family validation stays in the account
+layer: bare core protocol requests do not require a Mail account.
 
 ### Cursor envelope
 
@@ -1024,7 +1047,7 @@ boundary remain outside the plaintext smoothing guarantee described in
 - `frame_stream` runs the session-divergence comparison on every response frame's `sessionState`, through the same `Client::note_session_state` the HTTP door uses - including on a frame whose method responses fail to decode, whose session state was still truthful. The WS door previously handed responses up without ever looking, losing staleness detection on the connection that stays open longest.
 - A `Response` frame decodes in a single pass. The frame is not an HTTP response body - it carries `@type` and `requestId` beside the envelope fields - so `WebSocketResponse` keeps `methodResponses` as a raw JSON slice and hands it to `Response::from_frame_parts`, which runs the same per-call success/`MethodError` split (`split_call_results`) the HTTP envelope deserializer runs. It previously decoded the array into a `serde_json::Value` tree, rebuilt a `json!` envelope from it, and deserialized that a second time, re-allocating every method response on every frame. The frame dispatch is hand-written (`decode_frame` reads the `@type` discriminator by itself, then deserializes the variant from the same bytes) rather than `#[serde(tag = "@type")]`, because an internally-tagged enum buffers the frame into serde's private `Content` tree before selecting a variant and a `RawValue` cannot survive that buffer - it re-emerges as the newtype token. The same trap applies to every `#[serde(tag)]` / `#[serde(untagged)]` type in this crate: none can hold a `RawValue`, and the failure is a runtime decode error, not a compile error. Unknown `@type` values are ignored for forward compatibility. A malformed known push payload is converted to an `UnknownFrame` notification, which the push session turns into a broad invalidation so the bad frame cannot hide a state change or terminate the connection. Malformed text envelopes, unclaimed method-response decode failures, and binary frames close the current WebSocket as `WebSocketClosed`, which ends the push session `Failed` with a retryable class; a correlated method-response decode failure still fails its waiter. Session divergence is still checked on the frame's own `sessionState` before the method responses are touched, so a frame whose method responses fail to decode still reports its truthful session state and still fails its own waiter with `EnvelopeDecode`.
 
-- A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. Only an advertised, non-zero limit is enforced, for the same reason `CallLimit` refuses to enforce its two unusable states - and since the limit is an `Option`, an omitted `maxSizeRequest` declines to enforce without being confused for an advertised zero, which the session validator refuses separately. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
+- A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. It reads the cached positive bound from the request's session snapshot, exactly as HTTP does. An omitted or zero `maxSizeRequest` is left to the cached session validation result rather than enforced as a request that can never fit. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
 
 The await side is `PendingRequests`, a map of waiters keyed by `requestId`, held with the sink and the id counter in `WsConnection` on the shared `ClientInner` (not the `WsStream`, and not any one push stream) so it outlives any one connection. `Client::send_ws_awaiting` (and `Request::send_ws_awaiting`, the WebSocket counterpart of `Request::send`) registers a waiter and returns a `PendingResponse` that resolves to the correlated `Response`. `send_ws` is unchanged and still fire-and-forget.
 
@@ -1416,7 +1439,7 @@ exposure any consumer of an unbounded query has.
 
 `filters.rs` maps Stage 2 filter primitives onto JMAP Sieve:
 
-- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`capabilities::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `CoreLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::query_answer` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal explicit-object-miss one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
+- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each script's blob, returns `ServerFilter::Script`. The query's id list is however many scripts the account holds, so hydration is BATCHED at the session's `maxObjectsInGet` (`capabilities::max_objects_in_get`, the reader for doors that hold a bare `Account` rather than the `ObjectLimits` built at open) - one unbounded `/get` is a call a server may refuse wholesale with `requestTooLarge`. Each answer is then RECONCILED against the ids that batch submitted, the way `reconcile_hydration` and `contacts::get_cards` do. An id the server leaves out of `list` used to vanish from the returned `Vec`, which reads to the consumer as "that filter does not exist" - a deletion the response never claimed, and one an absent `notFound` cannot disprove (see the `/get` leniency rule). This door has no per-item lane, so the whole page fails, retryably: `error::query_answer` classifies both an unanswered id and a declared `notFound` as `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, the same class `get_id_unanswered` uses and the same answer `contact_update` gives for an unanswered pre-read id. `notFound` deliberately shares that lane rather than taking the terminal explicit-object-miss one: at page level the honest reading of a script the query named and the get disclaimed is a delete that raced the two calls, and the retry's fresh `/query` will not name it again. The downloads are independent of each other, so they run CONCURRENTLY under `factory::api_request_concurrency` (the server's `maxConcurrentRequests`, clamped `[1, 8]` - the same reading the open-time foreign probes use, deliberately one function rather than a second bound that could drift). Serially this was N+2 round trips for N scripts. It is `buffered`, never `buffer_unordered`: yielding in submission order is what keeps the error accounting identical to the serial loop's, where the first failing script in list order is the error the whole call returns. Arrival order would report whichever download happened to fail first.
 - `filter_create` uploads the body as `application/sieve`, creates a `SieveScript`, and `onSuccessActivateScript` when asked active.
 - `filter_update` patches name/body via `SieveScript/set` (body uploads a fresh blob first); `is_active: true` activates the target via `onSuccessActivateScript`. Deactivation first reads the target's `isActive`; an inactive target leaves activation alone while still applying name/body edits. An active target uses `onSuccessDeactivateScript` guarded by the read's `ifInState`, so a concurrent activation produces a conflict instead of deactivating another script. There is no automatic re-read and retry after `stateMismatch`, including one caused by an unrelated script edit. The patch can also replace name/body; preserving concurrent rule edits, as an enterprise Outlook user expects, takes precedence over silently authorizing the original patch against a newer ruleset. The caller refreshes and explicitly retries the whole patch; deactivation is not split into a second write. A target omitted from both read-result lanes fails retryably as `Protocol(PartialResponse)`; an explicit `notFound` remains `NotFound`.
 - `filter_delete` destroys the id; `filter_validate` uploads then `SieveScript/validate`, mapping set errors to `FilterValidation` diagnostics.
@@ -1520,8 +1543,10 @@ arrived) and, unless its primary cause already is one, the typed
   may have committed, so it is `Protocol(PartialResponse)` (the wire cause is
   the primary) -> `Retry::SameRequest` for an idempotent operation,
   `Reconcile` for a non-idempotent one.
-- `Method(invalidArguments | invalidResultReference | requestTooLarge)` ->
+- `Method(invalidArguments | invalidResultReference)` ->
   `Request(Malformed)` -> `ClientBug`.
+- `Method(requestTooLarge)` -> `Request(PayloadTooLarge)` -> terminal
+  `ProviderRefused`. The typed native code and acknowledgement remain intact.
 - `Method(unknownMethod | unsupportedSort | unsupportedFilter)` ->
   `Unsupported(operation)`.
 - `Method(accountNotFound | fromAccountNotFound | accountNotSupportedByMethod
@@ -1616,9 +1641,17 @@ arrived) and, unless its primary cause already is one, the typed
   `Protocol(MissingField)`. `IdUnanswered` -> `Protocol(PartialResponse)`
   with acknowledged evidence. Its request-stamped method, write/read kind and
   actual guard determine recovery; guarded writes narrow idempotency.
-- Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`,
-  `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`, for
+- Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`
+  and `InvalidUrl` (field `url`, for
   an empty session URL or an unusable EventSource URL component).
+- `RequestCallLimit`, `RequestSizeLimit` and `UploadSizeLimit` ->
+  `Request(PayloadTooLarge)`, without dispatch. Set `tooLarge`,
+  `tooManyKeywords`, `tooManyMailboxes` and `tooManyRecipients` use the same
+  terminal refusal. Set `willDestroy`, `singleton`, `scriptIsActive`,
+  `cannotUnsend`, `mailboxHasChild` and `mailboxHasEmail` use
+  `Request(PreconditionFailed)`. An enterprise Outlook user must change the
+  input or target state; repeating the same write cannot help. Each server
+  refusal retains its own typed JMAP wire cause and Acknowledged evidence.
 - `Set` routes through the same per-item `set_error_to_account_error` as
   the `Email/set` lanes below.
 
@@ -1887,8 +1920,12 @@ false when the server omits the optional sharing right.
 
 ### Sync limit policy and lifecycle publication
 
-`core/session.rs` owns core object-limit decoding (`CoreLimits`), required-field
-validation (`validated_core_limits`) and upload-size validation.
+`core/session.rs` owns cached core-limit interpretation (`CoreLimits`),
+required-field validation (`validated_core_limits`), upload-size validation and
+the positive object-batching view (`ObjectLimits`). Every installed session
+initializes its immutable cache in `SessionState::derive`, including validation
+errors. Refresh derives a fresh session and cache before publishing it; existing
+requests retain their old snapshot and limits.
 `sync/error.rs` maps the three protocol validation failures (absent, malformed
 and unusable) to account errors. `sync/capabilities.rs` invokes this boundary
 and owns the local set batch ceiling of 500 and the 100 ms batching wait.
@@ -1957,14 +1994,19 @@ the owner qualification for shared mail. Thread member ids use the same owner
 namespace as the thread and its hydrated messages. Submission/create workflows
 retain their separate created-object and compensation accounting.
 
-Local unsupported refusals still expose their operation and generic unsupported
-message key. Their detailed reasons are support diagnostics, not branchable API.
-The shared AccountError builder derives message keys from the kind and has no
-local unsupported-reason field; adding a sync-private enum cannot cross that
-boundary. A typed reason requires a bifrost-types contract change. Native-code
-telemetry remains reserved for provider codes. Send-as routing preserves its
-precedence: feature availability, scheduled-send support, known mailbox, then
-that mailbox's submission capability.
+Local unsupported helpers attach a shared `UnsupportedReason`, read through
+`AccountError::unsupported_reason`, alongside their operation, scope and generic
+unsupported message key. The builder validates that the reason belongs to an
+Unsupported kind and preserves it through decoration. JMAP call sites pass
+explicit reasons for absent submission, absent scheduled-send support,
+unavailable send-as, foreign scheduled sends, a foreign account lacking
+submission, container/label/flag variants, cursor scopes, MIME projections and
+the range transport hook. Remaining unsupported request/data shapes use typed
+RequestShape or DataRepresentation reasons. Diagnostic wording is support-only;
+consumers branch on the reason, never on text or invented native codes.
+Send-as routing preserves its precedence: feature availability, scheduled-send
+support, known mailbox, then that mailbox's submission capability. The unknown
+mailbox branch remains Request(Malformed), without an unsupported reason.
 
 Shared-account PermissionDenied quarantine uses
 `AccountError::revoke_foreign_scope`, retaining the original error as its source

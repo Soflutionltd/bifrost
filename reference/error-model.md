@@ -64,6 +64,17 @@ no account identity; built-in accounts use `unsupported_inventory_stream_with_pr
 The provider-neutral MIME renderer uses `Unknown` for unsupported inputs; its
 consuming account stamps the protocol at the boundary.
 
+Local unsupported refusals may attach `UnsupportedReason` through
+`AccountErrorBuilder::unsupported_reason`, read through
+`AccountError::unsupported_reason`. It distinguishes submission, scheduling,
+foreign sends, container/label/flag variants, cursor scopes, projections and
+transport hooks without parsing diagnostic prose. The reason is optional for
+other producers and survives cloning and `into_builder` decoration. Recovery
+and `unsupported.operation` stay derived from the kind; native codes remain
+provider wire evidence. `try_build` rejects a reason on any other kind with
+`UnsupportedReasonNotApplicable`. The ledger error digest retains the kind and
+diagnostics, not this live refusal metadata.
+
 ## AccountErrorBuilder funnel
 
 `builder.rs`. `AccountErrorBuilder::new(kind, primary_cause)` is the
@@ -138,7 +149,12 @@ top-level taxonomy with per-family subkind enums:
   transmission evidence for operations interrupted after dispatch: those retain
   their existing failure and reconciliation classification.
 - `ConcurrencyConflict` (flat).
-- `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
+- `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid` (caller
+  shape faults), `PayloadTooLarge` (provider size or cardinality limit), and
+  `PreconditionFailed` (valid request refused by target state). The latter two
+  derive terminal `ProviderRefused`, with `FixClientRequest` remediation;
+  the user must change the input or refresh and choose a new target. They are
+  not `ClientBug` and never automatically replay an unchanged request.
 - `NotFound(ResourceKind)` - message, mailbox, thread, calendar, event,
   contact, draft, identity, vacation, push-subscription, account,
   filter (a server-side mail rule: ManageSieve script, Gmail filter,
@@ -163,9 +179,9 @@ top-level taxonomy with per-family subkind enums:
   `internal.runtime-failure`, `internal.panicked`,
   `internal.account-contract`, `internal.limit-exceeded`.
 
-The three blame families are deliberately disjoint: `Request(_)` is the
-caller asking for something inexpressible, `Protocol(_)` is the provider
-sending something wrong, `Internal(_)` is the code in between. Before
+The three blame families are deliberately disjoint: `Request(_)` describes the
+request shape, provider input limit or unsatisfied target precondition;
+`Protocol(_)` is the provider sending something wrong, `Internal(_)` is the code in between. Before
 `Internal` existed, client-side failures borrowed
 `Protocol(ContractViolation)` and told operators to contact the provider
 about a bifrost bug.
@@ -345,7 +361,8 @@ operation is treated idempotent). The rules at altitude (read
 - **AccountClosed** -> terminal `Cancelled`, with no suggested remediation.
 - **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
   ConcurrencyConflict)`.
-- **Request** (both subkinds) -> `ClientBug`.
+- **Request** -> `Malformed` / `BatchInputInvalid` derive `ClientBug`;
+  `PayloadTooLarge` / `PreconditionFailed` derive terminal `ProviderRefused`.
 - **NotFound** -> `ProviderRefused` (unconditional; the per-operation
   "this NotFound is benign, absorb it" policy is **not** in this module
   - it lives at the call site in each protocol crate's operation, which

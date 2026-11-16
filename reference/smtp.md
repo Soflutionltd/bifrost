@@ -87,8 +87,9 @@ workspace, not about who uses `SmtpTransport`.
 The two halves share session sequencing, transaction sequencing and reply
 framing. See "Protocol core and I/O adapters". Dialing, token resolution, TLS
 handshakes, byte I/O, bandwidth admission and deadlines remain adapter-owned.
-The session conformance suite defines each transcript once and runs it through
-both adapters; adapter-specific timeout and cancellation tests stay separate.
+The session and send conformance suite defines each transcript once and runs it
+through both adapters; adapter-specific timeout and cancellation tests stay
+separate.
 There are two deliberate behavioural differences:
 the `abort()` timeout (see "Connection lifecycle") and what the configured
 timeout covers during SETUP, immediately below. (Outbound throttling used to be
@@ -1040,12 +1041,17 @@ sequencing are each pinned once, in the place the rule now lives, with no I/O
 at all. Every one of them was confirmed to bite by reintroducing the bug it
 describes. `client/session.rs` also tests successful TLS-effect ordering without a
 handshake, and `client/reply.rs` tests chunk splits, caps, UTF-8 and EOF.
-`client/conformance.rs` defines the session transcripts once and runs each
+`client/conformance.rs` defines the session and send transcripts once and runs each
 through both adapters when `tokio` is enabled (blocking only otherwise).
 It covers both SCRAM server-final shapes, token resolution, STARTTLS refusal
-and injection, capability refresh, pipelined DATA/BDAT for both dialects and
-EOF evidence. Remaining driver-specific transcripts retain their I/O, stream
-state, timeout and cancellation coverage.
+and injection, capability refresh, envelope validation and parameters,
+PIPELINING windows and coalesced replies, DATA/BDAT framing, recipient lanes,
+EOF evidence, reset and abort decisions, and LMTP drain retirement and stream
+state. Cases include sequential and pipelined recipient read failures and
+split-CRLF body chunks.
+The connection files retain private I/O, certificate, timeout, cancellation and
+standalone lifecycle tests. The shared tests call the real connection entry
+points; their adapter facade only forwards calls and never interprets outcomes.
 
 A scripted outcome list alone cannot reach every boundary. Writes and group
 boundaries consume the next scripted failure whichever one it is, so a failure
@@ -1065,15 +1071,15 @@ lanes they had collected (which the transports then discard - see "Error
 model"), and an LMTP drain close that fails after every final
 status was recorded (the batch result stands; only the stream is lost).
 
-The transcript suites carry the other half of that pair: a requested op is not
-a performed op, so both suites observe the stream state after the exchange, not
-only its result. `an_aborting_batch_failure_leaves_the_stream_broken` (abort,
+The conformance suite carries the other half of that pair: a requested op is not
+a performed op, so each adapter's run observes the stream state after the
+exchange, not only its result. `an_aborting_batch_failure_leaves_the_stream_broken` (abort,
 and not retired), `a_rejected_pipelined_mail_from_restores_the_stream_at_the_group_close`
 (the group bracket restores `Ok` when every reply drained),
 `a_clean_lmtp_batch_drain_leaves_the_stream_broken_and_retired`
 (`restore_ok: false` reaching the wire) and the direct-LMTP drain pins
-(`Ok` plus retired) exist in both halves. Each was confirmed to bite by breaking
-the adapter's handling of the op it targets - dropping the `Op::Abort` arm,
+(`Ok` plus retired) are defined once and run through both halves. Each was
+confirmed to bite by breaking the adapter's handling of the op it targets - dropping the `Op::Abort` arm,
 dropping the `Ok` restore in `finish_reply_group`, and ignoring `restore_ok` -
 rather than only by reverting the core. One limit of that observable is worth
 knowing before trusting it: asserting `has_broken()` after an abort does NOT

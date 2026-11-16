@@ -170,20 +170,13 @@ impl ImapConnection {
         max_estimated_bytes: usize,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.require_state(crate::types::CommandKind::Fetch)?;
-        self.validate_requested_fetch_items(attrs)?;
-        if uids.as_sequence_set().as_str().contains('$') {
-            self.require_searchres()?;
-        }
-        self.submit_regular(
-            Command::UidFetch {
+        self.execute_request(
+            super::request::UidFetchLimited {
                 sequence_set: uids.as_sequence_set().clone(),
                 items: attrs.to_vec().into(),
-                changed_since: None,
-                vanished: false,
+                max_estimated_bytes,
             },
-            dispatch::FetchConsumer::with_limit(max_estimated_bytes),
-            Some(tokio::time::Instant::now() + timeout),
+            timeout,
         )
         .await
     }

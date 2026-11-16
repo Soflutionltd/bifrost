@@ -27,10 +27,13 @@ use super::dispatch::{
     Finalized, StreamingConsumer,
 };
 use super::reply::{ClaimedReply, Reply};
+#[cfg(test)]
+mod declines_tests;
 mod events;
 mod idle;
 mod pipeline;
 pub(super) mod read_loop;
+pub(in crate::connection) mod setup;
 pub(crate) mod task;
 mod upgrade;
 mod wire_send;
@@ -45,8 +48,6 @@ use pipeline::group_into_sub_batches;
 use pipeline::{PipelineEnd, run_pipeline};
 use upgrade::{logout_best_effort, required_capability_refresh, run_upgrade};
 use wire_send::{SendOutcome, commit_before_first_write, send_wire_command};
-
-pub(in crate::connection) use upgrade::run_starttls_upgrade;
 
 /// Per-command result type for pipelined batch execution.
 ///
@@ -163,7 +164,7 @@ pub(super) trait ConsumerErased: Send {
         resp: UntaggedResponse,
         notify_snapshot: NotifyFlags,
         ctx: &ConsumerContext,
-    );
+    ) -> Option<UntaggedResponse>;
 
     /// Forwards to [`Consumer::finalize`], boxing the output.
     /// Infallible, like [`Consumer::finalize`]. Only the SUCCESS value is
@@ -216,8 +217,8 @@ where
         resp: UntaggedResponse,
         notify_snapshot: NotifyFlags,
         ctx: &ConsumerContext,
-    ) {
-        <C as Consumer>::on_response(self, resp, notify_snapshot, ctx);
+    ) -> Option<UntaggedResponse> {
+        <C as Consumer>::on_response(self, resp, notify_snapshot, ctx)
     }
 
     fn finalize_erased(
@@ -297,7 +298,7 @@ impl DriverConsumer {
         resp: UntaggedResponse,
         notify_snapshot: NotifyFlags,
         ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match self {
             Self::Regular(c) => c.on_response(resp, notify_snapshot, ctx),
             Self::StreamingRegular(c) => c.on_response(resp, notify_snapshot, ctx),
@@ -399,9 +400,8 @@ impl Default for ConnectionStateSnapshot {
 /// [`DriverEventSink`](event_sink::DriverEventSink). Publishes state
 /// snapshots via `watch::Sender` after every command.
 ///
-/// The caller (typically `ImapConnection::connect`) creates the wire
-/// reader and protocol state, reads the greeting, fetches initial
-/// capabilities, and then passes the pre-initialized components here.
+/// Setup initializes these components in this same task before entering the
+/// command loop. Test transcripts may also pass an initialized session.
 pub(super) async fn driver_task(
     mut wire_reader: super::wire::WireReader,
     mut state: super::state::ProtocolState,
@@ -747,7 +747,7 @@ pub(in crate::connection) fn live_state_refusal(
 /// `connection::admission` mints it after the same policy passed against the
 /// handle snapshot. A refusal here therefore always contradicts an earlier
 /// admission. The connect-time setup commands that run before a handle exists
-/// (CAPABILITY, the STARTTLS upgrade) have their own checks in `lifecycle`.
+/// (CAPABILITY, the STARTTLS upgrade) have their own checks in `driver::setup`.
 pub(in crate::connection) fn admit_live(
     state: &super::state::ProtocolState,
     command: &Command,
@@ -1014,7 +1014,11 @@ async fn dispatch_response_loop(
                 // server-initiated disconnect in this one command path.
                 if expected_logout_bye {
                     let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                    consumer.on_response(*u, notify_before, &ctx);
+                    emit_declined(
+                        event_sink,
+                        consumer.on_response(*u, notify_before, &ctx),
+                        code_emitted,
+                    );
                     continue;
                 }
 
@@ -1026,7 +1030,11 @@ async fn dispatch_response_loop(
                 match rule {
                     SolicitationRule::OnlySolicited | SolicitationRule::Either => {
                         let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                        consumer.on_response(*u, notify_before, &ctx);
+                        emit_declined(
+                            event_sink,
+                            consumer.on_response(*u, notify_before, &ctx),
+                            code_emitted,
+                        );
                     }
                     SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
                         // Skip event_sink.emit for responses whose
@@ -1284,3 +1292,28 @@ pub(super) mod event_sink;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+/// A declined response belongs to the driver's event path immediately. Preserve
+/// it even if a later read fails; critical codes already emitted by ReadLoop
+/// are never published twice. The consumer owns no generic event backlog.
+fn emit_declined(
+    event_sink: &mut event_sink::DriverEventSink,
+    declined: Option<UntaggedResponse>,
+    code_emitted: bool,
+) {
+    if let Some(response) = declined
+        && (!code_emitted
+            || matches!(
+                response,
+                UntaggedResponse::Status {
+                    status: UntaggedStatus::Bye,
+                    ..
+                }
+            ))
+    {
+        // ALERT/NOTIFICATIONOVERFLOW replace an ordinary status event, but a
+        // LOGOUT BYE independently reports session termination. Outlook users
+        // must receive that observation as well as the server's alert.
+        let _ = event_sink.emit(response.into());
+    }
+}

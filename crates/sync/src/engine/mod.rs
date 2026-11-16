@@ -42,11 +42,11 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
     AccountId, AccountStream, ChangeCursor, CursorEstablishment, CursorScope, DiagnosticText,
     EngineDirective, ErrorScope, InvalidationSink, InventoryPartition, ItemOutcome,
-    MembershipScope, MutationSuccess, OpenedAccount, PauseReason, Priority, ReconcileAction,
-    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent,
+    MembershipScope, OpenedAccount, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
+    RecoveryClass, SkippedScope, SyncEvent,
 };
 #[cfg(test)]
-use bifrost_types::{Batch, Checkpoint, PageBoundary};
+use bifrost_types::{Checkpoint, PageBoundary};
 use dashmap::DashMap;
 use futures::stream::StreamExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
@@ -1262,31 +1262,16 @@ impl SyncEngine {
         let _reopen_guard = slot.reopen_lock.lock().await;
         let records = slot.subscriptions.take();
         let account = slot.current.load_full();
-        let mut failed = Vec::new();
+        let teardown = slot.subscriptions.teardown(account_id, &slot.throttles);
         let mut first_error = None;
         for record in records {
             let _topology = TopologyBump(&slot.push_topology_tx);
-            if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
-                tracing::warn!(target: "bifrost.sync.reconcile", error=?error, "push_unsubscribe failed; retaining handle for retry");
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                // The server side may still be live. Keep the record, but as
-                // an orphan: the consumer asked for it to go, so a reopen
-                // carries it for retry instead of recreating it against the
-                // replacement connection.
-                failed.push(record.into_orphan());
+            if let Err(refusal) = teardown
+                .delete_or_orphan(account.as_ref().as_ref(), &record)
+                .await
+            {
+                first_error.get_or_insert(refusal.error);
             }
-        }
-        // A detach racing this call may already have drained this attachment's
-        // registry. Refusal reports that nobody remains to retry these handles;
-        // the next attachment owns an independent registry.
-        if !slot.subscriptions.restore_orphans(failed) {
-            tracing::debug!(
-                target: "bifrost.sync.push",
-                account = ?account_id,
-                "account detached during unsubscribe_push; refused handles are left to provider expiry"
-            );
         }
         match first_error {
             Some(error) => Err(Error::Account(error)),
@@ -1332,7 +1317,7 @@ impl SyncEngine {
             );
         }
         if let Some(handle) = result.handle()
-            && !slot.subscriptions.record(handle.clone(), covered)
+            && !slot.subscriptions.record(handle.clone(), covered.clone())
         {
             // Detach cancelled the slot while `push_subscribe` was in flight and
             // may already have taken the registry, so the subscription just made
@@ -1346,17 +1331,21 @@ impl SyncEngine {
             // Detached onto its own task and then awaited, so a caller that drops
             // this future while the delete is parked cannot strand the handle.
             let handle = handle.clone();
+            let subscriptions = Arc::clone(&slot.subscriptions);
+            let throttles = Arc::clone(&slot.throttles);
+            let cleanup_account_id = account_id.clone();
             let topology = slot.push_topology_tx.clone();
             let cleanup = tokio::spawn(async move {
                 let _topology = TopologyBump(&topology);
-                if let Err(error) = account.push_unsubscribe(handle).await {
-                    tracing::warn!(
-                        target: "bifrost.sync.push",
-                        error = ?error,
-                        "push subscription created during detach could not be torn down; \
-                         left to provider expiry"
-                    );
-                }
+                let teardown = subscriptions.teardown(&cleanup_account_id, &throttles);
+                let record = RegisteredSubscription {
+                    handle,
+                    scopes: covered,
+                    state: crate::push::subscription::SubscriptionState::Orphan,
+                };
+                let _ = teardown
+                    .delete_or_orphan(account.as_ref().as_ref(), &record)
+                    .await;
             });
             let _ = cleanup.await;
             return Err(Error::AccountNotAttached(account_id.clone()));

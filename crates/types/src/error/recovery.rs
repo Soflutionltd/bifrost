@@ -601,6 +601,11 @@ pub(crate) fn derive(
         AccountErrorKind::Request(
             RequestErrorKind::Malformed | RequestErrorKind::BatchInputInvalid,
         ) => RecoveryClass::ClientBug,
+        // An Outlook user must change the payload or target state. Replaying
+        // the same request cannot satisfy these conditions and is not a bug.
+        AccountErrorKind::Request(
+            RequestErrorKind::PayloadTooLarge | RequestErrorKind::PreconditionFailed,
+        ) => RecoveryClass::ProviderRefused,
         AccountErrorKind::NotFound(_) => RecoveryClass::ProviderRefused,
         AccountErrorKind::Unsupported(op) => RecoveryClass::Unsupported(*op),
         AccountErrorKind::Protocol(kind) => derive_protocol(
@@ -731,6 +736,14 @@ pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool
         (
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed { .. } | RequestCause::InvalidArgument { .. }),
+        )
+        | (
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge { .. }),
+        )
+        | (
+            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+            Cause::Request(RequestCause::PreconditionFailed { .. }),
         )
         | (
             AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),

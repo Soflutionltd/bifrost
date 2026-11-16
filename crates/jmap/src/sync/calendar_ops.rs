@@ -532,6 +532,7 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
         super::error::unsupported_error(
             operation,
             None,
+            bifrost_types::UnsupportedReason::DataRepresentation,
             format!("JMAP calendar total does not fit u64: {error}"),
         )
     })
@@ -541,11 +542,23 @@ fn require_calendars<T: HttpTransport>(
     calendars: Option<CalendarAccount<T>>,
     operation: AccountOperation,
 ) -> Result<CalendarAccount<T>, AccountError> {
-    calendars.ok_or_else(|| unsupported(operation, "JMAP Calendars capability is unavailable"))
+    calendars.ok_or_else(|| {
+        super::error::unsupported_error(
+            operation,
+            None,
+            bifrost_types::UnsupportedReason::CapabilityUnavailable,
+            "JMAP Calendars capability is unavailable",
+        )
+    })
 }
 
 fn unsupported(operation: AccountOperation, message: &str) -> AccountError {
-    super::error::unsupported_error(operation, None, message)
+    super::error::unsupported_error(
+        operation,
+        None,
+        bifrost_types::UnsupportedReason::DataRepresentation,
+        message,
+    )
 }
 
 pub(super) fn to_acct_err(

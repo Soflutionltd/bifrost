@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::account_error::{AccountError, AccountErrorParts};
 use super::cause::{Cause, CauseChain};
 use super::diagnostic::{DiagnosticInfo, DiagnosticText, TelemetryToken};
-use super::kind::{AccountErrorKind, ServerErrorKind, SyncStateErrorKind};
+use super::kind::{AccountErrorKind, ServerErrorKind, SyncStateErrorKind, UnsupportedReason};
 use super::message_key;
 use super::recovery::{self, ThrottleBudget, ThrottleScope};
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
@@ -54,6 +54,8 @@ pub enum AccountErrorBuildError {
     /// guarantees it, and a future builder entry point must fail here
     /// rather than freeze a causeless error.
     EmptyChain,
+    /// A local unsupported reason is meaningful only on Unsupported errors.
+    UnsupportedReasonNotApplicable { kind: AccountErrorKind },
     /// The outermost `Cause` does not match the declared
     /// `AccountErrorKind`. Producers must classify both halves
     /// consistently.
@@ -94,6 +96,9 @@ impl fmt::Display for AccountErrorBuildError {
             | Self::PartialCommitApplication { .. }
             | Self::PartialCommitCompensation { .. }
             | Self::PartialCommitNested { .. } => write!(f, "invalid partial commitment: {self:?}"),
+            Self::UnsupportedReasonNotApplicable { kind } => {
+                write!(f, "unsupported reason is not applicable to {kind:?}")
+            }
             Self::EmptyChain => write!(f, "AccountError chain is empty"),
             Self::KindCauseMismatch {
                 kind,
@@ -143,6 +148,7 @@ pub(crate) struct RebuildParts {
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
     pub throttle_budgets: Vec<ThrottleBudget>,
+    pub unsupported_reason: Option<UnsupportedReason>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +168,7 @@ pub struct AccountErrorBuilder {
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
     throttle_budgets: Vec<ThrottleBudget>,
+    unsupported_reason: Option<UnsupportedReason>,
 }
 
 impl AccountErrorBuilder {
@@ -183,6 +190,7 @@ impl AccountErrorBuilder {
             idempotency_override: None,
             throttle_scope: None,
             throttle_budgets: Vec::new(),
+            unsupported_reason: None,
         }
     }
 
@@ -212,6 +220,7 @@ impl AccountErrorBuilder {
             idempotency_override: parts.idempotency_override,
             throttle_scope: parts.throttle_scope,
             throttle_budgets: parts.throttle_budgets,
+            unsupported_reason: parts.unsupported_reason,
         }
     }
 
@@ -363,12 +372,25 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// Explain a local unsupported refusal without parsing diagnostic prose.
+    /// Rejected by `try_build` on any other error kind.
+    #[must_use]
+    pub fn unsupported_reason(mut self, reason: UnsupportedReason) -> Self {
+        self.unsupported_reason = Some(reason);
+        self
+    }
+
     /// Construct the `AccountError`. Returns `Err` only on producer-bug
     /// invariants (see [`AccountErrorBuildError`]); protocol-crate
     /// translation boundaries call `.expect("valid account error
     /// classification")` because an invalid combination is a library
     /// bug, not recoverable runtime state.
     pub fn try_build(self) -> Result<AccountError, AccountErrorBuildError> {
+        if self.unsupported_reason.is_some()
+            && !matches!(self.kind, AccountErrorKind::Unsupported(_))
+        {
+            return Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { kind: self.kind });
+        }
         if self.partial_commit_duplicate {
             return Err(AccountErrorBuildError::PartialCommitAlreadyAttached);
         }
@@ -491,6 +513,7 @@ impl AccountErrorBuilder {
             idempotency_override: self.idempotency_override,
             throttle_scope: self.throttle_scope,
             throttle_budgets: self.throttle_budgets,
+            unsupported_reason: self.unsupported_reason,
         }))
     }
 }
@@ -735,5 +758,96 @@ mod tests {
         .expect_err("CursorInvalid requires a cursor scope");
 
         assert_eq!(err, AccountErrorBuildError::CursorInvalidWithoutScope);
+    }
+}
+
+#[cfg(test)]
+mod refusal_contract_tests {
+    use super::*;
+    use crate::{RecoveryClass, RemediationAction, RequestCause, RequestErrorKind};
+
+    #[test]
+    fn request_refusals_validate_pairs_and_derive_terminal_keys() {
+        let cases = [
+            (
+                RequestErrorKind::PayloadTooLarge,
+                RequestCause::PayloadTooLarge {
+                    detail: DiagnosticText::support_only("too big"),
+                },
+                "request.payload-too-large",
+            ),
+            (
+                RequestErrorKind::PreconditionFailed,
+                RequestCause::PreconditionFailed {
+                    detail: DiagnosticText::support_only("active"),
+                },
+                "request.precondition-failed",
+            ),
+        ];
+        for (kind, cause, key) in cases {
+            let error = AccountErrorBuilder::new(
+                AccountErrorKind::Request(kind),
+                Cause::Request(cause.clone()),
+            )
+            .operation(AccountOperation::Send)
+            .try_build()
+            .expect("matching refusal");
+            assert_eq!(error.message_key(), key);
+            assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+            assert_eq!(
+                error.suggested_remediation(),
+                Some(&RemediationAction::FixClientRequest)
+            );
+            assert!(matches!(
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                    Cause::Request(cause)
+                )
+                .try_build(),
+                Err(AccountErrorBuildError::KindCauseMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_reason_survives_shared_and_unique_decoration() {
+        let plain = AccountError::unsupported(AccountOperation::Send, Protocol::Jmap);
+        assert_eq!(plain.unsupported_reason(), None);
+        let error = plain
+            .into_builder()
+            .unsupported_reason(UnsupportedReason::ForeignScheduledSend)
+            .try_build()
+            .expect("unsupported reason");
+        let shared = error.clone();
+        let decorated = error
+            .into_builder()
+            .scope(ErrorScope::Account)
+            .text(DiagnosticText::support_only("diagnostic can change"))
+            .try_build()
+            .expect("shared decoration");
+        let decorated = decorated
+            .into_builder()
+            .protocol(Protocol::Jmap)
+            .try_build()
+            .expect("unique decoration");
+        assert_eq!(decorated.unsupported_reason(), shared.unsupported_reason());
+        assert_eq!(
+            decorated.unsupported_reason(),
+            Some(UnsupportedReason::ForeignScheduledSend)
+        );
+        assert_eq!(decorated.recovery(), shared.recovery());
+        assert_eq!(decorated.message_key(), "unsupported.operation");
+    }
+
+    #[test]
+    fn unsupported_reason_is_rejected_on_other_kinds() {
+        let error = AccountError::account_closed(AccountOperation::Send, Protocol::Jmap)
+            .into_builder()
+            .unsupported_reason(UnsupportedReason::SubmissionUnavailable)
+            .try_build();
+        assert!(matches!(
+            error,
+            Err(AccountErrorBuildError::UnsupportedReasonNotApplicable { .. })
+        ));
     }
 }

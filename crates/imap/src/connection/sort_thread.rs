@@ -24,19 +24,13 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<SearchResult<crate::types::Seq>, Error> {
         let criteria = criteria.into();
-        self.check_utf8_only_enforced()?;
 
-        let cmd = Command::Sort {
+        let cmd = super::request::Sort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
             criteria,
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::SortConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// UID SORT  -  server-side sorting returning UIDs (RFC 5256 Section 2).
@@ -53,19 +47,13 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.into();
-        self.check_utf8_only_enforced()?;
 
-        let cmd = Command::UidSort {
+        let cmd = super::request::UidSort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
             criteria,
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::SortConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -89,19 +77,13 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<Vec<ThreadNode<crate::types::Seq>>, Error> {
         let criteria = criteria.into();
-        self.check_utf8_only_enforced()?;
 
-        let cmd = Command::Thread {
+        let cmd = super::request::Thread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),
             criteria,
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::ThreadConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// UID THREAD  -  server-side threading returning UIDs
@@ -120,18 +102,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<Vec<ThreadNode>, Error> {
         let criteria = criteria.into();
-        self.check_utf8_only_enforced()?;
 
-        let cmd = Command::UidThread {
+        let cmd = super::request::UidThread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),
             criteria,
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::ThreadConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 }

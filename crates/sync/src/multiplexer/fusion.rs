@@ -17,17 +17,15 @@
 
 use std::sync::Arc;
 
-use bifrost_types::{
-    Account, AccountError, Change, Checkpoint, CursorScope, ObjectChange, ObjectChangeKind,
-    SyncEvent,
-};
+use bifrost_types::{Account, AccountError, Checkpoint, CursorScope, SyncEvent};
 use futures::stream::StreamExt;
 
 #[cfg(test)]
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
+use crate::delivery::InventoryPublication as Forwarded;
 use crate::error::Error;
-use crate::inventory_walk::{InventoryWalk, WalkDecision};
+use crate::inventory_walk::{InventoryWalk, PageVerdict};
 
 use super::{ChangeDelivery, EventScope, MultiplexerEvent};
 
@@ -53,16 +51,6 @@ pub enum FusionOutcome {
     /// `AccountError` so the caller dispatches through
     /// `error.recovery()`.
     Terminated(AccountError),
-}
-
-/// What `forward_inventory_batch` did with one batch.
-enum Forwarded {
-    /// Sent on the delivery (with its publication, if it carried a checkpoint).
-    Published,
-    /// Nobody capable of acknowledging received this page. Retry the walk.
-    Undelivered,
-    /// Registration refused after a reset; the writer must retain this debt.
-    Refused(crate::cursor::CoverageClaim),
 }
 
 pub struct InventoryFusion {
@@ -202,40 +190,16 @@ impl InventoryFusion {
                             .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Ok(FusionOutcome::Terminated(error));
                     }
-                    let crossed = if completion.coverage.has_barrier() {
-                        crate::inventory_walk::cross_waived_barriers(
-                            Some(&self.publisher.writer),
-                            &completion.coverage,
-                            self.generation,
-                        )
-                        .await?
-                    } else {
-                        false
-                    };
-                    if !crossed
-                        && let WalkDecision::StopAtBarrier { resume_from } =
-                            walk.inspect(&completion.coverage)
-                    {
-                        // The walk ended on ground the cursor may not cross.
-                        // Establishing here would advance past a region nothing
-                        // can ever replay. Same rule as the backfill runner: a
-                        // barrier the store refused is announced to nobody -
-                        // the walk fails instead, so establishment is retried
-                        // rather than warning about an incident a restart
-                        // forgets and no operator can act on.
-                        self.record_barriers(&scope, &completion.coverage, resume_from)
-                            .await?;
-                        Self::warn_degraded(delivery, &scope, &completion.coverage);
+                    let verdict = walk
+                        .judge(&completion.coverage, &self.publisher, self.generation)
+                        .await?;
+                    if verdict == PageVerdict::Stop {
+                        walk.warn_coverage(delivery, &scope, &completion.coverage, verdict, true);
                         return Ok(FusionOutcome::NoCursor);
                     }
-                    // Past the stop, a barrier can only stand here if the
-                    // operator waived it, which is what `crossed` says.
-                    let checkpoint = completion.checkpoint.accepted(crossed).cloned();
+                    let checkpoint = completion.checkpoint.accepted(verdict.crossed()).cloned();
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
-                    let degraded = !completion.coverage.is_complete();
-                    if degraded {
-                        Self::warn_degraded(delivery, &scope, &completion.coverage);
-                    }
+                    walk.warn_coverage(delivery, &scope, &completion.coverage, verdict, true);
                     if let Some(cp) = checkpoint.clone() {
                         // Register the claim BEFORE publishing: a fast consumer
                         // can acknowledge between the send and a later
@@ -297,23 +261,11 @@ impl InventoryFusion {
                     // taken and the walk stops here. Checkpoints already
                     // accepted earlier in this walk stand: each of them
                     // certifies a prefix that ends before this region begins.
-                    let crossed = if batch.coverage.has_barrier() {
-                        crate::inventory_walk::cross_waived_barriers(
-                            Some(&self.publisher.writer),
-                            &batch.coverage,
-                            self.generation,
-                        )
-                        .await?
-                    } else {
-                        false
-                    };
-                    if !crossed
-                        && let WalkDecision::StopAtBarrier { resume_from } =
-                            walk.inspect(&batch.coverage)
-                    {
-                        self.record_barriers(&scope, &batch.coverage, resume_from)
-                            .await?;
-                        match self.forward_inventory_batch(delivery, &scope, &batch, None) {
+                    let verdict = walk
+                        .judge(&batch.coverage, &self.publisher, self.generation)
+                        .await?;
+                    if verdict == PageVerdict::Stop {
+                        match self.forward_inventory_batch(&scope, &batch, None) {
                             Ok(Forwarded::Published) => {}
                             Ok(Forwarded::Undelivered) => return Ok(FusionOutcome::Undelivered),
                             Ok(Forwarded::Refused(claim)) => {
@@ -321,13 +273,13 @@ impl InventoryFusion {
                             }
                             Err(error) => return Ok(FusionOutcome::Terminated(error)),
                         }
-                        Self::warn_degraded(delivery, &scope, &batch.coverage);
+                        walk.warn_coverage(delivery, &scope, &batch.coverage, verdict, false);
                         return Ok(FusionOutcome::NoCursor);
                     }
-                    let checkpoint = batch.checkpoint.accepted(crossed).cloned();
+                    let checkpoint = batch.checkpoint.accepted(verdict.crossed()).cloned();
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
                     walk.accept(checkpoint.clone());
-                    match self.forward_inventory_batch(delivery, &scope, &batch, checkpoint) {
+                    match self.forward_inventory_batch(&scope, &batch, checkpoint) {
                         Ok(Forwarded::Published) => {}
                         Ok(Forwarded::Undelivered) => return Ok(FusionOutcome::Undelivered),
                         Ok(Forwarded::Refused(claim)) => {
@@ -335,6 +287,7 @@ impl InventoryFusion {
                         }
                         Err(error) => return Ok(FusionOutcome::Terminated(error)),
                     }
+                    walk.warn_coverage(delivery, &scope, &batch.coverage, verdict, false);
                 }
                 // A producer-emitted warning is forwarded, not absorbed. Graph
                 // announces its public-folder over-cap degrade this way (past
@@ -372,12 +325,6 @@ impl InventoryFusion {
         );
     }
 
-    /// Point-in-time fence check for batches that carry no checkpoint.
-    /// Checkpoint-bearing pages use conditional registration instead.
-    fn fence_moved(&self, scope: &CursorScope) -> bool {
-        self.publisher.coverage.scope_fence(scope) != self.expected_fence
-    }
-
     async fn refused(
         &self,
         scope: &CursorScope,
@@ -393,88 +340,6 @@ impl InventoryFusion {
         Ok(FusionOutcome::Invalidated)
     }
 
-    /// Persist the blocked-progress incidents in `coverage`.
-    ///
-    /// A barrier is not debt behind an advanced cursor - no checkpoint was
-    /// accepted past it - so it cannot ride the acknowledgement path. Writing
-    /// nothing at all would be worse than it sounds: every restart would forget
-    /// the scope keeps hitting the same wall, and an operator would have no
-    /// durable object to waive.
-    ///
-    /// An `Err` is a store write that FAILED, and it must propagate: a walk
-    /// that goes on to warn and return `NoCursor` over it announces a barrier
-    /// nothing durable records, which a restart forgets and no operator can
-    /// block or waive. The caller fails the walk instead, so establishment is
-    /// retried under its ordinary error contract. A departed writer (detach,
-    /// shutdown) is not a failure - there is nothing left to persist to.
-    async fn record_barriers(
-        &self,
-        scope: &CursorScope,
-        coverage: &bifrost_types::InventoryCoverageReport,
-        resume_from: Option<Checkpoint>,
-    ) -> Result<(), Error> {
-        let result = crate::inventory_walk::record_barriers(
-            Some(&self.publisher.writer),
-            coverage,
-            self.generation,
-            resume_from,
-        )
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(
-                target: "bifrost.sync.inventory",
-                account = ?self.account_id,
-                scope = ?scope,
-                error = %error,
-                "failed to persist inventory barrier incident; failing the walk"
-            );
-        }
-        result
-    }
-
-    /// Surface degraded coverage to the consumer.
-    ///
-    /// Durable debt that nothing reports is only half a fix: the scope is live
-    /// and converging, but objects are known-missing and only an operator can
-    /// decide whether to repair, wait, or accept the gap.
-    fn warn_degraded(
-        delivery: &Arc<ChangeDelivery>,
-        scope: &CursorScope,
-        coverage: &bifrost_types::InventoryCoverageReport,
-    ) {
-        if coverage.is_complete() {
-            return;
-        }
-        let obligations = coverage.obligations();
-        let tx = delivery;
-        let barriers = obligations
-            .iter()
-            .filter(|obligation| obligation.is_barrier())
-            .count();
-        let warning = bifrost_types::Warning::user_safe(
-            bifrost_types::WarningKind::Engine(if barriers > 0 {
-                bifrost_types::EngineNotice::BarrierStop { regions: barriers }
-            } else {
-                bifrost_types::EngineNotice::DegradedCoverage {
-                    obligations: obligations.len(),
-                }
-            }),
-            if barriers > 0 {
-                format!(
-                    "inventory stopped at {barriers} region(s) it cannot represent and cannot \
-                     replay; the scope cannot advance past them until an operator waives them"
-                )
-            } else {
-                format!(
-                    "inventory completed with {} object(s) or region(s) it could not represent; \
-                     the scope is live but incomplete",
-                    obligations.len()
-                )
-            },
-        );
-        tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
-    }
-
     /// Forward a page's entries, publishing `checkpoint` with them.
     ///
     /// `checkpoint` is the position the caller ACCEPTED, passed separately from
@@ -482,72 +347,19 @@ impl InventoryFusion {
     /// take a withheld position.
     fn forward_inventory_batch(
         &self,
-        tx: &ChangeDelivery,
         scope: &CursorScope,
         batch: &bifrost_types::InventoryBatch,
         checkpoint: Option<Checkpoint>,
     ) -> Result<Forwarded, AccountError> {
-        // Checkpoint-free batches mint no claim, but still belong to the walk.
-        if checkpoint.is_none() && self.fence_moved(scope) {
-            return Ok(Forwarded::Refused(crate::cursor::CoverageClaim {
-                reports: Vec::new(),
-                generation: self.generation,
-            }));
-        }
-        let removals = match crate::inventory_walk::removals(scope, batch.removed.iter()) {
-            Ok(removals) => removals,
-            Err(error) => {
-                tx.publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
-                return Err(error);
-            }
-        };
-        // Inventory entries describe object existence; surface them as
-        // `Created` changes so consumers handle inventory the same way
-        // they handle a freshly-discovered object on the live stream.
-        let changes: Vec<Change> = batch
-            .items
-            .iter()
-            .map(|entry| {
-                Change::ObjectChange(ObjectChange {
-                    id: entry.id.clone(),
-                    kind: ObjectChangeKind::Created,
-                })
-            })
-            .chain(removals)
-            .collect();
-        let synthetic = bifrost_types::Batch {
-            items: changes,
-            page_boundary: batch.page_boundary,
-            server_latency: batch.server_latency,
-            bytes_in: batch.bytes_in,
-            checkpoint: checkpoint.clone(),
-        };
-        // A checkpoint-bearing batch declares the coverage it advances across,
-        // not just the terminal completion: Graph checkpoints per page, so
-        // waiting for `Done` would let a page checkpoint become durable across
-        // a gap it never declared.
-        let me = MultiplexerEvent {
-            scope: EventScope::Cursor(scope.clone()),
-            event: Arc::new(SyncEvent::Batch(synthetic)),
-            checkpoint: checkpoint.clone(),
-            publication: None,
-        };
-        if checkpoint.is_some() {
-            match self.publisher.publish_page(
-                me,
-                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
-                self.expected_fence,
-            ) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Forwarded::Undelivered),
-                Err(claim) => return Ok(Forwarded::Refused(claim)),
-            }
-        } else if !tx.publish_acknowledgeable(me) {
-            // Even a checkpoint-free page belongs to the prefix certified by
-            // Done. Stop now so a later cursor cannot skip its lost objects.
-            return Ok(Forwarded::Undelivered);
-        }
-        Ok(Forwarded::Published)
+        self.publisher.publish_inventory(
+            scope,
+            batch,
+            batch.items.iter().map(|entry| &entry.id),
+            batch.removed.iter(),
+            checkpoint,
+            self.generation,
+            self.expected_fence,
+        )
     }
 
     async fn finalize(
@@ -777,6 +589,41 @@ mod tests {
             },
         })
     }
+    #[tokio::test]
+    async fn degraded_pages_warn_once_before_an_unannounced_end() {
+        let (fusion, delivery, mut observer, _views) = guarded_fusion();
+        let _receiver = delivery.subscribe(None, Arc::clone(&fusion.publisher.coverage));
+        let outcome = fusion
+            .run_stream(
+                CursorScope::Account,
+                Box::pin(futures::stream::iter([
+                    page(false, true),
+                    page(false, true),
+                ])),
+            )
+            .await
+            .expect("walk");
+        assert!(matches!(outcome, FusionOutcome::NoCursor));
+        let mut incomplete = 0;
+        let mut unannounced = 0;
+        while let Ok(event) = observer.try_recv() {
+            if let SyncEvent::Warning(warning) = event.event.as_ref() {
+                match warning.kind {
+                    bifrost_types::WarningKind::Engine(
+                        bifrost_types::EngineNotice::DegradedCoverage { .. },
+                    ) => incomplete += 1,
+                    bifrost_types::WarningKind::InventoryEndedUnannounced => unannounced += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            incomplete, 1,
+            "missing objects must be announced even without Done"
+        );
+        assert_eq!(unannounced, 1);
+    }
+
     #[tokio::test]
     async fn a_fusion_page_under_a_moved_fence_is_refused_and_its_debt_recorded() {
         let (mut fusion, _delivery, mut rx, _views) = guarded_fusion();

@@ -189,3 +189,6 @@ impl<'de> Deserialize<'de> for Response {
         })
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

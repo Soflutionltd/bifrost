@@ -443,7 +443,7 @@ fn bad_without_code_maps_to_request_malformed() {
 }
 
 #[test]
-fn incomplete_uid_expansion_is_an_acknowledged_local_request_limit() {
+fn incomplete_uid_expansion_is_an_acknowledged_internal_limit() {
     let account = into_account_error(
         Error::ResultLimit(crate::error::ResultLimit::SearchTruncated {
             returned: 1_000_000,
@@ -454,7 +454,7 @@ fn incomplete_uid_expansion_is_an_acknowledged_local_request_limit() {
 
     assert!(matches!(
         account.kind(),
-        AccountErrorKind::Request(RequestErrorKind::Malformed)
+        AccountErrorKind::Internal(bifrost_types::InternalErrorKind::LimitExceeded)
     ));
     assert!(account.chain().iter().any(|cause| matches!(
         cause,
@@ -1206,4 +1206,116 @@ fn scram_refusals_keep_shared_recovery_intent() {
         };
         assert_eq!(actual, lane, "{token}");
     }
+}
+
+#[test]
+fn payload_limits_are_refusals_with_native_evidence() {
+    let local = into_account_error(
+        Error::LocalRefusal(crate::error::LocalRefusal::AppendLimit {
+            size: 11,
+            limit: 10,
+        }),
+        ImapErrorContext::operation(AccountOperation::DraftCreate),
+    );
+    assert_eq!(
+        local.kind(),
+        &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+    );
+    assert_eq!(local.recovery(), &RecoveryClass::ProviderRefused);
+    assert!(!local.chain().iter().any(|c| matches!(c, Cause::Attempt(_))));
+    for code in [
+        ResponseCode::TooBig,
+        ResponseCode::MaxConvertMessages(None),
+        ResponseCode::MaxConvertParts(None),
+        ResponseCode::MetadataMaxSize(10),
+    ] {
+        let wire = ImapResponseCode::from(&code);
+        let error = into_account_error(
+            Error::no_with_code("limit".into(), Some(code)),
+            ImapErrorContext::operation(AccountOperation::DraftCreate),
+        );
+        assert_eq!(error.kind(), local.kind());
+        assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+        assert!(
+            error
+                .chain()
+                .iter()
+                .any(|c| matches!(c, Cause::Wire(WireCause::Imap(c)) if c == &wire))
+        );
+        assert!(error.chain().iter().any(|c| matches!(c, Cause::Attempt(a) if a.transmission_state == TransmissionState::Acknowledged)));
+    }
+}
+
+#[test]
+fn local_result_budgets_are_internal_limits_with_accurate_attempts() {
+    use crate::error::ResultLimit;
+    for (limit, state) in [
+        (
+            ResultLimit::Fetch {
+                estimated: 11,
+                limit: 10,
+                seq: None,
+                uid: None,
+            },
+            TransmissionState::Acknowledged,
+        ),
+        (
+            ResultLimit::FetchLiteral {
+                estimated: 11,
+                limit: 10,
+            },
+            TransmissionState::InFlight,
+        ),
+        (
+            ResultLimit::SearchTruncated {
+                returned: 10,
+                omitted: Some(1),
+            },
+            TransmissionState::Acknowledged,
+        ),
+    ] {
+        let error = into_account_error(
+            Error::ResultLimit(limit),
+            ImapErrorContext::operation(AccountOperation::Hydrate),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::LimitExceeded)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
+        assert!(
+            error
+                .chain()
+                .iter()
+                .any(|c| matches!(c, Cause::Attempt(a) if a.transmission_state == state))
+        );
+    }
+}
+
+#[test]
+fn target_state_refusals_do_not_blame_the_caller_or_retry_old_targets() {
+    let folder = mailbox("INBOX");
+    let active = sieve_error(
+        Some(SieveResponseCode::Active),
+        AccountOperation::FilterUpdate,
+    );
+    let nonempty = super::non_empty_mailbox(&folder);
+    let stale = super::uidvalidity_changed_error(AccountOperation::BulkMove, &folder);
+    for error in [&active, &nonempty, &stale] {
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+        assert_eq!(error.message_key(), "request.precondition-failed");
+    }
+    assert_eq!(
+        stale.scope(),
+        Some(&ErrorScope::Cursor(folder_cursor("INBOX")))
+    );
+    assert_eq!(
+        nonempty.operation(),
+        Some(AccountOperation::ContainerDelete)
+    );
+    assert_eq!(active.operation(), Some(AccountOperation::FilterUpdate));
 }

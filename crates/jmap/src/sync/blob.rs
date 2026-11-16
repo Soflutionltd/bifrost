@@ -246,6 +246,7 @@ pub(crate) fn open_range(
         yield super::error::terminated_unsupported(
             AccountOperation::OpenBlobRange,
             None,
+            bifrost_types::UnsupportedReason::RangeTransport,
             "JMAP ranged blob download needs a Range-capable transport hook",
         );
     })

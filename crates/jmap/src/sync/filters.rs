@@ -26,14 +26,26 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
 }
 
 fn unsupported(op: AccountOperation, detail: &'static str) -> AccountError {
-    super::error::unsupported_error(op, None, detail)
+    super::error::unsupported_error(
+        op,
+        None,
+        bifrost_types::UnsupportedReason::RequestShape,
+        detail,
+    )
 }
 
 fn require_sieve<T: HttpTransport>(
     account: Option<SieveAccount<T>>,
     op: AccountOperation,
 ) -> Result<SieveAccount<T>, AccountError> {
-    account.ok_or_else(|| unsupported(op, "JMAP Sieve capability not available"))
+    account.ok_or_else(|| {
+        super::error::unsupported_error(
+            op,
+            None,
+            bifrost_types::UnsupportedReason::CapabilityUnavailable,
+            "JMAP Sieve capability not available",
+        )
+    })
 }
 
 // Production requests, including the per-filter script-body downloads, are

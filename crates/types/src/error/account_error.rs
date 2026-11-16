@@ -7,7 +7,7 @@ use super::diagnostic::{
     DetailVisibility, DiagnosticInfo, SupportExportConsented, SupportExportInternal,
     SupportExportMinimal, TelemetryToken, TelemetryView, account_kind_discriminant,
 };
-use super::kind::AccountErrorKind;
+use super::kind::{AccountErrorKind, UnsupportedReason};
 use super::partial::{CompensationOutcome, PartialCommit, StepOutcome};
 use super::recovery::{
     ReconcileAction, ReconcileReason, RecoveryClass, RemediationAction, RetryDisposition,
@@ -57,6 +57,7 @@ struct AccountErrorInner {
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
     throttle_budgets: Vec<ThrottleBudget>,
+    unsupported_reason: Option<UnsupportedReason>,
 }
 
 impl AccountError {
@@ -150,6 +151,7 @@ impl AccountError {
                 idempotency_override: self.inner.idempotency_override,
                 throttle_scope: self.inner.throttle_scope,
                 throttle_budgets: self.inner.throttle_budgets.clone(),
+                unsupported_reason: None,
             });
         builder
             .text(super::diagnostic::DiagnosticText::support_only(format!(
@@ -180,6 +182,7 @@ impl AccountError {
                 idempotency_override: parts.idempotency_override,
                 throttle_scope: parts.throttle_scope,
                 throttle_budgets: parts.throttle_budgets,
+                unsupported_reason: parts.unsupported_reason,
             }),
         }
     }
@@ -233,6 +236,13 @@ impl AccountError {
             }
         }
         observations
+    }
+
+    /// The typed local refusal reason, when the producer supplied one.
+    /// This does not change recovery or the canonical unsupported message key.
+    #[must_use]
+    pub fn unsupported_reason(&self) -> Option<UnsupportedReason> {
+        self.inner.unsupported_reason
     }
 
     /// Holds across primary, sibling and cleanup failures, with budget precedence.
@@ -430,6 +440,7 @@ impl AccountError {
             idempotency_override: inner.idempotency_override,
             throttle_scope: inner.throttle_scope,
             throttle_budgets: inner.throttle_budgets,
+            unsupported_reason: inner.unsupported_reason,
         })
     }
 }
@@ -467,6 +478,7 @@ pub(crate) struct AccountErrorParts {
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
     pub throttle_budgets: Vec<ThrottleBudget>,
+    pub unsupported_reason: Option<UnsupportedReason>,
 }
 
 impl<'a> TelemetryView<'a> {

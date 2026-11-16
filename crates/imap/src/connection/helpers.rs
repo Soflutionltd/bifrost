@@ -263,12 +263,7 @@ impl ImapConnection {
     /// Valid in any state (RFC 3501 Section 6.1.2). Returns an error only
     /// if the connection is closed (e.g. after LOGOUT).
     pub async fn noop(&self, timeout: Duration) -> Result<(), Error> {
-        self.submit_regular(
-            Command::Noop,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(super::request::Noop {}, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -285,18 +280,8 @@ impl ImapConnection {
     /// `IMAP4rev2`. On a pure rev2 connection, use [`noop`](Self::noop)
     /// instead  -  this method returns [`crate::error::LocalRefusal::MissingCapability`].
     pub async fn check(&self, timeout: Duration) -> Result<(), Error> {
-        self.require_state(crate::types::CommandKind::Check)?;
-        // RFC 9051 removed CHECK; reject when rev2 behavior is active.
-        // `is_rev2_from_snapshot` already handles dual-mode servers: it
-        // returns true only after `ENABLE IMAP4rev2` (or on pure-rev2
-        // servers). Once rev2 is active, CHECK is undefined.
-
-        self.submit_regular(
-            Command::Check,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(super::request::Check {}, timeout)
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -313,12 +298,8 @@ impl ImapConnection {
     ///
     /// Valid in any state (RFC 3501 Section 6.1.1).
     pub async fn capability(&self, timeout: Duration) -> Result<Vec<Capability>, Error> {
-        self.submit_regular(
-            Command::Capability,
-            super::dispatch::CapabilityConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(super::request::Capability {}, timeout)
+            .await
     }
 }
 

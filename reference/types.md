@@ -867,3 +867,16 @@ policy where they establish subject absence.
 Recipient validation accepts the calling `Protocol` and stamps empty-send
 refusals. Provider-neutral MIME rendering and header resolution pass `Unknown`;
 account boundaries stamp their protocol when propagating renderer failures.
+
+## Request refusals
+
+`RequestErrorKind::{PayloadTooLarge, PreconditionFailed}` distinguish provider
+input limits and unsatisfied target state from malformed caller requests. Their
+matching `RequestCause` variants retain support diagnostics. Both derive terminal
+`ProviderRefused`, stable request message keys and `FixClientRequest` remediation.
+`UnsupportedReason` is optional metadata on Unsupported errors, set by the
+builder and read through `AccountError::unsupported_reason`; decoration preserves
+it and `try_build` rejects it on other kinds. It lets an enterprise client explain
+which feature or request shape is unavailable without parsing support prose.
+Ledger vocabulary version 14 appends request subkind tags 2 and 3. Historical
+rows keep their existing bytes and reject those tags before version 14.

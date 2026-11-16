@@ -18,17 +18,11 @@ pub(crate) struct QuotaConsumer {
     root: String,
     /// The matching QUOTA response, if received.
     result: Option<Vec<QuotaResource>>,
-    /// Non-matching or non-QUOTA responses routed here via classification.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl QuotaConsumer {
     pub(crate) fn new(root: String) -> Self {
-        Self {
-            root,
-            result: None,
-            buffered: Vec::new(),
-        }
+        Self { root, result: None }
     }
 }
 
@@ -40,7 +34,7 @@ impl Consumer for QuotaConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 2087 Section4.2 / Section4.1: accept only the QUOTA for the requested root.
         // RFC 3501 Section5.2: unrelated untagged responses may be interleaved.
         match resp {
@@ -49,8 +43,9 @@ impl Consumer for QuotaConsumer {
             {
                 self.result = Some(resources);
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -58,11 +53,8 @@ impl Consumer for QuotaConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Vec<QuotaResource>> {
-        // `buffered` is the generic `Either` catch-all: the solicited QUOTA
-        // for this root lives in `result`, so nothing here is this command's
-        // own output and it is surrendered on every path.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         let Some(resources) = self.result else {
             return Finalized::failure(
@@ -71,10 +63,10 @@ impl Consumer for QuotaConsumer {
                      (RFC 2087 Section 4.2)",
                     self.root,
                 ))),
-                self.buffered,
+                Vec::new(),
             );
         };
-        Finalized::success(resources, self.buffered)
+        Finalized::success(resources, Vec::new())
     }
 }
 
@@ -90,8 +82,6 @@ pub(crate) struct QuotaRootConsumer {
     roots: Option<Vec<String>>,
     /// All QUOTA responses received.
     quotas: Vec<(String, Vec<QuotaResource>)>,
-    /// Non-matching responses.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl QuotaRootConsumer {
@@ -100,7 +90,6 @@ impl QuotaRootConsumer {
             mailbox,
             roots: None,
             quotas: Vec::new(),
-            buffered: Vec::new(),
         }
     }
 }
@@ -113,7 +102,7 @@ impl Consumer for QuotaRootConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             // RFC 2087 Section 4.3: QUOTAROOT response correlates by mailbox
             // address, preserving noncanonical wire identity and RFC 3501
@@ -130,8 +119,9 @@ impl Consumer for QuotaRootConsumer {
             UntaggedResponse::Quota { root, resources } => {
                 self.quotas.push((root, resources));
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -139,10 +129,8 @@ impl Consumer for QuotaRootConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<QuotaRootResponse> {
-        // `buffered` holds only responses this command never solicited, so it
-        // is surrendered on every path, failure included.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
 
         let Some(roots) = self.roots else {
@@ -152,14 +140,14 @@ impl Consumer for QuotaRootConsumer {
                      (RFC 2087 Section 4.3)",
                     self.mailbox,
                 ))),
-                self.buffered,
+                Vec::new(),
             );
         };
 
         // Partition QUOTA responses: matching roots are the result,
         // non-matching are reclassified as events.
         let mut resources: Vec<(String, Vec<QuotaResource>)> = Vec::new();
-        let mut buffered = self.buffered;
+        let mut buffered = Vec::new();
         for (root, res) in self.quotas {
             if roots.iter().any(|expected| expected == &root) {
                 resources.push((root, res));
@@ -175,9 +163,6 @@ impl Consumer for QuotaRootConsumer {
             return Finalized::success(QuotaRootResponse { roots, resources }, buffered);
         }
         if resources.is_empty() {
-            // Real `Error` in `output` - the driver classifies it before the
-            // result is published. `buffered` still goes out; the only thing
-            // lost is the (empty) resource partition.
             return Finalized::failure(
                 Error::Provider(crate::error::ProviderFailure::Missing(format!(
                     "server sent OK but no QUOTA response for QUOTAROOT mailbox \
@@ -200,8 +185,6 @@ pub(crate) struct AclConsumer {
     mailbox: MailboxName,
     /// The matching ACL entries, if received.
     result: Option<Vec<AclEntry>>,
-    /// Non-matching responses.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl AclConsumer {
@@ -209,7 +192,6 @@ impl AclConsumer {
         Self {
             mailbox,
             result: None,
-            buffered: Vec::new(),
         }
     }
 }
@@ -222,7 +204,7 @@ impl Consumer for AclConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 4314 Section 3.3 / RFC 3501 Section 5.2: correlate by mailbox
         // address, preserving noncanonical wire identity.
         match resp {
@@ -231,8 +213,9 @@ impl Consumer for AclConsumer {
             {
                 self.result = Some(entries);
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -240,10 +223,8 @@ impl Consumer for AclConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Vec<AclEntry>> {
-        // The solicited ACL lives in `result`; `buffered` is the generic
-        // `Either` catch-all and is surrendered on every path.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         let Some(entries) = self.result else {
             return Finalized::failure(
@@ -252,10 +233,10 @@ impl Consumer for AclConsumer {
                      (RFC 4314 Section 3.3)",
                     self.mailbox,
                 ))),
-                self.buffered,
+                Vec::new(),
             );
         };
-        Finalized::success(entries, self.buffered)
+        Finalized::success(entries, Vec::new())
     }
 }
 
@@ -270,8 +251,6 @@ pub(crate) struct ListRightsConsumer {
     identifier: String,
     /// The matching LISTRIGHTS response, if received.
     result: Option<ListRightsResponse>,
-    /// Non-matching responses.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl ListRightsConsumer {
@@ -280,7 +259,6 @@ impl ListRightsConsumer {
             mailbox,
             identifier,
             result: None,
-            buffered: Vec::new(),
         }
     }
 }
@@ -293,7 +271,7 @@ impl Consumer for ListRightsConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 4314 Section3.4: correlate by mailbox AND identifier.
         match resp {
             UntaggedResponse::ListRights {
@@ -307,8 +285,9 @@ impl Consumer for ListRightsConsumer {
             {
                 self.result = Some(ListRightsResponse { required, optional });
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -316,10 +295,8 @@ impl Consumer for ListRightsConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<ListRightsResponse> {
-        // The solicited LISTRIGHTS lives in `result`; `buffered` is the
-        // generic `Either` catch-all and is surrendered on every path.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         let Some(result) = self.result else {
             return Finalized::failure(
@@ -328,10 +305,10 @@ impl Consumer for ListRightsConsumer {
                      and identifier '{}' (RFC 4314 Section 3.4)",
                     self.mailbox, self.identifier,
                 ))),
-                self.buffered,
+                Vec::new(),
             );
         };
-        Finalized::success(result, self.buffered)
+        Finalized::success(result, Vec::new())
     }
 }
 
@@ -343,8 +320,6 @@ pub(crate) struct MyRightsConsumer {
     mailbox: MailboxName,
     /// The matching MYRIGHTS rights string, if received.
     result: Option<String>,
-    /// Non-matching responses.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl MyRightsConsumer {
@@ -352,7 +327,6 @@ impl MyRightsConsumer {
         Self {
             mailbox,
             result: None,
-            buffered: Vec::new(),
         }
     }
 }
@@ -365,7 +339,7 @@ impl Consumer for MyRightsConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 4314 Section3.5: correlate by mailbox.
         match resp {
             UntaggedResponse::MyRights { mailbox, rights }
@@ -373,8 +347,9 @@ impl Consumer for MyRightsConsumer {
             {
                 self.result = Some(rights);
             }
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -382,10 +357,8 @@ impl Consumer for MyRightsConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<String> {
-        // The solicited MYRIGHTS lives in `result`; `buffered` is the generic
-        // `Either` catch-all and is surrendered on every path.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
         let Some(rights) = self.result else {
             return Finalized::failure(
@@ -394,10 +367,10 @@ impl Consumer for MyRightsConsumer {
                      (RFC 4314 Section 3.5)",
                     self.mailbox,
                 ))),
-                self.buffered,
+                Vec::new(),
             );
         };
-        Finalized::success(rights, self.buffered)
+        Finalized::success(rights, Vec::new())
     }
 }
 
@@ -421,8 +394,6 @@ pub(crate) struct MetadataConsumer {
     notify_ambiguity: bool,
     /// Whether we saw at least one matching METADATA response.
     saw_matching: bool,
-    /// Different-mailbox METADATA and non-METADATA responses.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl MetadataConsumer {
@@ -432,7 +403,6 @@ impl MetadataConsumer {
             entries: Vec::new(),
             notify_ambiguity: false,
             saw_matching: false,
-            buffered: Vec::new(),
         }
     }
 }
@@ -445,7 +415,7 @@ impl Consumer for MetadataConsumer {
         resp: UntaggedResponse,
         notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         match resp {
             // Same-mailbox METADATA: accumulate entries.
             // RFC 5464 Section4.2: GETMETADATA can produce multiple METADATA
@@ -467,8 +437,9 @@ impl Consumer for MetadataConsumer {
                 self.entries.extend(entries);
             }
             // Different-mailbox METADATA or non-METADATA: reclassify.
-            other => self.buffered.push(other),
+            other => return Some(other),
         }
+        None
     }
 
     fn finalize(
@@ -476,15 +447,8 @@ impl Consumer for MetadataConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<MetadataResult> {
-        // On failure the `entries` accumulator is dropped: same-mailbox
-        // METADATA is wire-identical between the solicited reply and a NOTIFY
-        // event (RFC 5465 Section5.6-5.7, RFC 5464 Section4.2), so re-emitting
-        // it would leak potentially-solicited data into the NOTIFY event
-        // channel. `buffered` is a different set - different-mailbox METADATA
-        // and non-METADATA `Either` responses, none of which this command
-        // solicited - so it is surrendered.
         if let Err(e) = tagged.require_ok() {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
 
         if !self.saw_matching {
@@ -494,7 +458,7 @@ impl Consumer for MetadataConsumer {
                      response for the requested mailbox (RFC 5464 Section 4.2)"
                         .into(),
                 )),
-                self.buffered,
+                Vec::new(),
             );
         }
 
@@ -503,7 +467,7 @@ impl Consumer for MetadataConsumer {
                 entries: self.entries,
                 notify_ambiguity: self.notify_ambiguity,
             },
-            self.buffered,
+            Vec::new(),
         )
     }
 }
@@ -518,7 +482,9 @@ mod tests {
     fn quota_root_correlation_uses_wire_identity() {
         let canonical = MailboxName::new("a").expect("valid mailbox");
         let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
-        let mut consumer = QuotaRootConsumer::new(canonical.clone());
+        let mut consumer = crate::connection::test_support::record_consumer(
+            QuotaRootConsumer::new(canonical.clone()),
+        );
         let context = ConsumerContext {
             session: crate::types::profile::SessionCapabilities::empty(),
             command_target: Some(&canonical),

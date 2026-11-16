@@ -22,6 +22,82 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
+/// Unit-consumer assertions observe declined responses alongside the deferred
+/// disposition. Wire transcripts separately pin the driver's immediate event
+/// delivery and its suppression of already-emitted critical codes.
+pub(crate) struct RecordedConsumer<C> {
+    inner: C,
+    declined: Vec<UntaggedResponse>,
+}
+
+pub(crate) fn record_consumer<C: dispatch::Consumer>(inner: C) -> RecordedConsumer<C> {
+    RecordedConsumer {
+        inner,
+        declined: Vec::new(),
+    }
+}
+
+impl<C: dispatch::Consumer> RecordedConsumer<C> {
+    pub(crate) fn on_response(
+        &mut self,
+        response: UntaggedResponse,
+        notify: NotifyFlags,
+        ctx: &dispatch::ConsumerContext,
+    ) {
+        let _ = <Self as dispatch::Consumer>::on_response(self, response, notify, ctx);
+    }
+}
+
+impl<C: dispatch::Consumer> dispatch::Consumer for RecordedConsumer<C> {
+    type Output = C::Output;
+
+    fn literal_budget(&self) -> Option<usize> {
+        self.inner.literal_budget()
+    }
+
+    fn on_response(
+        &mut self,
+        response: UntaggedResponse,
+        notify: NotifyFlags,
+        ctx: &dispatch::ConsumerContext,
+    ) -> Option<UntaggedResponse> {
+        if let Some(response) = self.inner.on_response(response, notify, ctx) {
+            self.declined.push(response);
+        }
+        None
+    }
+
+    fn finalize(
+        self: Box<Self>,
+        tagged: crate::types::response::TaggedResponse,
+        ctx: &dispatch::ConsumerContext,
+    ) -> dispatch::Finalized<Self::Output> {
+        let Self {
+            inner,
+            mut declined,
+        } = *self;
+        let finalized = Box::new(inner).finalize(tagged, ctx);
+        declined.extend(finalized.reclassified_as_events);
+        dispatch::Finalized {
+            output: finalized.output,
+            reclassified_as_events: declined,
+        }
+    }
+}
+
+impl<C> std::ops::Deref for RecordedConsumer<C> {
+    type Target = C;
+    fn deref(&self) -> &C {
+        &self.inner
+    }
+}
+
+impl<C> std::ops::DerefMut for RecordedConsumer<C> {
+    fn deref_mut(&mut self) -> &mut C {
+        &mut self.inner
+    }
+}
+
 /// Build an [`ImapConnection`] with no driver behind it.
 ///
 /// The state snapshot is fixed at construction: this is the right double

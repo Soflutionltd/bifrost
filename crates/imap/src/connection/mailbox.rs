@@ -16,10 +16,7 @@ impl ImapConnection {
         pattern: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
-        use super::dispatch::ListConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::List {
+        let cmd = super::request::List {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
         };
@@ -28,12 +25,7 @@ impl ImapConnection {
         // NOTIFICATIONOVERFLOW (RFC 5465 Section5.8) is handled automatically:
         // apply_side_effects clears the notify flags, so subsequent
         // snapshots have list=false.
-        self.submit_regular(
-            cmd,
-            ListConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// LIST mailboxes with RFC 5258 selection options, multiple patterns, and
@@ -82,21 +74,16 @@ impl ImapConnection {
         return_options: &[&str],
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
-        use super::dispatch::ListExtendedConsumer;
-
-        self.check_utf8_only_enforced()?;
         let names = patterns
             .iter()
             .map(crate::types::MailboxInput::mailbox_name)
             .collect::<Result<Vec<_>, _>>()?;
-        let display = names.iter().map(MailboxName::as_str).collect::<Vec<_>>();
-        self.validate_list_extended_request(&display, selection_options, return_options)?;
 
         if selection_options.is_empty() && return_options.is_empty() && patterns.len() == 1 {
             return self.list(reference, patterns[0], timeout).await;
         }
 
-        let cmd = Command::ListExtended {
+        let cmd = super::request::ListExtended {
             selection_options: selection_options
                 .iter()
                 .map(|option| (*option).into())
@@ -108,10 +95,8 @@ impl ImapConnection {
                 .map(|option| (*option).into())
                 .collect(),
         };
-        let consumer =
-            ListExtendedConsumer::new(selection_options.iter().map(|o| (*o).into()).collect());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -127,25 +112,16 @@ impl ImapConnection {
         status_items: &str,
         timeout: Duration,
     ) -> Result<Vec<crate::types::ListStatusEntry>, Error> {
-        use super::dispatch::ListStatusConsumer;
-
-        self.check_utf8_only_enforced()?;
         // RFC 5819 Section 2 extends the LIST command syntax from RFC 5258
         // Section 3, so IMAP4rev1 needs both LIST-STATUS and LIST-EXTENDED.
         // RFC 9051 Section 6.3.9 folds LIST-STATUS into the IMAP4rev2 base.
 
-        self.validate_requested_status_items(status_items)?;
-        let cmd = Command::ListStatus {
+        let cmd = super::request::ListStatus {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
             status_items: status_items.into(),
         };
-        self.submit_regular(
-            cmd,
-            ListStatusConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).
@@ -226,24 +202,11 @@ impl ImapConnection {
         options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
-        use super::dispatch::SelectConsumer;
-
-        let wire_mailbox = mailbox.mailbox_name()?;
-        let cmd = if is_examine {
-            Command::Examine {
-                mailbox: wire_mailbox,
-                condstore: options.condstore,
-                qresync: options.qresync.clone(),
-            }
-        } else {
-            Command::Select {
-                mailbox: wire_mailbox,
-                condstore: options.condstore,
-                qresync: options.qresync.clone(),
-            }
+        let request = super::request::Selection {
+            mailbox: mailbox.mailbox_name()?,
+            is_examine,
+            options: options.clone(),
         };
-
-        let consumer = SelectConsumer::new(is_examine);
         // NO/BAD and validation failures arrive as the ordinary `Err` of this
         // call now that `Finalized::output` carries them. The consumer still
         // reclassifies its accumulated responses as events on those paths -
@@ -252,8 +215,7 @@ impl ImapConnection {
         //
         // State transitions (Selected on OK, Authenticated on NO) are
         // handled by the driver's apply_tagged via the tagged SELECT effect.
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+        self.execute_request(request, timeout).await
     }
 
     /// Validate QRESYNC parameters before SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).
@@ -290,18 +252,10 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Option<String>, Error> {
-        use super::dispatch::CreateConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::Create {
+        let cmd = super::request::Create {
             mailbox: mailbox.mailbox_name()?,
         };
-        self.submit_regular(
-            cmd,
-            CreateConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// CREATE a mailbox with special-use attributes (RFC 6154 Section 3).
@@ -333,10 +287,6 @@ impl ImapConnection {
         special_use: &[MailboxAttribute],
         timeout: Duration,
     ) -> Result<Option<String>, Error> {
-        use super::dispatch::CreateConsumer;
-
-        // RFC 6855 Section 3: UTF8=ONLY requires ENABLE UTF8=ACCEPT first.
-        self.check_utf8_only_enforced()?;
         // RFC 6154 Section 3: CREATE is a `command-auth`  -  valid only in
         // Authenticated or Selected state.
 
@@ -355,16 +305,11 @@ impl ImapConnection {
                 ),
             ));
         }
-        let cmd = Command::CreateSpecialUse {
+        let cmd = super::request::CreateSpecialUse {
             mailbox: mailbox.mailbox_name()?,
             special_use: special_use.to_vec(),
         };
-        self.submit_regular(
-            cmd,
-            CreateConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// DELETE a mailbox (RFC 3501 Section 6.3.4).
@@ -373,18 +318,10 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::TaggedOkConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::Delete {
+        let cmd = super::request::Delete {
             mailbox: mailbox.mailbox_name()?,
         };
-        self.submit_regular(
-            cmd,
-            TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// RENAME a mailbox (RFC 3501 Section 6.3.5).
@@ -394,19 +331,11 @@ impl ImapConnection {
         new_name: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::TaggedOkConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::Rename {
+        let cmd = super::request::Rename {
             mailbox: mailbox.mailbox_name()?,
             new_name: new_name.mailbox_name()?,
         };
-        self.submit_regular(
-            cmd,
-            TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// SUBSCRIBE to a mailbox (RFC 3501 Section 6.3.6).
@@ -418,18 +347,10 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::TaggedOkConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::Subscribe {
+        let cmd = super::request::Subscribe {
             mailbox: mailbox.mailbox_name()?,
         };
-        self.submit_regular(
-            cmd,
-            TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// UNSUBSCRIBE from a mailbox (RFC 3501 Section 6.3.7).
@@ -438,18 +359,10 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::TaggedOkConsumer;
-
-        self.check_utf8_only_enforced()?;
-        let cmd = Command::Unsubscribe {
+        let cmd = super::request::Unsubscribe {
             mailbox: mailbox.mailbox_name()?,
         };
-        self.submit_regular(
-            cmd,
-            TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// LSUB  -  list subscribed mailboxes (RFC 3501 Section 6.3.9).
@@ -462,23 +375,14 @@ impl ImapConnection {
         pattern: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
-        use super::dispatch::LsubConsumer;
-
-        self.check_utf8_only_enforced()?;
-
         // RFC 9051 Appendix F item 19: LSUB was deprecated in IMAP4rev2.
         // Use LIST with \Subscribed return option instead.
 
-        let cmd = Command::Lsub {
+        let cmd = super::request::Lsub {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
         };
-        self.submit_regular(
-            cmd,
-            LsubConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// CLOSE the selected mailbox (RFC 3501 Section 6.4.2).
@@ -490,14 +394,8 @@ impl ImapConnection {
     /// State transition to `Authenticated` is handled by the driver task
     /// via the tagged CLOSE effect in `ProtocolState::apply_tagged`.
     pub async fn close(&self, timeout: Duration) -> Result<(), Error> {
-        use super::dispatch::TaggedOkConsumer;
-
-        self.submit_regular(
-            Command::Close,
-            TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await?;
+        self.execute_request(super::request::Close {}, timeout)
+            .await?;
         Ok(())
     }
 
@@ -519,12 +417,8 @@ impl ImapConnection {
     /// The state snapshot transitions to `Authenticated` only after the
     /// tagged OK is received and processed by the driver.
     pub async fn unselect(&self, timeout: Duration) -> Result<(), Error> {
-        self.submit_regular(
-            Command::Unselect,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await?;
+        self.execute_request(super::request::Unselect {}, timeout)
+            .await?;
         Ok(())
     }
 
@@ -543,20 +437,11 @@ impl ImapConnection {
         items: &str,
         timeout: Duration,
     ) -> Result<StatusResult, Error> {
-        use super::dispatch::StatusConsumer;
-
-        self.check_utf8_only_enforced()?;
-        self.validate_requested_status_items(items)?;
-        let cmd = Command::Status {
+        let cmd = super::request::Status {
             mailbox: mailbox.mailbox_name()?,
             items: items.into(),
         };
-        self.submit_regular(
-            cmd,
-            StatusConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 }
 

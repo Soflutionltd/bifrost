@@ -393,3 +393,6 @@ mod time_zone_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

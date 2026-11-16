@@ -46,7 +46,8 @@ fn default_ctx() -> ConsumerContext<'static> {
 #[tokio::test]
 async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut consumer = StreamingFetchConsumer::new(tx);
+    let mut consumer =
+        crate::connection::test_support::record_consumer(StreamingFetchConsumer::new(tx));
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
 
@@ -105,7 +106,7 @@ fn fetch_byte_estimate_counts_gmail_labels() {
 /// never going to get, and re-emitting it would flood the event sink.
 #[test]
 fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
-    let mut consumer = FetchConsumer::new();
+    let mut consumer = crate::connection::test_support::record_consumer(FetchConsumer::new());
     let ctx = default_ctx();
 
     consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
@@ -141,7 +142,8 @@ fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
 #[tokio::test]
 async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut consumer = StreamingFetchConsumer::new(tx);
+    let mut consumer =
+        crate::connection::test_support::record_consumer(StreamingFetchConsumer::new(tx));
     let ctx = default_ctx();
 
     consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
@@ -181,7 +183,7 @@ async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
 /// the mailbox. Verbatim and in order - `buffered` first, then `mutations`.
 #[test]
 fn expunge_consumer_propagates_terminal_bad_and_surrenders_both_buffers() {
-    let mut consumer = ExpungeConsumer::new();
+    let mut consumer = crate::connection::test_support::record_consumer(ExpungeConsumer::new());
     let ctx = default_ctx();
 
     consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
@@ -234,7 +236,9 @@ fn esearch_all(tag: Option<&str>, all: Vec<UidRange>) -> UntaggedResponse {
 /// keep their wire order.
 #[test]
 fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() {
-    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
+    let mut consumer = crate::connection::test_support::record_consumer(SearchConsumer::<
+        crate::types::Uid,
+    >::new());
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
     consumer.on_response(
@@ -266,7 +270,9 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
 /// is never an asynchronous notification, so it must not become an event.
 #[test]
 fn search_consumer_drops_the_surplus_esearch_on_success() {
-    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
+    let mut consumer = crate::connection::test_support::record_consumer(SearchConsumer::<
+        crate::types::Uid,
+    >::new());
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
     consumer.on_response(
@@ -295,7 +301,9 @@ fn search_consumer_drops_the_surplus_esearch_on_success() {
 fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     let ctx = default_ctx();
 
-    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
+    let mut consumer = crate::connection::test_support::record_consumer(SearchConsumer::<
+        crate::types::Uid,
+    >::new());
     consumer.on_response(
         // `ALL *` is kept distinct from the numeric UID maximum.
         esearch_all(
@@ -318,7 +326,9 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
         "a standalone `*` must not expand to the literal id 4294967295"
     );
 
-    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
+    let mut consumer = crate::connection::test_support::record_consumer(SearchConsumer::<
+        crate::types::Uid,
+    >::new());
     consumer.on_response(
         esearch_all(
             Some("A001"),
@@ -361,7 +371,7 @@ fn thread_consumer_empty_result_returns_ok() {
 
 #[test]
 fn id_consumer_solicited_response_not_leaked() {
-    let mut consumer = IdConsumer::default();
+    let mut consumer = crate::connection::test_support::record_consumer(IdConsumer::default());
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
 
@@ -415,7 +425,7 @@ fn tagged_ok_with(code: ResponseCode) -> TaggedResponse {
 /// code, and being the answer it is consumed, not also published as an event.
 #[test]
 fn append_consumer_uses_an_untagged_appenduid_as_the_answer() {
-    let mut consumer = AppendConsumer::default();
+    let mut consumer = crate::connection::test_support::record_consumer(AppendConsumer::default());
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
     consumer.on_response(UntaggedResponse::Exists(3), notify, &ctx);
@@ -444,7 +454,7 @@ fn append_consumer_uses_an_untagged_appenduid_as_the_answer() {
 /// rather than silently dropped.
 #[test]
 fn append_consumer_surrenders_an_untagged_appenduid_the_tagged_code_outranks() {
-    let mut consumer = AppendConsumer::default();
+    let mut consumer = crate::connection::test_support::record_consumer(AppendConsumer::default());
     let ctx = default_ctx();
     let untagged = untagged_appenduid_ok(1, vec![UidRange::single(1)]);
     consumer.on_response(untagged.clone(), NotifyFlags::default(), &ctx);
@@ -471,7 +481,7 @@ fn append_consumer_surrenders_an_untagged_appenduid_the_tagged_code_outranks() {
 /// what used to make it unrecoverable.
 #[test]
 fn append_consumer_surrenders_the_whole_untagged_ok_on_failure() {
-    let mut consumer = AppendConsumer::default();
+    let mut consumer = crate::connection::test_support::record_consumer(AppendConsumer::default());
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
     let untagged = untagged_appenduid_ok(4242, vec![UidRange::single(12)]);
@@ -493,7 +503,8 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
     let notify = NotifyFlags::default();
     let untagged = untagged_appenduid_ok(5, vec![UidRange::range(10, 12), UidRange::single(20)]);
 
-    let mut consumer = MultiAppendConsumer::new(4);
+    let mut consumer =
+        crate::connection::test_support::record_consumer(MultiAppendConsumer::new(4));
     consumer.on_response(untagged.clone(), notify, &ctx);
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert_eq!(
@@ -522,7 +533,8 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
         "the consumed untagged OK is the answer, not an event"
     );
 
-    let mut consumer = MultiAppendConsumer::new(4);
+    let mut consumer =
+        crate::connection::test_support::record_consumer(MultiAppendConsumer::new(4));
     consumer.on_response(untagged.clone(), notify, &ctx);
     let result = Box::new(consumer).finalize(tagged_bad(), &ctx);
     assert!(result.output.is_err());
@@ -588,7 +600,8 @@ fn multi_append_consumer_expands_a_backwards_range() {
 
 #[test]
 fn namespace_consumer_solicited_response_not_leaked() {
-    let mut consumer = NamespaceConsumer::default();
+    let mut consumer =
+        crate::connection::test_support::record_consumer(NamespaceConsumer::default());
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
 
@@ -632,7 +645,7 @@ fn namespace_consumer_solicited_response_not_leaked() {
 
 #[test]
 fn enable_consumer_captures_extensions() {
-    let mut consumer = EnableConsumer::default();
+    let mut consumer = crate::connection::test_support::record_consumer(EnableConsumer::default());
     let ctx = default_ctx();
     let notify = NotifyFlags::default();
 

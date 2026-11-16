@@ -30,7 +30,7 @@ pub use diagnostic::{
 pub use kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, InternalErrorKind, MailboxUnavailableKind,
     ProtocolErrorKind, RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
-    TransportErrorKind,
+    TransportErrorKind, UnsupportedReason,
 };
 pub use recovery::{
     EngineDirective, EngineDirectiveIdentity, Fatal, OperatorOverrideReason, ReconcileAction,

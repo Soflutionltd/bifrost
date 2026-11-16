@@ -610,8 +610,26 @@ impl BoundaryEntry {
 /// single acknowledgement discharge the whole stream - silently stops holding.
 #[derive(Debug)]
 struct Ledger {
+    claims: Claims,
+    ring: RingCharge,
+    fences: Fences,
+    mint: PublicationMint,
+    /// Highest BACKFILL publication id this ledger has ever minted, per scope.
+    ///
+    /// Survives the publication itself: the entry is removed on acknowledgement,
+    /// retirement or invalidation, so "is anything of a newer attempt still
+    /// outstanding" cannot be asked of `boundaries`. What a ceilinged discard
+    /// needs to know is whether a NEWER attempt exists at all - an attempt whose
+    /// rows a whole-scope `delete_backfill` would take with it - and that
+    /// question is about what was minted, not about what is still in flight. One
+    /// entry per scope, so it stays bounded exactly as `fenced` does.
+    last_backfill_mint: HashMap<CursorScope, PublicationNumber>,
+}
+
+#[derive(Debug, Default)]
+struct Claims {
     /// Publications that have not yet been resolved.
-    claims: HashMap<AckToken, Publication>,
+    pending: HashMap<AckToken, Publication>,
     /// Debt rescued from publications nobody can acknowledge, waiting for the
     /// next publication that someone can.
     carried: Option<CoverageClaim>,
@@ -632,10 +650,60 @@ struct Ledger {
     /// coverage now rides the survivor. One entry per stream, so this stays
     /// bounded where a per-publication record would not.
     folded: HashMap<PublicationStream, AckToken>,
+}
+
+impl Claims {
+    /// Move each publication's DEBT into the carry-forward slot and drop its
+    /// claim. Caller holds the ledger lock and has already dealt with the
+    /// boundary entries.
+    ///
+    /// See [`CoverageClaim::debt_only`] for why only the debt travels: what a
+    /// batch nobody received proved CLEAN must not discharge anything.
+    fn carry_and_forget(&mut self, ids: impl IntoIterator<Item = AckToken>) {
+        for id in ids {
+            if let Some(publication) = self.pending.remove(&id) {
+                let debt = publication.claim.debt_only();
+                carry_forward(&mut self.carried, debt);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RingCharge {
     /// Publications whose checkpoint the control path is still waiting on, in
     /// publication order. Also the backfill stream's capacity ledger - see
     /// [`BoundaryEntry`].
     boundaries: Vec<BoundaryEntry>,
+    /// The numbered consumer receivers currently holding a subscription.
+    ///
+    /// The single membership set, updated under ChangeDelivery's ordering lock.
+    /// Delivery queries this ledger rather than maintaining a second copy.
+    /// Lock order is delivery -> coverage, never the reverse.
+    live: BTreeSet<crate::delivery::ReceiverSequence>,
+}
+
+impl RingCharge {
+    fn acknowledge(&mut self, id: &AckToken) {
+        if let Some(index) = self.boundaries.iter().position(|entry| entry.id == *id) {
+            self.boundaries.remove(index);
+        } else if let Some(entry) = self
+            .boundaries
+            .iter_mut()
+            .find(|entry| entry.subsumed.iter().any(|page| page.id == *id))
+        {
+            // The consumer acknowledged a batch a later publication has
+            // since superseded. It really received that batch, so its
+            // capacity is settled even though its record moved to the
+            // survivor; the survivor's own boundary stays until it is
+            // acknowledged too.
+            entry.subsumed.retain(|page| page.id != *id);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Fences {
     /// Per-scope acknowledgement fence installed by a durable scope reset.
     ///
     /// Holds the mint counter as of the moment the reset closed. Every
@@ -657,22 +725,6 @@ struct Ledger {
     /// an attachment that ended before this reset, so none may land after it.
     /// Repair receipts carry no scope and stay acknowledgeable.
     fenced_account: ScopeFence,
-    /// Highest BACKFILL publication id this ledger has ever minted, per scope.
-    ///
-    /// Survives the publication itself: the entry is removed on acknowledgement,
-    /// retirement or invalidation, so "is anything of a newer attempt still
-    /// outstanding" cannot be asked of `boundaries`. What a ceilinged discard
-    /// needs to know is whether a NEWER attempt exists at all - an attempt whose
-    /// rows a whole-scope `delete_backfill` would take with it - and that
-    /// question is about what was minted, not about what is still in flight. One
-    /// entry per scope, so it stays bounded exactly as `fenced` does.
-    last_backfill_mint: HashMap<CursorScope, PublicationNumber>,
-    /// The numbered consumer receivers currently holding a subscription.
-    ///
-    /// The single membership set, updated under ChangeDelivery's ordering lock.
-    /// Delivery queries this ledger rather than maintaining a second copy.
-    /// Lock order is delivery -> coverage, never the reverse.
-    live: BTreeSet<crate::delivery::ReceiverSequence>,
     /// The same fence, narrowed to the BACKFILL stream.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
@@ -683,20 +735,69 @@ struct Ledger {
     fenced_backfill: HashMap<CursorScope, ScopeFence>,
 }
 
-impl Default for Ledger {
+impl Fences {
+    fn scope_fence(&self, scope: &CursorScope) -> ScopeFence {
+        self.fenced
+            .get(scope)
+            .copied()
+            .unwrap_or_else(PendingCoverage::initial_fence)
+            .max(self.fenced_account)
+    }
+
+    fn raise_scope(&mut self, scope: &CursorScope, watermark: ScopeFence) {
+        let entry = self.fenced.entry(scope.clone()).or_insert(watermark);
+        *entry = (*entry).max(watermark);
+    }
+
+    fn raise_backfill(&mut self, scope: &CursorScope, watermark: ScopeFence) {
+        let entry = self
+            .fenced_backfill
+            .entry(scope.clone())
+            .or_insert(watermark);
+        *entry = (*entry).max(watermark);
+    }
+}
+
+impl Default for Fences {
     fn default() -> Self {
         Self {
-            claims: HashMap::new(),
-            carried: None,
-            persisted: HashMap::new(),
-            folded: HashMap::new(),
-            boundaries: Vec::new(),
             fenced: HashMap::new(),
             fenced_account: PendingCoverage::initial_fence(),
-            last_backfill_mint: HashMap::new(),
-            live: BTreeSet::new(),
             fenced_backfill: HashMap::new(),
         }
+    }
+}
+
+impl Ledger {
+    fn new(segment: u64) -> Self {
+        Self {
+            claims: Claims::default(),
+            ring: RingCharge::default(),
+            fences: Fences::default(),
+            mint: PublicationMint {
+                next: segment << PendingCoverage::SEGMENT_SHIFT,
+            },
+            last_backfill_mint: HashMap::new(),
+        }
+    }
+}
+
+/// Publication identities and reset fences consume the same sequence, always
+/// under the primary ledger guard. Proof generations have a separate lifetime.
+#[derive(Debug)]
+struct PublicationMint {
+    next: u64,
+}
+
+impl PublicationMint {
+    fn issue(&mut self) -> PublicationNumber {
+        let number = PublicationNumber(self.next);
+        self.next = self.next.wrapping_add(1);
+        number
+    }
+
+    fn burn_fence(&mut self) -> ScopeFence {
+        ScopeFence(self.issue().0 + 1)
     }
 }
 
@@ -706,16 +807,32 @@ impl Default for Ledger {
 pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 
 /// Per-account publication registry.
+///
+/// Delivery ordering and durable acknowledgement transitions are crate-private;
+/// use `ChangeDelivery`, `PagePublisher` and `WriterHandle::ack` for those.
+/// Inspection and standalone live-claim operations remain available.
+
 #[derive(Debug)]
 pub struct PendingCoverage {
     pub(crate) account: Option<bifrost_types::AccountId>,
     ledger: Mutex<Ledger>,
     delivery_owner: Mutex<Option<std::sync::Weak<crate::delivery::ChangeDelivery>>>,
-    next: AtomicU64,
     /// This instance's id segment: the high bits every id it mints carries.
     /// Lets a publication minted by a PRIOR attachment be recognised as such.
     segment: u64,
     next_generation: AtomicU64,
+    loss: LossLedger,
+    /// Pulsed whenever backfill capacity is freed, so a producer parked on the
+    /// bound wakes without polling. Every path that removes or lightens a
+    /// boundary entry pulses it, which is one more thing that comes for free
+    /// from capacity being a property of the record.
+    capacity: tokio::sync::Notify,
+}
+
+/// Sweeps finish the primary ledger transition before recording delivery loss.
+/// Keep their existing independent locks and delivery -> coverage ordering.
+#[derive(Debug, Default)]
+struct LossLedger {
     /// Scopes whose durable backfill rows a recorded loss has asked to drop.
     /// See [`PendingCoverage::note_undelivered`].
     discard_requests: Mutex<HashSet<CursorScope>>,
@@ -731,16 +848,26 @@ pub struct PendingCoverage {
     /// ledger lock, and giving the counter its own lock keeps that from becoming
     /// a re-entrancy rule somebody has to remember.
     undelivered: Mutex<HashMap<CursorScope, UndeliveredMark>>,
-    /// Pulsed whenever backfill capacity is freed, so a producer parked on the
-    /// bound wakes without polling. Every path that removes or lightens a
-    /// boundary entry pulses it, which is one more thing that comes for free
-    /// from capacity being a property of the record.
-    capacity: tokio::sync::Notify,
     /// Set by `detach` the moment teardown begins, and never cleared: the
     /// ledger dies with the attachment. Read by the departure sweep
     /// ([`PendingCoverage::release_undelivered`]), which is inert once this is
     /// set - see the ruling recorded there.
     tearing_down: AtomicBool,
+}
+
+impl LossLedger {
+    fn record(&self, scope: &CursorScope, count: usize) {
+        self.undelivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(scope.clone())
+            .or_insert_with(PendingCoverage::initial_undelivered_mark)
+            .record_loss(count);
+        self.discard_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(scope.clone());
+    }
 }
 
 static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
@@ -757,17 +884,14 @@ impl Default for PendingCoverage {
         let segment = NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             account: None,
-            ledger: Mutex::new(Ledger::default()),
+            ledger: Mutex::new(Ledger::new(segment)),
             delivery_owner: Mutex::new(None),
-            next: AtomicU64::new(segment << Self::SEGMENT_SHIFT),
             segment,
             // Standalone registries start at zero. The account writer restores
             // durable proof order before installing any producers.
             next_generation: AtomicU64::new(0),
-            undelivered: Mutex::new(HashMap::new()),
-            discard_requests: Mutex::new(HashSet::new()),
+            loss: LossLedger::default(),
             capacity: tokio::sync::Notify::new(),
-            tearing_down: AtomicBool::new(false),
         }
     }
 }
@@ -863,11 +987,8 @@ impl PendingCoverage {
     /// Mint and register under ONE ledger guard. Minting under one guard and
     /// registering under another lets an id minted before invalidation escape
     /// both retirement passes, stranding the debt in a fenced registration.
-    fn mint(&self, _held: &mut Ledger, receipt: PublicationReceipt) -> AckToken {
-        AckToken(
-            PublicationNumber(self.next.fetch_add(1, Ordering::Relaxed)),
-            std::sync::Arc::new(receipt),
-        )
+    fn mint(&self, held: &mut Ledger, receipt: PublicationReceipt) -> AckToken {
+        AckToken(held.mint.issue(), std::sync::Arc::new(receipt))
     }
 
     /// Issue an identity for a REPAIR publication that carries no coverage
@@ -904,7 +1025,7 @@ impl PendingCoverage {
         };
         let mut ledger = self.guard();
         let id = self.mint(&mut ledger, receipt);
-        ledger.claims.insert(
+        ledger.claims.pending.insert(
             id.clone(),
             Publication {
                 stream: PublicationStream::Repair,
@@ -977,7 +1098,7 @@ impl PendingCoverage {
             let Some(scope) = stream.scope() else {
                 return Err(claim);
             };
-            if Self::scope_fence_in(&ledger, scope) != expected {
+            if ledger.fences.scope_fence(scope) != expected {
                 return Err(claim);
             }
         }
@@ -1001,7 +1122,7 @@ impl PendingCoverage {
         // publish on scope B, reset A: A's obligation is sitting inside B's claim
         // and both of the reset's passes walk straight past it. A publication
         // absorbs what it can actually make durable and leaves the rest carried.
-        if let Some(carried) = ledger.carried.take() {
+        if let Some(carried) = ledger.claims.carried.take() {
             let (mine, theirs): (Vec<_>, Vec<_>) = carried
                 .reports
                 .into_iter()
@@ -1013,7 +1134,7 @@ impl PendingCoverage {
                 });
             }
             if !theirs.is_empty() {
-                ledger.carried = Some(CoverageClaim {
+                ledger.claims.carried = Some(CoverageClaim {
                     reports: theirs,
                     generation: carried.generation,
                 });
@@ -1038,11 +1159,12 @@ impl PendingCoverage {
         let charged = matches!(stream, PublicationStream::Backfill(..));
         if stream.supersedes()
             && let Some(index) = ledger
+                .ring
                 .boundaries
                 .iter()
                 .position(|entry| entry.stream == stream)
         {
-            let previous = ledger.boundaries.remove(index);
+            let previous = ledger.ring.boundaries.remove(index);
             let superseded = previous.id.clone();
             if charged {
                 subsumed = previous.subsumed;
@@ -1059,9 +1181,10 @@ impl PendingCoverage {
             // whose claim an acknowledgement already consumed is answered by
             // the persisted watermark, or by nothing - it must not be handed a
             // second, empty acknowledgement on the strength of this fold.
-            if let Some(old) = ledger.claims.remove(&superseded) {
+            if let Some(old) = ledger.claims.pending.remove(&superseded) {
                 claim.absorb(old.claim);
                 let mark = ledger
+                    .claims
                     .folded
                     .entry(stream.clone())
                     .or_insert(superseded.clone());
@@ -1074,8 +1197,8 @@ impl PendingCoverage {
         // Backstop for an unkeyed `Checkpoint` variant, which never supersedes.
         // The debt still carries forward; only the boundary registration goes.
         let mut freed_capacity = false;
-        if ledger.boundaries.len() >= PENDING_BOUNDARY_CAP {
-            let evicted = ledger.boundaries.remove(0);
+        if ledger.ring.boundaries.len() >= PENDING_BOUNDARY_CAP {
+            let evicted = ledger.ring.boundaries.remove(0);
             // Evicting a charged entry FREES backfill capacity, and anything
             // parked on the bound has to be told. Every other path that lightens
             // the ledger pulses the notify; this one is reached only through an
@@ -1091,8 +1214,8 @@ impl PendingCoverage {
             for dropped in
                 std::iter::once(evicted.id).chain(evicted.subsumed.into_iter().map(|page| page.id))
             {
-                if let Some(old) = ledger.claims.remove(&dropped) {
-                    carry_forward(&mut ledger.carried, old.claim.debt_only());
+                if let Some(old) = ledger.claims.pending.remove(&dropped) {
+                    carry_forward(&mut ledger.claims.carried, old.claim.debt_only());
                 }
             }
         }
@@ -1101,14 +1224,14 @@ impl PendingCoverage {
         // exactly like the live claim. Freeze it only after folding, before
         // any consumer can receive this publication.
         std::sync::Arc::make_mut(&mut id.1).claim = claim.clone();
-        ledger.claims.insert(
+        ledger.claims.pending.insert(
             id.clone(),
             Publication {
                 stream: stream.clone(),
                 claim,
             },
         );
-        ledger.boundaries.push(BoundaryEntry {
+        ledger.ring.boundaries.push(BoundaryEntry {
             id: id.clone(),
             stream,
             checkpoint,
@@ -1162,17 +1285,8 @@ impl PendingCoverage {
     /// from the counter instead would not move across two resets with nothing
     /// minted between them, and a walk that snapshotted the first would not see
     /// the second. Called only under the ledger lock.
-    fn burn_fence(&self, _held: &mut Ledger) -> ScopeFence {
-        ScopeFence(self.next.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-
-    fn scope_fence_in(ledger: &Ledger, scope: &CursorScope) -> ScopeFence {
-        ledger
-            .fenced
-            .get(scope)
-            .copied()
-            .unwrap_or_else(Self::initial_fence)
-            .max(ledger.fenced_account)
+    fn burn_fence(&self, held: &mut Ledger) -> ScopeFence {
+        held.mint.burn_fence()
     }
 
     /// Revoke every fence-guarded producer of one scope, now. Retires nothing:
@@ -1181,7 +1295,7 @@ impl PendingCoverage {
     pub(crate) fn raise_scope_fence(&self, scope: &CursorScope) {
         let mut ledger = self.guard();
         let fence = self.burn_fence(&mut ledger);
-        Self::fence_in(&mut ledger, scope, fence);
+        ledger.fences.raise_scope(scope, fence);
         drop(ledger);
         self.wake_capacity();
     }
@@ -1191,7 +1305,7 @@ impl PendingCoverage {
     /// the store.
     pub(crate) fn raise_account_fence(&self) {
         let mut ledger = self.guard();
-        ledger.fenced_account = self.burn_fence(&mut ledger);
+        ledger.fences.fenced_account = self.burn_fence(&mut ledger);
         drop(ledger);
         self.wake_capacity();
     }
@@ -1206,24 +1320,26 @@ impl PendingCoverage {
     pub(crate) fn invalidate_account(&self) -> CoverageClaim {
         let mut ledger = self.guard();
         ledger
+            .ring
             .boundaries
             .retain(|entry| entry.stream.scope().is_none());
-        let mut debt = ledger.carried.take().unwrap_or(CoverageClaim {
+        let mut debt = ledger.claims.carried.take().unwrap_or(CoverageClaim {
             reports: Vec::new(),
             generation: crate::cursor::PendingCoverage::initial_generation(),
         });
         let ids: Vec<_> = ledger
             .claims
+            .pending
             .iter()
             .filter(|(_, publication)| publication.stream.scope().is_some())
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            if let Some(publication) = ledger.claims.remove(&id) {
+            if let Some(publication) = ledger.claims.pending.remove(&id) {
                 debt.absorb(publication.claim.debt_only());
             }
         }
-        ledger.fenced_account = self.burn_fence(&mut ledger);
+        ledger.fences.fenced_account = self.burn_fence(&mut ledger);
         drop(ledger);
         self.wake_capacity();
         debt.debt_only()
@@ -1243,7 +1359,7 @@ impl PendingCoverage {
     /// and the answer is `None`: not a marker this attachment can judge, which
     /// refuses NOTHING rather than assuming the worst.
     #[must_use]
-    pub fn walk_watermark(&self, id: &AckToken) -> Option<UndeliveredMark> {
+    pub(crate) fn walk_watermark(&self, id: &AckToken) -> Option<UndeliveredMark> {
         if !self.minted_here(id) {
             return None;
         }
@@ -1256,7 +1372,7 @@ impl PendingCoverage {
     /// acknowledgement replayed across a detach is recognisable without keeping
     /// any state about the attachment that minted it.
     #[must_use]
-    pub fn minted_here(&self, id: &AckToken) -> bool {
+    pub(crate) fn minted_here(&self, id: &AckToken) -> bool {
         id.1.account == self.account && id.0.0 >> Self::SEGMENT_SHIFT == self.segment
     }
 
@@ -1270,9 +1386,18 @@ impl PendingCoverage {
     /// exactly that reason: a receiver that subscribes between the two really
     /// does receive the batch, and judging it beforehand would retire the
     /// capacity of a page that is about to be delivered.
-    pub fn mark_delivered(&self, id: &AckToken, subscriber_seq: crate::delivery::ReceiverSequence) {
+    pub(crate) fn mark_delivered(
+        &self,
+        id: &AckToken,
+        subscriber_seq: crate::delivery::ReceiverSequence,
+    ) {
         let mut ledger = self.guard();
-        if let Some(entry) = ledger.boundaries.iter_mut().find(|entry| entry.id == *id) {
+        if let Some(entry) = ledger
+            .ring
+            .boundaries
+            .iter_mut()
+            .find(|entry| entry.id == *id)
+        {
             entry.delivered_at = Some(subscriber_seq);
         }
     }
@@ -1295,11 +1420,15 @@ impl PendingCoverage {
     /// consumer is only now reading may already have been folded into a later
     /// publication of its partition, and the page just read is almost always
     /// either the survivor or the most recently folded element.
-    pub fn mark_received(&self, id: &AckToken, receiver_seq: crate::delivery::ReceiverSequence) {
+    pub(crate) fn mark_received(
+        &self,
+        id: &AckToken,
+        receiver_seq: crate::delivery::ReceiverSequence,
+    ) {
         let freed = {
             let mut ledger = self.guard();
             let mut freed = false;
-            for entry in &mut ledger.boundaries {
+            for entry in &mut ledger.ring.boundaries {
                 // Only the backfill stream has a bound to keep honest, and only it
                 // inherits a charge on supersession. Marking a live-stream entry
                 // would leave state nothing ever reads, which is the sort of
@@ -1325,7 +1454,7 @@ impl PendingCoverage {
 
     /// Lowest numbered receiver still subscribed, from the authoritative set.
     pub(crate) fn min_live_receiver(&self) -> Option<crate::delivery::ReceiverSequence> {
-        self.guard().live.iter().next().copied()
+        self.guard().ring.live.iter().next().copied()
     }
 
     /// A numbered consumer receiver has subscribed.
@@ -1334,7 +1463,7 @@ impl PendingCoverage {
     /// numbered at or above every existing page's `delivered_at`, and only
     /// receivers numbered strictly below one hold it. So this never needs a wake.
     pub(crate) fn receiver_joined(&self, receiver_seq: crate::delivery::ReceiverSequence) {
-        self.guard().live.insert(receiver_seq);
+        self.guard().ring.live.insert(receiver_seq);
     }
 
     /// A numbered consumer receiver has gone.
@@ -1347,7 +1476,7 @@ impl PendingCoverage {
     /// earlier. Called under the delivery gate's lock, ahead of that sweep.
     pub(crate) fn receiver_departed(&self, receiver_seq: crate::delivery::ReceiverSequence) {
         let mut ledger = self.guard();
-        let was_live = ledger.live.remove(&receiver_seq);
+        let was_live = ledger.ring.live.remove(&receiver_seq);
         drop(ledger);
         if was_live {
             self.wake_capacity();
@@ -1367,10 +1496,11 @@ impl PendingCoverage {
     pub fn backfill_in_flight(&self) -> usize {
         let ledger = self.guard();
         ledger
+            .ring
             .boundaries
             .iter()
             .filter(|entry| matches!(entry.stream, PublicationStream::Backfill(..)))
-            .map(|entry| entry.unread_charge(&ledger.live))
+            .map(|entry| entry.unread_charge(&ledger.ring.live))
             .sum()
     }
 
@@ -1396,6 +1526,7 @@ impl PendingCoverage {
         let mut holders = BTreeSet::new();
         let mut scopes: Vec<CursorScope> = Vec::new();
         for entry in ledger
+            .ring
             .boundaries
             .iter()
             .filter(|entry| matches!(entry.stream, PublicationStream::Backfill(..)))
@@ -1408,13 +1539,14 @@ impl PendingCoverage {
                     .map(|page| (page.delivered_at, &page.readers)),
             );
             for (delivered_at, readers) in pages {
-                if !BoundaryEntry::page_unread(delivered_at, readers, &ledger.live) {
+                if !BoundaryEntry::page_unread(delivered_at, readers, &ledger.ring.live) {
                     continue;
                 }
                 charged = true;
                 if let Some(sent_at) = delivered_at {
                     holders.extend(
                         ledger
+                            .ring
                             .live
                             .range(..sent_at)
                             .filter(|seq| !readers.contains(seq)),
@@ -1457,8 +1589,8 @@ impl PendingCoverage {
     /// before the flag finishes recording its loss and its discard request
     /// before `detach` drains the requests. A bare store here is not ordered
     /// against that; tests that call it directly have no concurrent sweep.
-    pub fn begin_teardown(&self) {
-        self.tearing_down.store(true, Ordering::Release);
+    pub(crate) fn begin_teardown(&self) {
+        self.loss.tearing_down.store(true, Ordering::Release);
     }
 
     /// Retire every published backfill boundary that no live receiver can still
@@ -1500,11 +1632,11 @@ impl PendingCoverage {
     /// window behave exactly like a drop after it, and `reference/sync.md`
     /// states the contract. Do not re-file the window as a defect; what would
     /// reopen it is a downstream store willing to pay for the row.
-    pub fn release_undelivered(
+    pub(crate) fn release_undelivered(
         &self,
         min_live: Option<crate::delivery::ReceiverSequence>,
     ) -> usize {
-        if self.tearing_down.load(Ordering::Acquire) {
+        if self.loss.tearing_down.load(Ordering::Acquire) {
             return 0;
         }
         // Which scope each retirement belongs to, so the record lands on the
@@ -1517,7 +1649,7 @@ impl PendingCoverage {
             // that superseded it can have different readers, so a survivor whose
             // own stamp is still reachable may be carrying pages that are not.
             let mut demote = Vec::new();
-            for entry in &mut ledger.boundaries {
+            for entry in &mut ledger.ring.boundaries {
                 if !matches!(entry.stream, PublicationStream::Backfill(..)) {
                     continue;
                 }
@@ -1546,12 +1678,12 @@ impl PendingCoverage {
             // coverage costs a re-walk, over-reporting it loses objects nobody
             // sees again.
             for id in demote {
-                if let Some(publication) = ledger.claims.get_mut(&id) {
+                if let Some(publication) = ledger.claims.pending.get_mut(&id) {
                     publication.claim = publication.claim.clone().debt_only();
                 }
             }
             // Then whole entries whose own send is beyond every live reader.
-            ledger.boundaries.retain(|entry| {
+            ledger.ring.boundaries.retain(|entry| {
                 if matches!(entry.stream, PublicationStream::Backfill(..))
                     && entry.undeliverable(min_live)
                 {
@@ -1587,7 +1719,7 @@ impl PendingCoverage {
             // fenced the id anyway - so the obligation reached only the volatile
             // `carried` slot and was lost at detach. Retirement and debt
             // extraction are the same decision and must not be two.
-            Self::carry_and_forget(&mut ledger, retired.iter().cloned());
+            ledger.claims.carry_and_forget(retired.iter().cloned());
             retired.len()
         };
         if count > 0 {
@@ -1625,17 +1757,8 @@ impl PendingCoverage {
     /// The request is taken by the walk itself, per scope
     /// (`take_backfill_discard`), and whatever is left at teardown by `detach`
     /// (`take_backfill_discards`) before the writer goes.
-    pub fn note_undelivered(&self, scope: &CursorScope, count: usize) {
-        self.undelivered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(scope.clone())
-            .or_insert_with(Self::initial_undelivered_mark)
-            .record_loss(count);
-        self.discard_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope.clone());
+    pub(crate) fn note_undelivered(&self, scope: &CursorScope, count: usize) {
+        self.loss.record(scope, count);
     }
 
     /// Take ONE scope's outstanding discard request, reporting whether there was
@@ -1648,8 +1771,9 @@ impl PendingCoverage {
     /// marker that scope had since re-earned and refusing the consumer's
     /// acknowledgement of it. Every producer of a request has a scope; so does
     /// every consumer of one.
-    pub fn take_backfill_discard(&self, scope: &CursorScope) -> bool {
-        self.discard_requests
+    pub(crate) fn take_backfill_discard(&self, scope: &CursorScope) -> bool {
+        self.loss
+            .discard_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(scope)
@@ -1659,8 +1783,9 @@ impl PendingCoverage {
     /// moment anything can be written, and by then no walk is left to answer for
     /// its own scope.
     #[must_use]
-    pub fn take_backfill_discards(&self) -> Vec<CursorScope> {
-        self.discard_requests
+    pub(crate) fn take_backfill_discards(&self) -> Vec<CursorScope> {
+        self.loss
+            .discard_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain()
@@ -1671,27 +1796,13 @@ impl PendingCoverage {
     /// readings.
     #[must_use]
     pub fn undelivered_watermark(&self, scope: &CursorScope) -> UndeliveredMark {
-        self.undelivered
+        self.loss
+            .undelivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(scope)
             .copied()
             .unwrap_or_else(Self::initial_undelivered_mark)
-    }
-
-    /// Move each publication's DEBT into the carry-forward slot and drop its
-    /// claim. Caller holds the ledger lock and has already dealt with the
-    /// boundary entries.
-    ///
-    /// See [`CoverageClaim::debt_only`] for why only the debt travels: what a
-    /// batch nobody received proved CLEAN must not discharge anything.
-    fn carry_and_forget(ledger: &mut Ledger, ids: impl IntoIterator<Item = AckToken>) {
-        for id in ids {
-            if let Some(publication) = ledger.claims.remove(&id) {
-                let debt = publication.claim.debt_only();
-                carry_forward(&mut ledger.carried, debt);
-            }
-        }
     }
 
     /// Wake anything parked on backfill capacity.
@@ -1707,23 +1818,10 @@ impl PendingCoverage {
     /// the final checkpoint on both the last batch and `Done`), so a
     /// value search can release a boundary belonging to a different, still
     /// in-flight publication.
-    pub fn acknowledge_publication(&self, id: AckToken) {
+    pub(crate) fn acknowledge_publication(&self, id: AckToken) {
         {
             let mut ledger = self.guard();
-            if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
-                ledger.boundaries.remove(index);
-            } else if let Some(entry) = ledger
-                .boundaries
-                .iter_mut()
-                .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
-            {
-                // The consumer acknowledged a batch a later publication has
-                // since superseded. It really received that batch, so its
-                // capacity is settled even though its record moved to the
-                // survivor; the survivor's own boundary stays until it is
-                // acknowledged too.
-                entry.subsumed.retain(|page| page.id != id);
-            }
+            ledger.ring.acknowledge(&id);
         }
         self.wake_capacity();
     }
@@ -1740,7 +1838,7 @@ impl PendingCoverage {
     /// have nothing to do with this one. A later reset then finds neither a
     /// boundary nor carried debt, and the obligation is simply gone. Re-raising
     /// an obligation is idempotent; losing one is not.
-    pub fn retire_publication(&self, id: AckToken) {
+    pub(crate) fn retire_publication(&self, id: AckToken) {
         self.abandon(std::iter::once(id));
     }
 
@@ -1753,21 +1851,22 @@ impl PendingCoverage {
     /// account resets all move it when they revoke the producer's ownership.
     #[must_use]
     pub fn scope_fence(&self, scope: &CursorScope) -> ScopeFence {
-        Self::scope_fence_in(&self.guard(), scope)
+        self.guard().fences.scope_fence(scope)
     }
 
     /// Best-effort boundary release for a caller that holds only a checkpoint
     /// value - the public [`crate::SyncControl::record_checkpoint`] hook. Every
     /// engine-internal path uses [`PendingCoverage::acknowledge_publication`],
     /// which cannot mistake one publication for another.
-    pub fn acknowledge_checkpoint(&self, checkpoint: &Checkpoint) {
+    pub(crate) fn acknowledge_checkpoint(&self, checkpoint: &Checkpoint) {
         let mut ledger = self.guard();
         if let Some(index) = ledger
+            .ring
             .boundaries
             .iter()
             .position(|entry| entry.checkpoint == *checkpoint)
         {
-            ledger.boundaries.remove(index);
+            ledger.ring.boundaries.remove(index);
         }
         drop(ledger);
         self.wake_capacity();
@@ -1783,7 +1882,7 @@ impl PendingCoverage {
     /// prevent.
     ///
     /// Returns how many registrations were abandoned.
-    pub fn abandon_checkpoints(&self) -> usize {
+    pub(crate) fn abandon_checkpoints(&self) -> usize {
         // Boundary removal and debt extraction as ONE transition, for the reason
         // spelled out on `release_undelivered`.
         // Abandoned BACKFILL pages, per scope. An abandonment is a page the
@@ -1796,6 +1895,7 @@ impl PendingCoverage {
         let count = {
             let mut ledger = self.guard();
             let ids: Vec<_> = ledger
+                .ring
                 .boundaries
                 .drain(..)
                 .flat_map(|entry| {
@@ -1828,7 +1928,7 @@ impl PendingCoverage {
                 })
                 .collect();
             let count = ids.len();
-            Self::carry_and_forget(&mut ledger, ids);
+            ledger.claims.carry_and_forget(ids);
             count
         };
         for (scope, abandoned) in &by_scope {
@@ -1913,7 +2013,7 @@ impl PendingCoverage {
         // rather than in a list of ids somebody has to remember to extend. The
         // ids collected here are for the CLAIMS and their debt, which is a
         // different question with a different answer.
-        ledger.boundaries.retain(|entry| {
+        ledger.ring.boundaries.retain(|entry| {
             if entry.stream.belongs_to(scope)
                 && stream_kind.is_none_or(|kind| entry.stream.kind() == kind)
                 // The ceiling bounds the RETIREMENT, not only the fence. Fencing
@@ -1944,7 +2044,7 @@ impl PendingCoverage {
             generation: crate::cursor::PendingCoverage::initial_generation(),
         };
         for id in &ids {
-            if let Some(publication) = ledger.claims.remove(id) {
+            if let Some(publication) = ledger.claims.pending.remove(id) {
                 carried.absorb(publication.claim.clone().debt_only());
             }
         }
@@ -1958,7 +2058,7 @@ impl PendingCoverage {
         // the backfill rows, then a detach) the obligation existed only in this
         // volatile slot and was gone. The reset is the writer's one durable
         // transition for the scope, so it has to be where that debt lands.
-        if let Some(pending) = ledger.carried.take() {
+        if let Some(pending) = ledger.claims.carried.take() {
             let (mine, theirs): (Vec<_>, Vec<_>) = pending
                 .reports
                 .into_iter()
@@ -1970,7 +2070,7 @@ impl PendingCoverage {
                 });
             }
             if !theirs.is_empty() {
-                ledger.carried = Some(CoverageClaim {
+                ledger.claims.carried = Some(CoverageClaim {
                     reports: theirs,
                     generation: pending.generation,
                 });
@@ -1983,10 +2083,10 @@ impl PendingCoverage {
         match stream_kind {
             // No narrowing: the whole scope is invalidated, every stream with it.
             None | Some(PublicationStreamKind::Other) => {
-                Self::fence_in(&mut ledger, scope, watermark);
+                ledger.fences.raise_scope(scope, watermark);
             }
             Some(PublicationStreamKind::Backfill) => {
-                Self::fence_in_backfill(&mut ledger, scope, watermark);
+                ledger.fences.raise_backfill(scope, watermark);
             }
         }
         drop(ledger);
@@ -1994,22 +2094,9 @@ impl PendingCoverage {
         carried
     }
 
-    fn fence_in(ledger: &mut Ledger, scope: &CursorScope, watermark: ScopeFence) {
-        let entry = ledger.fenced.entry(scope.clone()).or_insert(watermark);
-        *entry = (*entry).max(watermark);
-    }
-
-    fn fence_in_backfill(ledger: &mut Ledger, scope: &CursorScope, watermark: ScopeFence) {
-        let entry = ledger
-            .fenced_backfill
-            .entry(scope.clone())
-            .or_insert(watermark);
-        *entry = (*entry).max(watermark);
-    }
-
     #[must_use]
     pub fn pending_checkpoints(&self) -> usize {
-        self.guard().boundaries.len()
+        self.guard().ring.boundaries.len()
     }
 
     /// How many superseded publications the outstanding entries are still
@@ -2023,6 +2110,7 @@ impl PendingCoverage {
     #[must_use]
     pub fn retained_history(&self) -> usize {
         self.guard()
+            .ring
             .boundaries
             .iter()
             .map(|entry| entry.subsumed.len())
@@ -2048,15 +2136,15 @@ impl PendingCoverage {
             return;
         }
         let mut ledger = self.guard();
-        let Some(old) = ledger.claims.remove(&superseded) else {
+        let Some(old) = ledger.claims.pending.remove(&superseded) else {
             return;
         };
-        if let Some(new) = ledger.claims.get_mut(&survivor) {
+        if let Some(new) = ledger.claims.pending.get_mut(&survivor) {
             new.claim.absorb(old.claim);
         } else {
             // The survivor is gone or already persisted, so folding has nowhere
             // to land. Put the claim back rather than dropping it on the floor.
-            ledger.claims.insert(superseded, old);
+            ledger.claims.pending.insert(superseded, old);
         }
     }
 
@@ -2065,7 +2153,7 @@ impl PendingCoverage {
     /// The checkpoint names the stream, so an id belonging to a repair
     /// publication - or to a different stream entirely - resolves to `Unknown`
     /// rather than consuming a claim it does not name.
-    pub fn claim_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) -> ClaimLookup {
+    pub(crate) fn claim_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) -> ClaimLookup {
         if id.1.checkpoint.as_ref() != Some(checkpoint) {
             return ClaimLookup::Unknown;
         }
@@ -2078,7 +2166,7 @@ impl PendingCoverage {
     /// whole point: consuming it would let the later, real `ack`
     /// short-circuit as already persisted and make the engine announce a
     /// durable boundary the store never wrote.
-    pub fn claim_repair(&self, id: AckToken) -> ClaimLookup {
+    pub(crate) fn claim_repair(&self, id: AckToken) -> ClaimLookup {
         self.claim_in(id, &PublicationStream::Repair)
     }
 
@@ -2097,16 +2185,18 @@ impl PendingCoverage {
         // next, post-reset publication will take.
         let fenced_out = stream.scope().is_some_and(|scope| {
             let scope_wide = ledger
+                .fences
                 .fenced
                 .get(scope)
                 .is_some_and(|watermark| watermark.excludes(&id));
             let stream_wide = stream.kind() == PublicationStreamKind::Backfill
                 && ledger
+                    .fences
                     .fenced_backfill
                     .get(scope)
                     .is_some_and(|watermark| watermark.excludes(&id));
-            let account_wide = ledger.fenced_account.excludes(&id)
-                || (ledger.fenced_account.is_raised() && !self.minted_here(&id));
+            let account_wide = ledger.fences.fenced_account.excludes(&id)
+                || (ledger.fences.fenced_account.is_raised() && !self.minted_here(&id));
             account_wide || scope_wide || stream_wide
         });
         if fenced_out {
@@ -2116,10 +2206,11 @@ impl PendingCoverage {
             // refuses the acknowledgement.
             return ClaimLookup::Unknown;
         }
-        match ledger.claims.get(&id) {
+        match ledger.claims.pending.get(&id) {
             Some(publication) if publication.stream == *stream => {
                 let publication = ledger
                     .claims
+                    .pending
                     .remove(&id)
                     .unwrap_or_else(|| unreachable!("checked present under the same lock"));
                 ClaimLookup::Apply(publication.claim)
@@ -2143,12 +2234,14 @@ impl PendingCoverage {
                 let mine = self.minted_here(&id);
                 if mine
                     && ledger
+                        .claims
                         .persisted
                         .get(stream)
                         .is_some_and(|watermark| *watermark >= id)
                 {
                     ClaimLookup::AlreadyPersisted
                 } else if let Some(claim) = ledger
+                    .claims
                     .folded
                     .get(stream)
                     .filter(|watermark| mine && **watermark >= id)
@@ -2187,12 +2280,12 @@ impl PendingCoverage {
     /// write that failed reports `Unknown` - honestly refusing - rather than
     /// `AlreadyPersisted`, which would make the engine announce a durable
     /// boundary that does not exist.
-    pub fn settle_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) {
+    pub(crate) fn settle_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) {
         self.settle_in(id, PublicationStream::of(checkpoint));
     }
 
     /// Record that a repair publication was durably applied.
-    pub fn settle_repair(&self, id: AckToken) {
+    pub(crate) fn settle_repair(&self, id: AckToken) {
         self.settle_in(id, PublicationStream::Repair);
     }
 
@@ -2201,7 +2294,7 @@ impl PendingCoverage {
             return;
         }
         let mut ledger = self.guard();
-        let watermark = ledger.persisted.entry(stream).or_insert(id.clone());
+        let watermark = ledger.claims.persisted.entry(stream).or_insert(id.clone());
         if *watermark < id {
             *watermark = id;
         }
@@ -2222,7 +2315,12 @@ impl PendingCoverage {
     /// different publications. Both stay; every engine path uses the
     /// stream-checked, publication-identified forms.
     pub fn claim(&self, id: AckToken) -> ClaimLookup {
-        let stream = self.guard().claims.get(&id).map(|p| p.stream.clone());
+        let stream = self
+            .guard()
+            .claims
+            .pending
+            .get(&id)
+            .map(|p| p.stream.clone());
         match stream {
             Some(stream) => self.claim_in(id, &stream),
             None => ClaimLookup::Unknown,
@@ -2233,26 +2331,18 @@ impl PendingCoverage {
     /// carried for the next publication that can be acknowledged.
     ///
     /// See [`CoverageClaim::debt_only`] for why only the debt travels.
-    pub fn abandon<I>(&self, ids: I)
+    pub(crate) fn abandon<I>(&self, ids: I)
     where
         I: IntoIterator<Item = AckToken>,
     {
         {
             let mut ledger = self.guard();
             for id in ids {
-                if let Some(publication) = ledger.claims.remove(&id) {
+                if let Some(publication) = ledger.claims.pending.remove(&id) {
                     let debt = publication.claim.debt_only();
-                    carry_forward(&mut ledger.carried, debt);
+                    carry_forward(&mut ledger.claims.carried, debt);
                 }
-                if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
-                    ledger.boundaries.remove(index);
-                } else if let Some(entry) = ledger
-                    .boundaries
-                    .iter_mut()
-                    .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
-                {
-                    entry.subsumed.retain(|page| page.id != id);
-                }
+                ledger.ring.acknowledge(&id);
             }
         }
         self.wake_capacity();
@@ -2273,7 +2363,7 @@ impl PendingCoverage {
 
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        self.guard().claims.len()
+        self.guard().claims.pending.len()
     }
 }
 
@@ -2302,11 +2392,6 @@ fn carry_forward(carried: &mut Option<CoverageClaim>, claim: CoverageClaim) {
         None => *carried = Some(claim),
     }
 }
-
-/// The unified per-account publication ledger.
-///
-/// Alias for `PendingCoverage`, emphasizing its role as a publication ledger.
-pub type Publications = PendingCoverage;
 
 #[cfg(test)]
 mod tests {

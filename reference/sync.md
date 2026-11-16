@@ -1102,7 +1102,7 @@ events, same lag warning shape, but the engine never waits on it and its lag
 abandons nothing (see the consumer contract under "Backfill flow control").
 
 Observing a lag on the ACKNOWLEDGING receiver also abandons the account's
-outstanding checkpoint publications through the per-account `Publications`
+outstanding checkpoint publications through the per-account `PendingCoverage`
 ledger, and the warning's `next_action` reports how many. This is load-bearing, not
 tidy-up: registration runs before the send and an entry leaves
 only through a matching consumer ack, so a registration whose batch the
@@ -1547,6 +1547,13 @@ so retirement, boundary tracking and delivery stamping share that owner.
 `publish_page` conditionally registers under the original walk fence, sends and
 stamps backfill pages, and retires unreachable claims synchronously. A backfill
 page that reaches no numbered reader advances the undelivered watermark.
+`publish_inventory` owns the common Created-id and removal projection, preserves
+page metadata, and checks the original walk fence before forwarding a
+checkpoint-free page, including a barrier page. Checkpoint-bearing pages use
+conditional registration instead. This is a point-in-time comparison for a
+checkpoint-free page; it mints no durable evidence. Repair shares the Created-id
+projection but retains its separate obligation-discharge publication: it has no
+page walk or progress checkpoint to judge.
 `publish_marker` applies the same delivery and retirement rule to completion;
 an unreachable marker returns `Withheld`, never `Published`. A user must get a
 retry rather than a completed folder whose inventory reached nobody.
@@ -2229,6 +2236,26 @@ Late cleanup can only reach the old attachment's registry. Writes still check
 the registry's own shutdown token under its lock: accepting a newly created
 server handle after teardown would abandon the cleanup obligation. A refused
 transfer tells its caller to tear the handle down or report provider expiry.
+`push/teardown.rs` provides `SubscriptionTeardown` through the registry.
+Every engine-owned deletion uses its `delete` operation, which records all
+shared throttle holds once and returns the provider refusal with its longest
+local deadline. Reattach folds that deadline into `RepairPacing` without
+observing the error again. Consumer unsubscribe and dropped-reattach cleanup
+also record holds, so a failed background delete cannot silently let sibling
+requests ignore a provider's rate limit.
+
+Settlement distinguishes still-wanted registered coverage from owned handles
+whose coverage is no longer wanted. The former retains desire on refusal and
+marks successful deletion immediately; the latter becomes an orphan on refusal.
+A timer's orphan snapshot can remove only orphan rows, preserving desired
+coverage if registration changed while the delete was pending. Orphan retention
+and detached-provider-expiry diagnostics share the same registry service.
+Snapshot/replace ordering remains the caller's reopen lock, and cancellation
+ownership remains with the existing reattach guard or registered timer row.
+The timer alone retains its five-minute attempt timeout. Applying that timeout
+to replacement cleanup would introduce a new abandonment policy and could
+truncate a provider's multi-id teardown; it is intentionally not generalized.
+
 The consumer can later call
 `SyncEngine::unsubscribe_push(account)` to walk the handles back
 through `Account::push_unsubscribe`. A failed teardown is returned to
@@ -2405,9 +2432,23 @@ a live subscription no handle anywhere names (ruled 2026-10-04):
 
 ## Mutation pipeline
 
-All three bulk operations share `run_bulk_pipeline`. `BulkPipelineOp`
-selects `SetFlags`, `Move`, or `Destroy`, which determines the wire
-method and final read-back guard. Campaign flow:
+All three bulk operations share `run_bulk_pipeline`. `mutation/campaign.rs`
+owns the private `Campaign` state: cohort execution identities, per-object
+outcomes and effects, retry allowance, first failure, caller conflicts and
+forwarded directives. Its synchronous transitions select ready actions, reroute
+unsent targets, finalize abort and engine-block lanes, consume read-back reports,
+and settle submissions. `Submission` owns one round's submitted and answered
+sets, retry advice and deferred directives. This keeps every selected target in
+final accounting across cancellation and cleanup, as a mail user expects.
+`engine/bulk.rs` retains the public entry points and async driving: provider
+streams, readiness waits, DriveStart admission, activity lifetimes and directive
+delivery after those resources are released. The existing `CohortPhase` enum
+and shared admission primitive remain in use.
+
+`MutationCounters` is a result record with public fields; aggregation writes
+those fields directly. The redundant `record_*` mutators are removed.
+`BulkPipelineOp` selects `SetFlags`, `Move`, or `Destroy`, which determines the
+wire method and final read-back guard. Campaign flow:
 
 1. Deduplicate targets and group them by the canonical set of throttle keys
    declared for each singleton target. Moves include the source and
@@ -2496,7 +2537,7 @@ hydrated against the original request: trash membership cannot satisfy object
 absence, and unsupported flags cannot satisfy the original flag operation.
 Unknown future success variants remain protected in the read-back lane.
 
-`MutationCounters` buckets `ItemOutcome::Failed` outcomes via
+`Campaign` buckets `ItemOutcome::Failed` outcomes for `MutationCounters` via
 `crate::recovery::plan_recovery`:
 - `Retry { SameRequest | AfterAuthRefresh }` -> `pending_retry`.
 - `Retry { AfterStateRefresh }` and `Reconcile { CheckTarget }` enter
@@ -3017,8 +3058,12 @@ cursor advanced past them, so there is nothing durable to hang debt off); they
 are recorded as `BarrierIncident`, which is what gives a restart its memory and
 an operator something to waive or block. `InventoryFusion` and
 `BackfillRunner` both make this decision through the shared `InventoryWalk`
-state, including a barrier carried by terminal `Done`. The incident's
-`resume_from` is always the last checkpoint accepted before the barrier. The
+state, including a barrier carried by terminal `Done`. `InventoryWalk::judge`
+orders waived-barrier crossing and incident recording through the writer, tracks
+whether the walk is degraded, and returns `PageVerdict`. A store refusal is
+logged in this shared path and fails either front end before forwarding or
+announcing the barrier. The incident's `resume_from` is always the last
+checkpoint accepted before the barrier. The
 backfill front end therefore never mints or publishes a positional checkpoint
 for a refused page.
 
@@ -3080,7 +3125,7 @@ operator waiver is load-bearing rather than a nicety.
 
 ### Publication identity
 
-Coverage reaches the durable record through the per-account `Publications`
+Coverage reaches the durable record through the per-account `PendingCoverage`
 ledger, keyed by an
 engine-issued `AckToken`. It cannot ride `Checkpoint`, which is a published
 type crossing the broadcast channel and back through `ack`.
@@ -3249,16 +3294,18 @@ became an entry is not in that total - the count cannot be used to detect any of
 this.
 
 Degraded coverage is surfaced to the consumer as a
-`Warning::OperatorAttentionNeeded`, and open debt is enumerable through
-`SyncEngine::debt`. Durable debt that nothing reports, or that nothing can list,
-is only half a fix. Backfill announces replayable incomplete coverage on the
-FIRST incomplete page of each partition walk and on the terminal summary; later
+`WarningKind::Engine(EngineNotice::DegradedCoverage { .. })`, and open debt is
+enumerable through `SyncEngine::debt`. Durable debt that nothing reports, or
+that nothing can list, is only half a fix. Both front ends use
+`InventoryWalk::warn_coverage` to announce replayable incomplete coverage on the
+FIRST incomplete page of each walk and on the terminal summary; later
 incomplete pages of the same walk add no warning (their obligations still reach
 the debt ledger). Enterprise mail users must see that a live folder is
 incomplete even when automatic replay can repair it, and a stream that ends
 before its summary must not hide the page's degraded coverage - but one warning
 per page of a large degraded folder is noise they cannot act on. Barrier warnings
-remain distinct and follow durable barrier recording.
+remain distinct and follow durable barrier recording. Crossing a waived barrier
+does not announce a stop.
 
 ### Repair
 
@@ -3734,6 +3781,10 @@ ambiguous old ids are never guessed into owners. Future shared
 tag additions advance `wire::ledger::VOCABULARY_VERSION` beyond the enclosing
 ledger version; a compile-time assertion requires sync to adopt that version.
 Shared malformed-input and schema errors preserve sync's existing classifications.
+Version 14 appends PayloadTooLarge and PreconditionFailed request subkind tags
+2 and 3 under kind tag 6. Versions 3 through 13 remain readable with their old
+vocabulary and reject the new tags as malformed historical rows. The current
+readable window is 3 through 14; no ledger payload layout changed.
 
 `DebtLedger::from_parts` is the only door into the private maps that is not
 `ingest`, and it is crate-private for the reason the fields are: no protocol
@@ -3975,7 +4026,7 @@ changes path could never re-emit it. The consumer never learned the
 account was running on a downgraded sync strategy.
 
 Note this is distinct from the warnings the engine SYNTHESIZES
-(`warn_degraded` for incomplete coverage, `announce_page_loss` for page
+(`InventoryWalk::warn_coverage` for incomplete coverage, `announce_page_loss` for page
 lanes). Those describe what the engine concluded; these carry what the
 protocol crate observed.
 
@@ -4350,11 +4401,9 @@ crates/sync/src/
       guard.rs            // ReattachGuard, ReattachAttempt, provisional rows
                           // and cancellation cleanup obligations
     establish.rs          // common stored/fresh cursor decision and run_establish
-    bulk.rs               // bulk_set_flags / bulk_move / bulk_move_from
-                          // / bulk_destroy + run_bulk_pipeline;
-                          // classify_item_outcome, MutationBucket,
-                          // retry + read-back queueing, directive
-                          // de-duplication
+    bulk.rs               // bulk entry points + async run_bulk_pipeline driver;
+                          // provider streams, admission, cancellation and
+                          // directive delivery after resources are released
     passthrough.rs        // live_account + the read-only hydration and
                           // PIM forwarders (get_stream,
                           // message_hydrate, open_blob, contacts_*,
@@ -4363,7 +4412,7 @@ crates/sync/src/
     tests.rs              // the module's unit tests
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning
-  inventory_walk.rs       // shared inventory barrier and resume state
+  inventory_walk.rs       // shared barrier judgement, resume and warning state
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, Incarnation, AccountGeneration
@@ -4412,9 +4461,11 @@ crates/sync/src/
     health.rs             // Retained per-lane coverage state
     reconciler.rs         // Retained work set -> changes_stream
     subscription.rs       // SubscriptionRegistry (per-attachment vector)
+    teardown.rs           // Shared push deletion, throttle observation and settlement
   mutation/
     mod.rs                // MutationCounters,
                           // fanout::partition_by_account
+    campaign.rs           // Campaign state and synchronous transitions; round accounting
     idempotency.rs        // IdempotencyKey vending
     readback.rs           // per-object read-back report, flags judged
                           // through Account::flag_target
@@ -4472,20 +4523,28 @@ no in-engine caller - teardown pulses the slot's
 `PendingCoverage::wake_capacity` directly, having the coverage and no gate - and
 is kept as published surface rather than removed, the same standing as
 `SyncControl::record_checkpoint`. `ChangeDelivery` is public from `delivery`
-(`new`, `observe`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
-gained the following methods (receiver membership mutators are now crate-private): `mark_delivered`, `mark_received`
-(the receipt bound's permit), `receiver_joined` and `receiver_departed` (the
-live numbered set the slowest-reader rule is evaluated against),
-`backfill_in_flight`,
-`await_backfill_capacity`, `release_undelivered`, `scope_fence` and
-`retained_history` with the bound, then `register_walk_marker`,
-`walk_watermark`, `minted_here`, `note_undelivered`, `take_backfill_discard`,
-`take_backfill_discards` and `undelivered_watermark` with the completion
-guarantee. `PublicationReceipt` carries a crate-private
-`walk_watermark: Option<UndeliveredMark>`; consumers retain the opaque token through
-its codec rather than constructing receipts. Receipt-minting methods, including
-`register_walk_marker`, are crate-private. `BackfillConfig` gained `lane_capacity`, and
-the private writer protocol gained `DiscardBackfillProgress`.
+(`new`, `observe`, `publish_backfill`, `subscribe`, `min_live`).
+`PendingCoverage` is the sole name for the publication ledger; the `Publications`
+alias is removed. Its guarded state separates `Claims` (pending claims,
+carry-forward and persisted/folded watermarks), `RingCharge` (boundary entries
+and numbered readers) and `Fences`, plus `PublicationMint` for identities and
+reset bounds. Transitions spanning them still use one primary mutex.
+`LossLedger` groups the existing independent loss-watermark, discard-request
+and teardown state; this refactor does not change their locks
+or the delivery-to-coverage lock order. Publication ids still mint under the
+primary guard, atomically with registration or fencing.
+
+Delivery stamping, receipt recording, receiver membership, teardown, departure
+sweeping, loss recording and discard drains are crate-private, as are the
+writer's stream-specific claim and settlement operations. Consumers reach them
+through `ChangeDelivery`, `PagePublisher` and `WriterHandle::ack`. Ledger
+inspection, capacity waits, walk-generation issuance and the deliberately
+published standalone `claim`, `supersede` and `retire` operations remain.
+Those standalone operations do not replace the writer's durable acknowledgement
+path. `PublicationReceipt::walk_watermark` remains crate-private; consumers
+retain the opaque token through its codec rather than constructing receipts.
+`BackfillConfig::lane_capacity` bounds unread pages; the private writer protocol
+carries `DiscardBackfillProgress`.
 `engine::writer::WriterHandle` is the public opaque endpoint passed to
 `PagePublisher` and `run_repair_pass`. Standalone producers can start the same
 single writer with `WriterHandle::spawn`; engine attachments own its worker
@@ -4736,7 +4795,10 @@ barrier, proof and compacted discharge audit generation. A failed load refuses
 attach and closes the opened account; it never starts an unseeded producer.
 The lifecycle guard excludes the preceding attachment's writer during this
 handoff. The writer still owns ledger mutations, while PendingCoverage issues
-walk numbers from that restored baseline. Delayed rediscovery cannot lower a
+walk numbers from that restored baseline. Issuance remains synchronous for the
+shared coverage owner: forwarding every walk number through the writer would
+add an asynchronous round trip without changing this restored ordering.
+Delayed rediscovery cannot lower a
 debt or barrier generation. Exhaustion refuses to wrap the counter. The first
 covering walk after restart can therefore settle old debt, as a mail user
 expects, without waiting for an attachment-local counter to catch up.

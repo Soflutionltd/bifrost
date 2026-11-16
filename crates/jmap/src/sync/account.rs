@@ -270,6 +270,7 @@ fn unseeded_scope_error(scope: CursorScope) -> AccountError {
     super::error::unsupported_error(
         AccountOperation::EstablishCursor,
         Some(ErrorScope::Cursor(scope)),
+        bifrost_types::UnsupportedReason::CursorScope,
         "JMAP did not seed a cursor for this scope",
     )
 }
@@ -413,7 +414,7 @@ impl Account for JmapAccount {
     }
 
     fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
-        partitioning_for_scope(scope, self.registry.primary.limits.max_objects_in_get)
+        partitioning_for_scope(scope, self.registry.primary.limits.max_objects_in_get.get())
     }
 
     fn inventory_partition_stream(
@@ -507,6 +508,7 @@ impl Account for JmapAccount {
                     super::error::unsupported_error(
                         AccountOperation::PushSubscribe,
                         Some(bifrost_types::ErrorScope::Cursor(scope)),
+                        bifrost_types::UnsupportedReason::CursorScope,
                         "JMAP push requires a supported scope in a registered account",
                     ),
                 );
@@ -557,6 +559,7 @@ impl Account for JmapAccount {
                         super::error::unsupported_error(
                             AccountOperation::PushSubscribe,
                             Some(bifrost_types::ErrorScope::Cursor(scope)),
+                            bifrost_types::UnsupportedReason::CursorScope,
                             "JMAP push requires a supported scope in a registered account",
                         ),
                     );
@@ -766,6 +769,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::SetLabelMembership,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP does not support label membership",
         );
         Box::pin(async move { Err(err) })
@@ -780,6 +784,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::SetCategory,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP does not support categories",
         );
         Box::pin(async move { Err(err) })
@@ -794,6 +799,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::SetExtendedProperty,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP does not support extended properties",
         );
         Box::pin(async move { Err(err) })
@@ -873,6 +879,7 @@ impl Account for JmapAccount {
             let err = super::error::unsupported_error(
                 AccountOperation::Send,
                 None,
+                bifrost_types::UnsupportedReason::SubmissionUnavailable,
                 "JMAP submission capability not available",
             );
             return Box::pin(async move { Err(err) });
@@ -904,6 +911,7 @@ impl Account for JmapAccount {
             let err = super::error::unsupported_error(
                 AccountOperation::Send,
                 None,
+                bifrost_types::UnsupportedReason::SubmissionUnavailable,
                 "JMAP submission capability not available",
             );
             return Box::pin(async move { Err(err) });
@@ -934,6 +942,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::HostAttachment,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP has no cloud-drive attachment hosting",
         );
         Box::pin(async move { Err(err) })
@@ -977,6 +986,7 @@ impl Account for JmapAccount {
             let err = super::error::unsupported_error(
                 AccountOperation::DraftSend,
                 None,
+                bifrost_types::UnsupportedReason::SubmissionUnavailable,
                 "JMAP submission capability not available",
             );
             return Box::pin(async move { Err(err) });
@@ -997,6 +1007,7 @@ impl Account for JmapAccount {
             let err = super::error::unsupported_error(
                 AccountOperation::CancelScheduledSend,
                 None,
+                bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
                 "JMAP scheduled send not available",
             );
             return Box::pin(async move { Err(err) });
@@ -1021,6 +1032,7 @@ impl Account for JmapAccount {
             let err = super::error::unsupported_error(
                 AccountOperation::RescheduleSend,
                 None,
+                bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
                 "JMAP scheduled send not available",
             );
             return Box::pin(async move { Err(err) });
@@ -1298,6 +1310,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::DirectorySearch,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP has no organization-directory concept",
         );
         Box::pin(async move { Err(err) })
@@ -1310,6 +1323,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::DirectoryGroupsList,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP has no organization-directory concept",
         );
         Box::pin(async move { Err(err) })
@@ -1323,6 +1337,7 @@ impl Account for JmapAccount {
         let err = super::error::unsupported_error(
             AccountOperation::DirectoryGroupExpand,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP has no organization-directory concept",
         );
         Box::pin(async move { Err(err) })
@@ -1484,6 +1499,7 @@ impl Account for JmapAccount {
                 let err = super::error::unsupported_error(
                     AccountOperation::SetLabelMembership,
                     None,
+                    bifrost_types::UnsupportedReason::LabelKind,
                     "JMAP does not support this label kind",
                 );
                 Box::pin(async move { Err(err) })
@@ -1503,6 +1519,7 @@ impl Account for JmapAccount {
                 let err = super::error::unsupported_error(
                     AccountOperation::SetLabelMembership,
                     None,
+                    bifrost_types::UnsupportedReason::LabelKind,
                     "JMAP does not support this label kind",
                 );
                 Box::pin(async move { Err(err) })
@@ -1607,8 +1624,7 @@ fn close_outcome(result: crate::Result<()>) -> Result<(), AccountError> {
 // Preserve the precedence below: an Outlook user must first learn whether
 // send-as exists at all, then whether scheduling is supported, then whether
 // their chosen mailbox is valid and can submit. These are distinct refusal
-// reasons, but AccountError has no shared reason field for local unsupported
-// operations; do not make callers parse the diagnostic text as an API.
+// reasons exposed through AccountError::unsupported_reason.
 fn route_send_as(
     send_as: &SendAs,
     feature_available: bool,
@@ -1620,6 +1636,7 @@ fn route_send_as(
         return Err(super::error::unsupported_error(
             AccountOperation::Send,
             None,
+            bifrost_types::UnsupportedReason::SendAsUnavailable,
             "no seeded foreign account advertises submission, \
              so send-as is unavailable on this account",
         ));
@@ -1628,6 +1645,7 @@ fn route_send_as(
         return Err(super::error::unsupported_error(
             AccountOperation::Send,
             None,
+            bifrost_types::UnsupportedReason::ForeignScheduledSend,
             "scheduled foreign send is not supported",
         ));
     }
@@ -1638,6 +1656,7 @@ fn route_send_as(
         return Err(super::error::unsupported_error(
             AccountOperation::Send,
             None,
+            bifrost_types::UnsupportedReason::ForeignSubmissionUnavailable,
             "foreign account does not advertise submission",
         ));
     }
@@ -2094,6 +2113,49 @@ mod tests {
                 "{op:?} must not fall back to the Mail account"
             );
         }
+    }
+
+    #[test]
+    fn send_as_refusal_reasons_follow_routing_precedence() {
+        use bifrost_types::UnsupportedReason;
+        for (available, scheduled, known, capable, reason) in [
+            (
+                false,
+                true,
+                false,
+                false,
+                UnsupportedReason::SendAsUnavailable,
+            ),
+            (
+                true,
+                true,
+                false,
+                false,
+                UnsupportedReason::ForeignScheduledSend,
+            ),
+            (
+                true,
+                false,
+                true,
+                false,
+                UnsupportedReason::ForeignSubmissionUnavailable,
+            ),
+        ] {
+            let error = route_send_as(&as_shared(), available, scheduled, known, capable)
+                .expect_err("refused");
+            assert_eq!(error.unsupported_reason(), Some(reason));
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::Send)
+            );
+        }
+        let unknown =
+            route_send_as(&as_shared(), true, false, false, false).expect_err("unknown mailbox");
+        assert_eq!(unknown.unsupported_reason(), None);
+        assert_eq!(
+            unknown.kind(),
+            &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
     }
 
     fn as_shared() -> SendAs {

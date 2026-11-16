@@ -772,3 +772,6 @@ pub(crate) use define_parse_method;
 pub(crate) use define_query_changes_method;
 pub(crate) use define_query_method;
 pub(crate) use define_set_method;
+
+#[cfg(test)]
+mod wire_tests;

@@ -186,8 +186,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::RequestCallLimit { max } => build(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP request exceeds maxCallsInRequest ({max})"
                 )),
@@ -197,8 +197,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::RequestSizeLimit { max, size } => build(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP request of {size} bytes exceeds maxSizeRequest ({max})"
                 )),
@@ -208,8 +208,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::UploadSizeLimit { max, size } => build(
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP upload of {size} bytes exceeds maxSizeUpload ({max})"
                 )),
@@ -272,9 +272,12 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
                 get_id_unanswered(context.method, &id, ctx)
             }
         }
-        crate::Error::UnsupportedOperation(reason) => {
-            unsupported_error(ctx.operation, ctx.scope, reason)
-        }
+        crate::Error::UnsupportedFlagOperation(reason) => unsupported_error(
+            ctx.operation,
+            ctx.scope,
+            bifrost_types::UnsupportedReason::FlagOperation,
+            reason,
+        ),
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
@@ -347,6 +350,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
+        .unsupported_reason(bifrost_types::UnsupportedReason::CapabilityUnavailable)
         .text(DiagnosticText::support_only(format!(
             "account {account_id} does not serve capability {capability}"
         )))
@@ -359,6 +363,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
+        .unsupported_reason(bifrost_types::UnsupportedReason::CapabilityUnavailable)
         .text(DiagnosticText::support_only(format!(
             "session lists no primary account for capability {capability}"
         )))
@@ -447,19 +452,17 @@ pub(crate) fn terminated_from_jmap<T>(err: crate::Error, ctx: JmapErrorContext) 
 /// stream call sites emit a Terminated event without constructing
 /// `RecoveryClass` directly.
 #[must_use]
-// The shared error contract derives message_key from AccountErrorKind and
-// RequestCause::Unsupported carries only the operation. A sync-local reason
-// enum would be erased at this AccountError boundary. Do not encode local
-// refusal reasons as native_code: that field records provider wire codes.
-// Caller-visible distinctions require a shared UnsupportedReason field and
-// builder/accessor in bifrost-types, then explicit reasons at these call sites.
+// An Outlook user needs to distinguish unavailable submission, scheduling and
+// shared-mailbox support without parsing provider or support prose.
 pub(crate) fn unsupported_error(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
+    reason: bifrost_types::UnsupportedReason,
     message: impl Into<String>,
 ) -> AccountError {
     let mut builder = AccountError::unsupported(operation, Protocol::Jmap)
         .into_builder()
+        .unsupported_reason(reason)
         .text(DiagnosticText::support_only(message));
     if let Some(scope) = scope {
         builder = builder.scope(scope);
@@ -693,9 +696,10 @@ pub(crate) fn cross_account_destination(
 pub(crate) fn terminated_unsupported<T>(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
+    reason: bifrost_types::UnsupportedReason,
     message: impl Into<String>,
 ) -> SyncEvent<T> {
-    terminated(unsupported_error(operation, scope, message))
+    terminated(unsupported_error(operation, scope, reason, message))
 }
 
 /// Stream-side variant for protocol-shape failures that are
@@ -811,8 +815,13 @@ pub(crate) fn set_error_to_account_error(
         SetErrorType::TooLarge
         | SetErrorType::TooManyKeywords
         | SetErrorType::TooManyMailboxes
-        | SetErrorType::TooManyRecipients
-        | SetErrorType::InvalidPatch
+        | SetErrorType::TooManyRecipients => (
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
+                detail: DiagnosticText::support_only(set_error.to_string()),
+            }),
+        ),
+        SetErrorType::InvalidPatch
         | SetErrorType::InvalidProperties
         | SetErrorType::InvalidEmail
         | SetErrorType::InvalidRecipients
@@ -823,38 +832,18 @@ pub(crate) fn set_error_to_account_error(
                 detail: DiagnosticText::support_only(set_error.to_string()),
             }),
         ),
-        // The following set-error variants are legitimate JMAP wire
-        // responses describing protocol-shape state conflicts (id is
-        // on the destroy list, singleton already exists, mailbox has
-        // children, etc.). They classify under `Protocol(Unknown)`
-        // paired with a typed `Cause::Wire(JmapMethod::*)` so the
-        // strict `kind_matches_cause` rule holds. Recovery for
-        // `Protocol(Unknown)` is `UnknownPermanent`, which is the
-        // right consumer-facing outcome: the operation cannot retry
-        // and the engine has no automatic remediation.
-        SetErrorType::WillDestroy => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::WillDestroy)),
-        ),
-        SetErrorType::Singleton => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Singleton)),
-        ),
-        SetErrorType::ScriptIsActive => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::ScriptIsActive)),
-        ),
-        SetErrorType::CannotUnsend => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::CannotUnsend)),
-        ),
-        SetErrorType::MailboxHasChild => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasChild)),
-        ),
-        SetErrorType::MailboxHasEmail => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasEmail)),
+        // Valid requests refused because of target state need a caller decision.
+        // Repeating the write or blaming the provider would not help the user.
+        SetErrorType::WillDestroy
+        | SetErrorType::Singleton
+        | SetErrorType::ScriptIsActive
+        | SetErrorType::CannotUnsend
+        | SetErrorType::MailboxHasChild
+        | SetErrorType::MailboxHasEmail => (
+            AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+            Cause::Request(RequestCause::PreconditionFailed {
+                detail: DiagnosticText::support_only(set_error.to_string()),
+            }),
         ),
         SetErrorType::Other(code) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
@@ -868,21 +857,8 @@ pub(crate) fn set_error_to_account_error(
         .push_cause(Cause::Attempt(AttemptCause::new(
             TransmissionState::Acknowledged,
         )));
-    // Push the typed wire cause as a forensic layer for all non-Other
-    // variants whose primary cause is not already a WireCause. For
-    // WillDestroy/Singleton/etc. the primary IS the WireCause so we
-    // skip to avoid duplication; for Forbidden/OverQuota/RateLimit/etc.
-    // the primary is an Access/Server cause and we add the wire signal.
-    let primary_was_wire = matches!(
-        set_error.error_type(),
-        SetErrorType::WillDestroy
-            | SetErrorType::Singleton
-            | SetErrorType::ScriptIsActive
-            | SetErrorType::CannotUnsend
-            | SetErrorType::MailboxHasChild
-            | SetErrorType::MailboxHasEmail
-            | SetErrorType::Other(_)
-    );
+    // Preserve the server's typed refusal alongside the request classification.
+    let primary_was_wire = matches!(set_error.error_type(), SetErrorType::Other(_));
     if !primary_was_wire
         && let Some(wire) = set_error_type_to_jmap_method(set_error.error_type().clone())
     {
@@ -902,12 +878,7 @@ pub(crate) fn set_error_to_account_error(
         .expect("valid account error classification")
 }
 
-/// Map a `SetErrorType` to the corresponding typed `JmapMethod` wire
-/// cause variant. Returns `None` only for `SetErrorType::Other` (no
-/// stable wire code) and the resource-classified cases handled above
-/// whose primary cause is already a `WireCause` (`WillDestroy`,
-/// `Singleton`, etc.). Callers that already check `primary_was_wire`
-/// will not call this for those variants.
+/// The typed native signal retained as forensic evidence for each known code.
 fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod> {
     match error_type {
         SetErrorType::Forbidden
@@ -929,18 +900,14 @@ fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod>
         SetErrorType::InvalidRecipients => Some(JmapMethod::InvalidRecipients),
         SetErrorType::InvalidScript => Some(JmapMethod::InvalidScript),
         SetErrorType::NoRecipients => Some(JmapMethod::NoRecipients),
-        // WillDestroy/Singleton/ScriptIsActive/CannotUnsend/MailboxHasChild/
-        // MailboxHasEmail primary IS the WireCause; callers skip these.
-        // Other(code) carries the unknown wire code already as the
-        // primary `Cause::Wire(JmapMethod::Unknown { code })`; no
-        // forensic duplicate is added.
-        SetErrorType::WillDestroy
-        | SetErrorType::Singleton
-        | SetErrorType::ScriptIsActive
-        | SetErrorType::CannotUnsend
-        | SetErrorType::MailboxHasChild
-        | SetErrorType::MailboxHasEmail
-        | SetErrorType::Other(_) => None,
+        SetErrorType::WillDestroy => Some(JmapMethod::WillDestroy),
+        SetErrorType::Singleton => Some(JmapMethod::Singleton),
+        SetErrorType::ScriptIsActive => Some(JmapMethod::ScriptIsActive),
+        SetErrorType::CannotUnsend => Some(JmapMethod::CannotUnsend),
+        SetErrorType::MailboxHasChild => Some(JmapMethod::MailboxHasChild),
+        SetErrorType::MailboxHasEmail => Some(JmapMethod::MailboxHasEmail),
+        // Unknown codes already carry their wire spelling in the primary cause.
+        SetErrorType::Other(_) => None,
     }
 }
 
@@ -1280,6 +1247,10 @@ pub(super) fn push_set_error(err: crate::Error) -> AccountError {
 /// Shared local refusals retain their canonical types-owned classification.
 pub(super) fn unsupported(operation: AccountOperation) -> AccountError {
     AccountError::unsupported(operation, Protocol::Jmap)
+        .into_builder()
+        .unsupported_reason(bifrost_types::UnsupportedReason::RequestShape)
+        .try_build()
+        .expect("valid unsupported request shape")
 }
 
 pub(super) fn account_closed(operation: AccountOperation) -> AccountError {
@@ -1717,8 +1688,8 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             JmapMethod::AccountReadOnly,
         ),
         MethodErrorType::RequestTooLarge => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
+            AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+            Cause::Request(RequestCause::PayloadTooLarge {
                 detail: DiagnosticText::support_only("requestTooLarge".to_string()),
             }),
             JmapMethod::RequestTooLarge,
@@ -2249,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_upload_is_a_local_malformed_request() {
+    fn oversized_upload_is_a_local_payload_limit() {
         let error = into_account_error(
             crate::Error::UploadSizeLimit { max: 3, size: 4 },
             JmapErrorContext::new(AccountOperation::AttachmentUpload),
@@ -2257,7 +2228,7 @@ mod tests {
 
         assert_eq!(
             error.kind(),
-            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+            &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
         );
         assert_eq!(error.operation(), Some(AccountOperation::AttachmentUpload));
     }
@@ -2491,6 +2462,7 @@ mod tests {
         let err = unsupported_error(
             AccountOperation::HostAttachment,
             None,
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "JMAP has no cloud-drive attachment hosting",
         );
         assert_eq!(
@@ -3016,7 +2988,7 @@ mod tests {
         );
     }
 
-    /// jmap-N1: `terminated_unsupported(op, scope, msg)` carries the
+    /// jmap-N1: `terminated_unsupported(op, scope, reason, msg)` carries the
     /// caller's operation. The pre-fix helper hard-coded
     /// `AccountOperation::Discover`, mis-classifying every stream that
     /// emitted an unsupported event.
@@ -3027,6 +2999,7 @@ mod tests {
             Some(ErrorScope::Cursor(CursorScope::Type(
                 bifrost_types::ObjectType::Thread,
             ))),
+            bifrost_types::UnsupportedReason::CursorScope,
             "JMAP thread inventory is derived from Email inventory",
         );
         match event {
@@ -3563,10 +3536,24 @@ mod unsupported_constructor_tests {
         let error = unsupported_error(
             operation,
             Some(bifrost_types::ErrorScope::Account),
+            bifrost_types::UnsupportedReason::OperationUnavailable,
             "unavailable",
         );
         assert_eq!(error.protocol(), Some(protocol));
         assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::OperationUnavailable)
+        );
+        let flag = into_account_error(
+            crate::Error::UnsupportedFlagOperation("wording is diagnostic only"),
+            JmapErrorContext::new(AccountOperation::UpdateFlags),
+        );
+        assert_eq!(
+            flag.unsupported_reason(),
+            Some(bifrost_types::UnsupportedReason::FlagOperation)
+        );
+
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(operation)
@@ -3649,6 +3636,85 @@ mod replay_tests {
         );
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_contract_tests {
+    use super::*;
+    use bifrost_types::RecoveryClass;
+
+    #[test]
+    fn local_frame_and_upload_limits_are_payload_refusals() {
+        for input in [
+            crate::Error::RequestCallLimit { max: 1 },
+            crate::Error::RequestSizeLimit { max: 1, size: 2 },
+            crate::Error::UploadSizeLimit { max: 1, size: 2 },
+        ] {
+            let error = into_account_error(input, JmapErrorContext::new(AccountOperation::Send));
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+            );
+            assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused);
+        }
+    }
+
+    #[test]
+    fn wire_payload_and_precondition_refusals_retain_each_native_code() {
+        for (codes, kind) in [
+            (
+                &[
+                    "tooLarge",
+                    "tooManyKeywords",
+                    "tooManyMailboxes",
+                    "tooManyRecipients",
+                ][..],
+                RequestErrorKind::PayloadTooLarge,
+            ),
+            (
+                &[
+                    "willDestroy",
+                    "singleton",
+                    "scriptIsActive",
+                    "cannotUnsend",
+                    "mailboxHasChild",
+                    "mailboxHasEmail",
+                ][..],
+                RequestErrorKind::PreconditionFailed,
+            ),
+        ] {
+            for code in codes {
+                let native: SetError<String> =
+                    serde_json::from_value(serde_json::json!({"type": code}))
+                        .expect("native error");
+                let error = into_account_error(
+                    crate::Error::Set(native),
+                    JmapErrorContext::new(AccountOperation::Send),
+                );
+                assert_eq!(error.kind(), &AccountErrorKind::Request(kind), "{code}");
+                assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused, "{code}");
+                assert!(
+                    error
+                        .support_internal()
+                        .chain
+                        .iter()
+                        .any(|cause| cause.native_code == Some(*code)),
+                    "{code}"
+                );
+                assert!(error.chain().iter().any(|c| matches!(c, Cause::Attempt(a) if a.transmission_state == TransmissionState::Acknowledged)), "{code}");
+            }
+        }
+        let method = serde_json::from_value(serde_json::json!({"type": "requestTooLarge"}))
+            .expect("method error");
+        let error = into_account_error(
+            crate::Error::Method(method),
+            JmapErrorContext::new(AccountOperation::Send),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
         );
     }
 }

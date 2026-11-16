@@ -57,3 +57,6 @@ impl QueryObject for SieveScript {
 
     type Sort = Comparator;
 }
+
+#[cfg(test)]
+mod wire_tests;

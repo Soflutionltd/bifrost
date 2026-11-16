@@ -62,56 +62,6 @@ impl Serialize for RawMethodCall {
     }
 }
 
-/// What the open session says about `maxCallsInRequest` (RFC 8620 §2).
-///
-/// Three states, kept apart deliberately. Only the third is a bound this
-/// request may enforce; collapsing the first two into "the limit is zero"
-/// turns a malformed or capability-shifted session into a request that
-/// can never contain a single method call. Account opening validates before probes;
-/// direct protocol requests still need to preserve the classification -
-/// `CapabilityChanged` for an absent core capability,
-/// `Protocol(ContractViolation)` for a zero-valued one - that tells the
-/// engine how to recover. Not enforcing here loses nothing: the
-/// capability validation is the gate for both bad states, and a server
-/// that advertised no usable limit has no limit for us to respect.
-#[derive(Debug, Clone, Copy)]
-enum CallLimit {
-    /// No limit was advertised at all: either the session document
-    /// carries no `urn:ietf:params:jmap:core` capability, or it carries
-    /// one that omits `maxCallsInRequest`.
-    Unadvertised,
-    /// A limit was advertised and it is not usable: the core block
-    /// advertises `maxCallsInRequest: 0` (which the spec forbids), or the
-    /// block itself is present but unparseable, so whatever it advertised
-    /// cannot be honoured.
-    Invalid,
-    /// A usable advertised bound.
-    Advertised(std::num::NonZeroUsize),
-}
-
-impl CallLimit {
-    fn read(session: &super::session::Session) -> Self {
-        use super::session::CoreCapabilityState;
-        match session.core_capability_state() {
-            CoreCapabilityState::Absent => CallLimit::Unadvertised,
-            CoreCapabilityState::Malformed => CallLimit::Invalid,
-            CoreCapabilityState::Present(core) => match core.max_calls_in_request() {
-                None => CallLimit::Unadvertised,
-                Some(max) => std::num::NonZeroUsize::new(max)
-                    .map_or(CallLimit::Invalid, CallLimit::Advertised),
-            },
-        }
-    }
-
-    /// The bound to enforce, if any. `None` for both unusable states.
-    fn enforced(self) -> Option<usize> {
-        match self {
-            CallLimit::Unadvertised | CallLimit::Invalid => None,
-            CallLimit::Advertised(max) => Some(max.get()),
-        }
-    }
-}
-
 /// A JMAP request batch.
 pub(crate) struct Request<
     'x,
@@ -125,7 +75,6 @@ pub(crate) struct Request<
     pub(crate) using: Vec<&'static str>,
     method_calls: Vec<RawMethodCall>,
     pub(crate) created_ids: Option<std::collections::HashMap<String, String>>,
-    max_calls: CallLimit,
 }
 
 impl<T: HttpTransport, C: Capability> Serialize for Request<'_, T, C> {
@@ -144,7 +93,6 @@ impl<T: HttpTransport, C: Capability> Serialize for Request<'_, T, C> {
 impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
     fn scoped(client: &'x Client<T>, account_id: AccountId) -> Self {
         let session_state = client.session_state();
-        let max_calls = CallLimit::read(session_state.session());
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
@@ -153,7 +101,6 @@ impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
             capability: PhantomData,
             client,
             session_state,
-            max_calls,
         }
     }
 
@@ -216,7 +163,11 @@ impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
     }
 
     fn push<M: JmapMethod>(&mut self, mut method: M) -> Result<CallHandle<M>, crate::Error> {
-        if let Some(max) = self.max_calls.enforced()
+        if let Some(max) = self
+            .session_state
+            .session()
+            .core_limits()
+            .max_calls_in_request()
             && self.method_calls.len() >= max
         {
             return Err(crate::Error::RequestCallLimit { max });
@@ -428,9 +379,8 @@ impl<T: HttpTransport, C: Capability> Request<'_, T, C> {
         let advertised = self
             .session_state()
             .session()
-            .core_capabilities()
-            .and_then(crate::core::session::CoreCapabilities::max_size_request)
-            .filter(|max| *max > 0);
+            .core_limits()
+            .max_size_request();
         let max_size = advertised.map_or(max_size, |max| max.min(max_size));
         if self.encoded_len()? > max_size {
             return Ok(None);
@@ -486,69 +436,4 @@ pub(crate) fn require_capability<C: Capability>(
 }
 
 #[cfg(test)]
-mod call_limit_tests {
-    use super::CallLimit;
-    use crate::core::session::Session;
-
-    fn session_with_capabilities(capabilities: serde_json::Value) -> Session {
-        serde_json::from_value(serde_json::json!({
-            "capabilities": capabilities,
-            "accounts": {},
-            "primaryAccounts": {},
-            "username": "user@example.test",
-            "apiUrl": "https://example.test/jmap/api",
-            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
-            "uploadUrl": "https://example.test/upload/{accountId}",
-            "eventSourceUrl": "https://example.test/eventsource",
-            "state": "session-1"
-        }))
-        .expect("session fixture parses")
-    }
-
-    fn session_with_core(core: serde_json::Value) -> Session {
-        session_with_capabilities(serde_json::json!({ "urn:ietf:params:jmap:core": core }))
-    }
-
-    /// The three lanes must be told apart at the source. "No core block",
-    /// "core block that omits the limit", "core block that advertises
-    /// zero" and "core block that does not parse" all decline to enforce,
-    /// so nothing but the lane itself distinguishes them here - and the
-    /// session validator classifies each differently.
-    #[test]
-    fn call_limit_reads_the_lane_the_session_actually_describes() {
-        assert!(matches!(
-            CallLimit::read(&session_with_capabilities(serde_json::json!({}))),
-            CallLimit::Unadvertised
-        ));
-        assert!(
-            matches!(
-                CallLimit::read(&session_with_core(serde_json::json!({}))),
-                CallLimit::Unadvertised
-            ),
-            "an OMITTED maxCallsInRequest advertised no limit; \
-             it is not an advertised zero"
-        );
-        assert!(matches!(
-            CallLimit::read(&session_with_core(
-                serde_json::json!({"maxCallsInRequest": 0})
-            )),
-            CallLimit::Invalid
-        ));
-        assert!(
-            matches!(
-                CallLimit::read(&session_with_core(
-                    serde_json::json!({"maxCallsInRequest": "16"})
-                )),
-                CallLimit::Invalid
-            ),
-            "a present-but-unparseable core block advertised something \
-             unusable; it must not read as unadvertised"
-        );
-        assert!(matches!(
-            CallLimit::read(&session_with_core(
-                serde_json::json!({"maxCallsInRequest": 16})
-            )),
-            CallLimit::Advertised(max) if max.get() == 16
-        ));
-    }
-}
+mod wire_tests;

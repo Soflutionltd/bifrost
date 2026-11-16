@@ -66,6 +66,10 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         AccountErrorKind::AccountClosed => "account.closed",
         AccountErrorKind::ConcurrencyConflict => "concurrency.conflict",
         AccountErrorKind::Request(RequestErrorKind::Malformed) => "request.malformed",
+        AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge) => "request.payload-too-large",
+        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed) => {
+            "request.precondition-failed"
+        }
         AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid) => {
             "request.batch-input-invalid"
         }
@@ -226,6 +230,14 @@ mod tests {
             (
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 "request.malformed",
+            ),
+            (
+                AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge),
+                "request.payload-too-large",
+            ),
+            (
+                AccountErrorKind::Request(RequestErrorKind::PreconditionFailed),
+                "request.precondition-failed",
             ),
             (
                 AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),

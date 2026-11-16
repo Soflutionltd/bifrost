@@ -1565,7 +1565,12 @@ pub(super) fn validate_shared_attendees(
 }
 
 fn unsupported(operation: AccountOperation, message: &str) -> AccountError {
-    super::error::unsupported_error(operation, None, message)
+    super::error::unsupported_error(
+        operation,
+        None,
+        bifrost_types::UnsupportedReason::DataRepresentation,
+        message,
+    )
 }
 
 fn to_acct_err(operation: AccountOperation) -> impl Fn(crate::Error) -> AccountError {

@@ -60,36 +60,15 @@ impl ImapConnection {
         params: NotifySetParams,
         timeout: Duration,
     ) -> Result<(), Error> {
-        // RFC 5465 Section 3: NOTIFY is a `command-auth` extension, valid
-        // in Authenticated or Selected state.
-        self.require_notify()?;
+        let cmd = super::request::NotifySet { params };
 
-        // RFC 6855 Section 6: UTF8=ONLY servers reject commands that might
-        // require UTF-8 support until ENABLE UTF8=ACCEPT. Only check when
-        // the command actually carries mailbox strings (Subtree/Mailboxes
-        // filters). Atom-only registrations like `(selected (MessageNew))`
-        // contain no mailbox strings and are valid without ENABLE.
-        let has_mailbox_strings = params.event_groups.iter().any(|g| {
-            matches!(
-                g.filter(),
-                MailboxFilter::Subtree(_) | MailboxFilter::Mailboxes(_)
-            )
-        });
-        if has_mailbox_strings {
-            self.check_utf8_only_enforced()?;
-        }
-
-        let cmd = Command::NotifySet(params);
-        let consumer = super::dispatch::NotifySetConsumer::default();
         // Driver arms NOTIFY SET before sending; apply_tagged updates
         // notify flags on tagged OK. NOTIFICATIONOVERFLOW clears them.
         // NO/BAD arrive as the ordinary `Err` of this call: they ride
         // `Finalized::output`, so the consumer's `reclassified_as_events` is
         // emitted on that path too, and the caller no longer unwraps a second
         // inner `Result` to find out.
-        let overflow = self
-            .submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await?;
+        let overflow = self.execute_request(cmd, timeout).await?;
 
         if overflow {
             // RFC 5465 Section 5.8: server cannot keep up. Notify flags
@@ -117,17 +96,11 @@ impl ImapConnection {
     ///   ([`crate::error::TransportFailure::Closed`] once the session is in Logout).
     pub async fn notify_none(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension.
-        self.require_notify()?;
 
-        let cmd = Command::NotifyNone;
+        let cmd = super::request::NotifyNone {};
         // Driver arms NOTIFY NONE before sending;
         // apply_tagged resets notify flags on tagged OK.
-        self.submit_regular(
-            cmd,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await?;
+        self.execute_request(cmd, timeout).await?;
 
         debug!("NOTIFY NONE  -  notifications disabled (RFC 5465)");
         Ok(())
@@ -193,15 +166,14 @@ impl ImapConnection {
     ) -> Result<Vec<String>, Error> {
         // RFC 5161 Section 2: ENABLE is only valid in Authenticated state.
 
-        let cmd = Command::Enable {
+        let cmd = super::request::Enable {
             capabilities: capabilities
                 .iter()
                 .map(|c| Capability::from_imap_str(c))
                 .collect(),
         };
-        let consumer = super::dispatch::EnableConsumer::default();
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -217,12 +189,8 @@ impl ImapConnection {
     /// Requires the `NAMESPACE` capability or an `IMAP4rev2` connection
     /// (RFC 9051 folds NAMESPACE into the base protocol).
     pub async fn namespace(&self, timeout: Duration) -> Result<NamespaceResponse, Error> {
-        self.submit_regular(
-            Command::Namespace,
-            super::dispatch::NamespaceConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(super::request::Namespace {}, timeout)
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -242,18 +210,13 @@ impl ImapConnection {
         params: &[(&str, Option<&str>)],
         timeout: Duration,
     ) -> Result<Vec<(String, Option<String>)>, Error> {
-        let cmd = Command::Id(
-            params
+        let cmd = super::request::Id {
+            params: params
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
                 .collect(),
-        );
-        self.submit_regular(
-            cmd,
-            super::dispatch::IdConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        };
+        self.execute_request(cmd, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -281,18 +244,15 @@ impl ImapConnection {
         depth: Option<&str>,
         timeout: Duration,
     ) -> Result<MetadataResult, Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::GetMetadata {
-            mailbox: mailbox_name.clone(),
+        let cmd = super::request::GetMetadata {
+            mailbox: mailbox_name,
             entries: entries.iter().map(|e| (*e).to_owned()).collect(),
             max_size,
             depth: depth.map(str::to_owned),
         };
-        let consumer = super::dispatch::MetadataConsumer::new(mailbox_name.clone());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// SETMETADATA  -  set or delete mailbox/server metadata entries
@@ -309,22 +269,15 @@ impl ImapConnection {
         entries: &[(&str, Option<&[u8]>)],
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::SetMetadata {
+        let cmd = super::request::SetMetadata {
             mailbox: mailbox_name,
             entries: entries
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), v.map(<[u8]>::to_vec)))
                 .collect(),
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -342,12 +295,11 @@ impl ImapConnection {
         root: &str,
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        let cmd = Command::GetQuota {
+        let cmd = super::request::GetQuota {
             root: root.to_owned(),
         };
-        let consumer = super::dispatch::QuotaConsumer::new(root.to_owned());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// GETQUOTAROOT  -  query quota roots for a mailbox
@@ -362,15 +314,12 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<QuotaRootResponse, Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::GetQuotaRoot {
-            mailbox: mailbox_name.clone(),
+        let cmd = super::request::GetQuotaRoot {
+            mailbox: mailbox_name,
         };
-        let consumer = super::dispatch::QuotaRootConsumer::new(mailbox_name.clone());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// SETQUOTA  -  set resource limits on a quota root
@@ -386,16 +335,15 @@ impl ImapConnection {
         resources: &[(&str, u64)],
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        let cmd = Command::SetQuota {
+        let cmd = super::request::SetQuota {
             root: root.to_owned(),
             resources: resources
                 .iter()
                 .map(|(name, limit)| ((*name).to_owned(), *limit))
                 .collect(),
         };
-        let consumer = super::dispatch::QuotaConsumer::new(root.to_owned());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     // -----------------------------------------------------------------------
@@ -417,20 +365,13 @@ impl ImapConnection {
         rights: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::SetAcl {
+        let cmd = super::request::SetAcl {
             mailbox: mailbox_name,
             identifier: identifier.to_owned(),
             rights: rights.to_owned(),
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// DELETEACL  -  remove an access control list entry for a mailbox
@@ -445,19 +386,12 @@ impl ImapConnection {
         identifier: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::DeleteAcl {
+        let cmd = super::request::DeleteAcl {
             mailbox: mailbox_name,
             identifier: identifier.to_owned(),
         };
-        self.submit_regular(
-            cmd,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
+        self.execute_request(cmd, timeout).await
     }
 
     /// GETACL  -  retrieve the access control list for a mailbox
@@ -471,15 +405,12 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Vec<AclEntry>, Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::GetAcl {
-            mailbox: mailbox_name.clone(),
+        let cmd = super::request::GetAcl {
+            mailbox: mailbox_name,
         };
-        let consumer = super::dispatch::AclConsumer::new(mailbox_name.clone());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// LISTRIGHTS  -  query the set of rights grantable to an identifier
@@ -495,17 +426,13 @@ impl ImapConnection {
         identifier: &str,
         timeout: Duration,
     ) -> Result<ListRightsResponse, Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::ListRights {
-            mailbox: mailbox_name.clone(),
+        let cmd = super::request::ListRights {
+            mailbox: mailbox_name,
             identifier: identifier.to_owned(),
         };
-        let consumer =
-            super::dispatch::ListRightsConsumer::new(mailbox_name.clone(), identifier.to_owned());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
+
+        self.execute_request(cmd, timeout).await
     }
 
     /// MYRIGHTS  -  query the logged-in user's rights on a mailbox
@@ -519,20 +446,12 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<String, Error> {
-        self.check_utf8_only_enforced()?;
-
         let mailbox_name = mailbox.mailbox_name()?;
-        let cmd = Command::MyRights {
-            mailbox: mailbox_name.clone(),
+        let cmd = super::request::MyRights {
+            mailbox: mailbox_name,
         };
-        let consumer = super::dispatch::MyRightsConsumer::new(mailbox_name.clone());
-        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
-            .await
-    }
 
-    /// Verify that the server advertises the NOTIFY capability (RFC 5465).
-    fn require_notify(&self) -> Result<(), Error> {
-        self.admit_command(&Command::NotifyNone).map(drop)
+        self.execute_request(cmd, timeout).await
     }
 }
 

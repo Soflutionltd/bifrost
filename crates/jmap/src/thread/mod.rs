@@ -42,3 +42,6 @@ impl crate::core::changes::ChangesObject for Thread {
 
 crate::define_get_method!(ThreadGet, Thread);
 crate::define_changes_method!(ThreadChanges, Thread);
+
+#[cfg(test)]
+mod wire_tests;

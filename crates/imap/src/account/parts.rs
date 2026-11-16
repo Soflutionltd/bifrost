@@ -469,10 +469,7 @@ impl DecodedPartHandle {
         if self.uidvalidity == live {
             Ok(())
         } else {
-            Err(malformed(
-                "IMAP part handle was minted under a different UIDVALIDITY",
-                op,
-            ))
+            Err(super::error::uidvalidity_changed_error(op, &self.folder))
         }
     }
 }

@@ -161,3 +161,25 @@ fn new_provider_and_protocol_tags_keep_their_historical_gate() {
         assert!(ledger::decode_protocol(tag, 8).is_err());
     }
 }
+
+#[test]
+fn request_refusal_tags_are_versioned_and_roundtrip() {
+    for (tag, kind) in [
+        (2, RequestErrorKind::PayloadTooLarge),
+        (3, RequestErrorKind::PreconditionFailed),
+    ] {
+        let kind = AccountErrorKind::Request(kind);
+        let mut encoded = Vec::new();
+        ledger::encode_error_kind(&mut encoded, &kind);
+        assert_eq!(encoded, [6, tag]);
+        let mut reader = Reader::new(&encoded, 14);
+        assert_eq!(ledger::decode_error_kind(&mut reader).unwrap(), kind);
+        assert!(reader.is_finished());
+        for version in 3..14 {
+            assert!(matches!(
+                ledger::decode_error_kind(&mut Reader::new(&encoded, version)),
+                Err(DecodeError::Malformed(_))
+            ));
+        }
+    }
+}

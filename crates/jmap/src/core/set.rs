@@ -506,3 +506,6 @@ impl Display for SetErrorType {
         }
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

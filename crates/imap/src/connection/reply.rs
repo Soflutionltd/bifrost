@@ -56,6 +56,15 @@ pub(in crate::connection) struct CommitGate {
 }
 
 impl CommitGate {
+    /// Driver-owned setup has no queued caller command to withdraw. Its caller
+    /// cancels by aborting the entire setup task and destroying the transport.
+    pub(in crate::connection) fn committed() -> Self {
+        Self {
+            state: AtomicU8::new(COMMITTED),
+            wake: Notify::new(),
+        }
+    }
+
     /// CAS CLAIMED -> COMMITTED. `true` also when already COMMITTED; `false`
     /// when the caller withdrew, in which case the driver must write nothing
     /// and answer nothing.

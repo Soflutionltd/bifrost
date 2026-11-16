@@ -26,7 +26,6 @@ use crate::types::response::{
     AclEntry, EsearchResponse, ListRightsResponse, MetadataResult, NamespaceResponse,
     QuotaResource, QuotaRootResponse, ThreadNode, UidRange,
 };
-use crate::types::set::UidSet;
 use crate::types::{
     Capability, Command, CopyResult, ExpungeResult, FetchResponse, MoveResult, StatusResult,
     StoreResult,
@@ -34,8 +33,10 @@ use crate::types::{
 
 use super::MailboxInfo;
 use super::SearchResult;
+#[cfg(test)]
 use super::dispatch;
 use super::driver::ConsumerErased;
+use super::request::{self, Request};
 
 mod error;
 mod unfold;
@@ -103,24 +104,31 @@ macro_rules! pipeline_method {
     (
         $(#[$meta:meta])*
         fn $name:ident($($param:ident : $param_ty:ty),* $(,)?) -> $output:ty;
-        command = $cmd:expr;
-        consumer = $consumer:expr;
+        request = $request:expr;
     ) => {
         $(#[$meta])*
-        pub fn $name(mut self $(, $param: $param_ty)*) -> Pipeline<'conn, ($output, T)> {
-            self.commands.push($cmd);
-            self.pending.push(Box::new($consumer) as Box<dyn ConsumerErased>);
-            Pipeline {
-                conn: self.conn,
-                pending: self.pending,
-                commands: self.commands,
-                _marker: PhantomData,
-            }
+        pub fn $name(self $(, $param: $param_ty)*) -> Pipeline<'conn, ($output, T)> {
+            self.push($request)
         }
     };
 }
 
 impl<'conn, T> Pipeline<'conn, T> {
+    fn push<R: Request>(
+        mut self,
+        request: R,
+    ) -> Pipeline<'conn, (<R::Consumer as super::dispatch::Consumer>::Output, T)> {
+        let (command, consumer) = request.into_parts();
+        self.commands.push(command);
+        self.pending.push(Box::new(consumer));
+        Pipeline {
+            conn: self.conn,
+            pending: self.pending,
+            commands: self.commands,
+            _marker: PhantomData,
+        }
+    }
+
     // =======================================================================
     // Any-state commands (RFC 3501 Section6.1)
     // =======================================================================
@@ -128,15 +136,13 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// NOOP command (RFC 3501 Section6.1.2).
         fn noop() -> ();
-        command = Command::Noop;
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Noop {};
     }
 
     pipeline_method! {
         /// CAPABILITY command (RFC 3501 Section6.1.1).
         fn capability() -> Vec<Capability>;
-        command = Command::Capability;
-        consumer = dispatch::CapabilityConsumer::default();
+        request = request::Capability {};
     }
 
     // =======================================================================
@@ -145,9 +151,8 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// LIST command (RFC 3501 Section6.3.8).
-        fn list(reference: String, pattern: String) -> Result<Vec<MailboxInfo>, Error>;
-        command = Command::List { reference: reference.into(), pattern: pattern.into() };
-        consumer = dispatch::ListConsumer::new();
+        fn list(reference: String, pattern: String) -> Vec<MailboxInfo>;
+        request = request::List { reference: reference.into(), pattern: pattern.into() };
     }
 
     /// LIST with selection/return options (RFC 5258 Section3, RFC 9051 Section6.3.9).
@@ -157,27 +162,18 @@ impl<'conn, T> Pipeline<'conn, T> {
     /// / `\NoAccess` responses are treated as NOTIFY markers and
     /// reclassified as events.
     pub fn list_extended(
-        mut self,
+        self,
         selection_options: Vec<crate::types::command_options::ListSelect>,
         reference: String,
         patterns: Vec<String>,
         return_options: Vec<crate::types::command_options::ListReturn>,
-    ) -> Pipeline<'conn, (Result<Vec<MailboxInfo>, Error>, T)> {
-        let consumer = dispatch::ListExtendedConsumer::new(selection_options.clone());
-        self.commands.push(Command::ListExtended {
+    ) -> Pipeline<'conn, (Vec<MailboxInfo>, T)> {
+        self.push(request::ListExtended {
             selection_options,
             reference: reference.into(),
             patterns: patterns.into_iter().map(Into::into).collect(),
             return_options,
-        });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+        })
     }
 
     pipeline_method! {
@@ -186,23 +182,20 @@ impl<'conn, T> Pipeline<'conn, T> {
             reference: String,
             pattern: String,
             status_items: impl Into<crate::types::command_options::StatusItems>,
-        ) -> Result<Vec<crate::types::ListStatusEntry>, Error>;
-        command = Command::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items: status_items.into() };
-        consumer = dispatch::ListStatusConsumer::new();
+        ) -> Vec<crate::types::ListStatusEntry>;
+        request = request::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items: status_items.into() };
     }
 
     pipeline_method! {
         /// LSUB command (RFC 3501 Section6.3.9).
         fn lsub(reference: String, pattern: String) -> Vec<MailboxInfo>;
-        command = Command::Lsub { reference: reference.into(), pattern: pattern.into() };
-        consumer = dispatch::LsubConsumer::default();
+        request = request::Lsub { reference: reference.into(), pattern: pattern.into() };
     }
 
     pipeline_method! {
         /// CREATE command (RFC 3501 Section6.3.3).
         fn create(mailbox: MailboxName) -> Option<String>;
-        command = Command::Create { mailbox };
-        consumer = dispatch::CreateConsumer::default();
+        request = request::Create { mailbox };
     }
 
     pipeline_method! {
@@ -211,50 +204,43 @@ impl<'conn, T> Pipeline<'conn, T> {
             mailbox: MailboxName,
             special_use: Vec<MailboxAttribute>,
         ) -> Option<String>;
-        command = Command::CreateSpecialUse { mailbox, special_use };
-        consumer = dispatch::CreateConsumer::default();
+        request = request::CreateSpecialUse { mailbox, special_use };
     }
 
     pipeline_method! {
         /// DELETE command (RFC 3501 Section6.3.4).
         fn delete(mailbox: MailboxName) -> ();
-        command = Command::Delete { mailbox };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Delete { mailbox };
     }
 
     pipeline_method! {
         /// RENAME command (RFC 3501 Section6.3.5).
         fn rename(mailbox: MailboxName, new_name: MailboxName) -> ();
-        command = Command::Rename { mailbox, new_name };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Rename { mailbox, new_name };
     }
 
     pipeline_method! {
         /// SUBSCRIBE command (RFC 3501 Section6.3.6).
         fn subscribe(mailbox: MailboxName) -> ();
-        command = Command::Subscribe { mailbox };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Subscribe { mailbox };
     }
 
     pipeline_method! {
         /// UNSUBSCRIBE command (RFC 3501 Section6.3.7).
         fn unsubscribe(mailbox: MailboxName) -> ();
-        command = Command::Unsubscribe { mailbox };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Unsubscribe { mailbox };
     }
 
     pipeline_method! {
         /// STATUS command (RFC 3501 Section6.3.10).
         fn status(mailbox: MailboxName, items: impl Into<crate::types::command_options::StatusItems>) -> StatusResult;
-        command = Command::Status { mailbox, items: items.into() };
-        consumer = dispatch::StatusConsumer::new();
+        request = request::Status { mailbox, items: items.into() };
     }
 
     pipeline_method! {
         /// NAMESPACE command (RFC 2342).
         fn namespace() -> NamespaceResponse;
-        command = Command::Namespace;
-        consumer = dispatch::NamespaceConsumer::default();
+        request = request::Namespace {};
     }
 
     // =======================================================================
@@ -264,8 +250,7 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// CHECK command (RFC 3501 Section6.4.1).
         fn check() -> ();
-        command = Command::Check;
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::Check {};
     }
 
     pipeline_method! {
@@ -276,15 +261,13 @@ impl<'conn, T> Pipeline<'conn, T> {
         /// (RFC 3501 Section5.5). Callers must ensure no such ambiguity
         /// exists in their pipeline.
         fn expunge() -> ExpungeResult;
-        command = Command::Expunge;
-        consumer = dispatch::ExpungeConsumer::new();
+        request = request::Expunge {};
     }
 
     pipeline_method! {
         /// SEARCH command (RFC 3501 Section6.4.4).
-        fn search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult<crate::types::Seq>, Error>;
-        command = Command::Search { criteria: criteria.into() };
-        consumer = dispatch::SearchConsumer::<crate::types::Seq>::new();
+        fn search(criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult<crate::types::Seq>;
+        request = request::Search { criteria: criteria.into() };
     }
 
     pipeline_method! {
@@ -292,16 +275,14 @@ impl<'conn, T> Pipeline<'conn, T> {
         fn search_return(
             criteria: impl Into<crate::types::SearchCriteria>,
             return_opts: Vec<crate::types::command_options::SearchReturn>,
-        ) -> Result<EsearchResponse, Error>;
-        command = Command::SearchReturn { criteria: criteria.into(), return_opts };
-        consumer = dispatch::EsearchConsumer::new();
+        ) -> EsearchResponse;
+        request = request::SearchReturn { criteria: criteria.into(), return_opts };
     }
 
     pipeline_method! {
         /// SEARCH RETURN (SAVE) command (RFC 5182 Section2).
-        fn search_save(criteria: impl Into<crate::types::SearchCriteria>) -> Result<(), Error>;
-        command = Command::SearchSave { criteria: criteria.into() };
-        consumer = dispatch::SearchSaveConsumer::new();
+        fn search_save(criteria: impl Into<crate::types::SearchCriteria>) -> ();
+        request = request::SearchSave { criteria: criteria.into() };
     }
 
     pipeline_method! {
@@ -311,8 +292,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             items: impl Into<crate::types::fetch::FetchItems>,
             changed_since: Option<crate::types::ModSeq>,
         ) -> Vec<FetchResponse>;
-        command = Command::Fetch { sequence_set, items: items.into(), changed_since };
-        consumer = dispatch::FetchConsumer::new();
+        request = request::Fetch { sequence_set, items: items.into(), changed_since };
     }
 
     pipeline_method! {
@@ -323,22 +303,19 @@ impl<'conn, T> Pipeline<'conn, T> {
             flags: Vec<Flag>,
             unchanged_since: Option<crate::types::ModSeqValzer>,
         ) -> StoreResult;
-        command = Command::Store { sequence_set, operation, flags, unchanged_since };
-        consumer = dispatch::StoreConsumer::new(unchanged_since);
+        request = request::Store { sequence_set, operation, flags, unchanged_since };
     }
 
     pipeline_method! {
         /// COPY command (RFC 3501 Section6.4.7).
         fn copy(sequence_set: SequenceSet<crate::types::Seq>, mailbox: MailboxName) -> CopyResult;
-        command = Command::Copy { sequence_set, mailbox };
-        consumer = dispatch::CopyConsumer::new();
+        request = request::Copy { sequence_set, mailbox };
     }
 
     pipeline_method! {
         /// MOVE command (RFC 6851 Section3).
         fn move_messages(sequence_set: SequenceSet<crate::types::Seq>, mailbox: MailboxName) -> MoveResult;
-        command = Command::Move { sequence_set, mailbox };
-        consumer = dispatch::MoveConsumer::new();
+        request = request::Move { sequence_set, mailbox };
     }
 
     // =======================================================================
@@ -347,9 +324,8 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// UID SEARCH command (RFC 3501 Section6.4.4).
-        fn uid_search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult, Error>;
-        command = Command::UidSearch { criteria: criteria.into() };
-        consumer = dispatch::SearchConsumer::<crate::types::Uid>::new();
+        fn uid_search(criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
+        request = request::UidSearch { criteria: criteria.into() };
     }
 
     pipeline_method! {
@@ -357,21 +333,19 @@ impl<'conn, T> Pipeline<'conn, T> {
         fn uid_search_return(
             criteria: impl Into<crate::types::SearchCriteria>,
             return_opts: Vec<crate::types::command_options::SearchReturn>,
-        ) -> Result<EsearchResponse, Error>;
-        command = Command::UidSearchReturn { criteria: criteria.into(), return_opts };
-        consumer = dispatch::EsearchConsumer::new();
+        ) -> EsearchResponse;
+        request = request::UidSearchReturn { criteria: criteria.into(), return_opts };
     }
 
     pipeline_method! {
         /// UID SEARCH RETURN (SAVE) command (RFC 5182 Section2).
-        fn uid_search_save(criteria: impl Into<crate::types::SearchCriteria>) -> Result<(), Error>;
-        command = Command::UidSearchSave { criteria: criteria.into() };
-        consumer = dispatch::SearchSaveConsumer::new();
+        fn uid_search_save(criteria: impl Into<crate::types::SearchCriteria>) -> ();
+        request = request::UidSearchSave { criteria: criteria.into() };
     }
 
     /// UID FETCH command (RFC 3501 Section6.4.5, RFC 7162 Section3.2.6).
     ///
-    /// Uses [`FetchVanishedConsumer`](dispatch::FetchVanishedConsumer)
+    /// Uses the shared VANISHED-aware request
     /// regardless of the `vanished` flag so that VANISHED responses
     /// are always captured when the server sends them.
     ///
@@ -379,29 +353,18 @@ impl<'conn, T> Pipeline<'conn, T> {
     /// filtering of `VANISHED (EARLIER)` UIDs (RFC 7162 Section 3.2.6).
     #[allow(clippy::type_complexity)]
     pub fn uid_fetch(
-        mut self,
+        self,
         sequence_set: SequenceSet,
         items: impl Into<crate::types::fetch::FetchItems>,
         changed_since: Option<crate::types::ModSeq>,
         vanished: bool,
     ) -> Pipeline<'conn, ((Vec<FetchResponse>, Vec<UidRange>), T)> {
-        // Parse before moving sequence_set into the command.
-        let parsed_set = UidSet::from_expression(&sequence_set);
-        self.commands.push(Command::UidFetch {
+        self.push(request::UidFetchWithVanished {
             sequence_set,
             items: items.into(),
             changed_since,
             vanished,
-        });
-        self.pending
-            .push(Box::new(dispatch::FetchVanishedConsumer::new(parsed_set))
-                as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+        })
     }
 
     pipeline_method! {
@@ -412,29 +375,25 @@ impl<'conn, T> Pipeline<'conn, T> {
             flags: Vec<Flag>,
             unchanged_since: Option<crate::types::ModSeqValzer>,
         ) -> StoreResult;
-        command = Command::UidStore { sequence_set, operation, flags, unchanged_since };
-        consumer = dispatch::StoreConsumer::new(unchanged_since);
+        request = request::UidStore { sequence_set, operation, flags, unchanged_since };
     }
 
     pipeline_method! {
         /// UID COPY command (RFC 3501 Section6.4.7).
         fn uid_copy(sequence_set: SequenceSet, mailbox: MailboxName) -> CopyResult;
-        command = Command::UidCopy { sequence_set, mailbox };
-        consumer = dispatch::CopyConsumer::new();
+        request = request::UidCopy { sequence_set, mailbox };
     }
 
     pipeline_method! {
         /// UID MOVE command (RFC 6851 Section3).
         fn uid_move_messages(sequence_set: SequenceSet, mailbox: MailboxName) -> MoveResult;
-        command = Command::UidMove { sequence_set, mailbox };
-        consumer = dispatch::MoveConsumer::new();
+        request = request::UidMove { sequence_set, mailbox };
     }
 
     pipeline_method! {
         /// UID EXPUNGE command (RFC 4315).
         fn uid_expunge(sequence_set: SequenceSet) -> ExpungeResult;
-        command = Command::UidExpunge { sequence_set };
-        consumer = dispatch::ExpungeConsumer::new();
+        request = request::UidExpunge { sequence_set };
     }
 
     // =======================================================================
@@ -444,33 +403,23 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// ID command (RFC 2971 Section3.1).
         fn id(params: Vec<(String, Option<String>)>) -> Vec<(String, Option<String>)>;
-        command = Command::Id(params);
-        consumer = dispatch::IdConsumer::default();
+        request = request::Id { params };
     }
 
     /// GETMETADATA command (RFC 5464 Section4.2).
     pub fn get_metadata(
-        mut self,
+        self,
         mailbox: MailboxName,
         entries: Vec<String>,
         max_size: Option<u64>,
         depth: Option<String>,
     ) -> Pipeline<'conn, (MetadataResult, T)> {
-        let consumer = dispatch::MetadataConsumer::new(mailbox.clone());
-        self.commands.push(Command::GetMetadata {
+        self.push(request::GetMetadata {
             mailbox,
             entries,
             max_size,
             depth,
-        });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+        })
     }
 
     pipeline_method! {
@@ -479,81 +428,53 @@ impl<'conn, T> Pipeline<'conn, T> {
             mailbox: MailboxName,
             entries: Vec<(String, Option<Vec<u8>>)>,
         ) -> ();
-        command = Command::SetMetadata { mailbox, entries };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::SetMetadata { mailbox, entries };
     }
 
     pipeline_method! {
         /// THREAD command (RFC 5256 Section3).
         fn thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode<crate::types::Seq>>;
-        command = Command::Thread { algorithm, charset, criteria: criteria.into() };
-        consumer = dispatch::ThreadConsumer::<crate::types::Seq>::default();
+        request = request::Thread { algorithm, charset, criteria: criteria.into() };
     }
 
     pipeline_method! {
         /// UID THREAD command (RFC 5256 Section3).
         fn uid_thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode>;
-        command = Command::UidThread { algorithm, charset, criteria: criteria.into() };
-        consumer = dispatch::ThreadConsumer::<crate::types::Uid>::default();
+        request = request::UidThread { algorithm, charset, criteria: criteria.into() };
     }
 
     pipeline_method! {
         /// SORT command (RFC 5256 Section2).
         fn sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult<crate::types::Seq>;
-        command = Command::Sort { sort_criteria, charset, criteria: criteria.into() };
-        consumer = dispatch::SortConsumer::<crate::types::Seq>::default();
+        request = request::Sort { sort_criteria, charset, criteria: criteria.into() };
     }
 
     pipeline_method! {
         /// UID SORT command (RFC 5256 Section2).
         fn uid_sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
-        command = Command::UidSort { sort_criteria, charset, criteria: criteria.into() };
-        consumer = dispatch::SortConsumer::<crate::types::Uid>::default();
+        request = request::UidSort { sort_criteria, charset, criteria: criteria.into() };
     }
 
     pipeline_method! {
         /// NOTIFY SET command (RFC 5465 Section3).
-        fn notify_set(params: NotifySetParams) -> Result<bool, Error>;
-        command = Command::NotifySet(params);
-        consumer = dispatch::NotifySetConsumer::default();
+        fn notify_set(params: NotifySetParams) -> bool;
+        request = request::NotifySet { params };
     }
 
     pipeline_method! {
         /// NOTIFY NONE command (RFC 5465 Section3).
         fn notify_none() -> ();
-        command = Command::NotifyNone;
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::NotifyNone {};
     }
 
     /// GETQUOTA command (RFC 2087 Section4.2).
-    pub fn get_quota(mut self, root: String) -> Pipeline<'conn, (Vec<QuotaResource>, T)> {
-        let consumer = dispatch::QuotaConsumer::new(root.clone());
-        self.commands.push(Command::GetQuota { root });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+    pub fn get_quota(self, root: String) -> Pipeline<'conn, (Vec<QuotaResource>, T)> {
+        self.push(request::GetQuota { root })
     }
 
     /// GETQUOTAROOT command (RFC 2087 Section4.3).
-    pub fn get_quota_root(
-        mut self,
-        mailbox: MailboxName,
-    ) -> Pipeline<'conn, (QuotaRootResponse, T)> {
-        let consumer = dispatch::QuotaRootConsumer::new(mailbox.clone());
-        self.commands.push(Command::GetQuotaRoot { mailbox });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+    pub fn get_quota_root(self, mailbox: MailboxName) -> Pipeline<'conn, (QuotaRootResponse, T)> {
+        self.push(request::GetQuotaRoot { mailbox })
     }
 
     /// SETQUOTA command (RFC 2087 Section4.1).
@@ -562,83 +483,45 @@ impl<'conn, T> Pipeline<'conn, T> {
     /// untagged responses. The consumer captures the QUOTA response for
     /// the requested root.
     pub fn set_quota(
-        mut self,
+        self,
         root: String,
         resources: Vec<(String, u64)>,
     ) -> Pipeline<'conn, (Vec<QuotaResource>, T)> {
-        let consumer = dispatch::QuotaConsumer::new(root.clone());
-        self.commands.push(Command::SetQuota { root, resources });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+        self.push(request::SetQuota { root, resources })
     }
 
     pipeline_method! {
         /// SETACL command (RFC 4314 Section3.1).
         fn set_acl(mailbox: MailboxName, identifier: String, rights: String) -> ();
-        command = Command::SetAcl { mailbox, identifier, rights };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::SetAcl { mailbox, identifier, rights };
     }
 
     pipeline_method! {
         /// DELETEACL command (RFC 4314 Section3.2).
         fn delete_acl(mailbox: MailboxName, identifier: String) -> ();
-        command = Command::DeleteAcl { mailbox, identifier };
-        consumer = dispatch::TaggedOkConsumer::default();
+        request = request::DeleteAcl { mailbox, identifier };
     }
 
     /// GETACL command (RFC 4314 Section3.3).
-    pub fn get_acl(mut self, mailbox: MailboxName) -> Pipeline<'conn, (Vec<AclEntry>, T)> {
-        let consumer = dispatch::AclConsumer::new(mailbox.clone());
-        self.commands.push(Command::GetAcl { mailbox });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+    pub fn get_acl(self, mailbox: MailboxName) -> Pipeline<'conn, (Vec<AclEntry>, T)> {
+        self.push(request::GetAcl { mailbox })
     }
 
     /// LISTRIGHTS command (RFC 4314 Section3.4).
     pub fn list_rights(
-        mut self,
+        self,
         mailbox: MailboxName,
         identifier: String,
     ) -> Pipeline<'conn, (ListRightsResponse, T)> {
-        let consumer = dispatch::ListRightsConsumer::new(mailbox.clone(), identifier.clone());
-        self.commands.push(Command::ListRights {
+        self.push(request::ListRights {
             mailbox,
             identifier,
-        });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+        })
     }
 
     /// MYRIGHTS command (RFC 4314 Section3.5).
-    pub fn my_rights(mut self, mailbox: MailboxName) -> Pipeline<'conn, (String, T)> {
-        let consumer = dispatch::MyRightsConsumer::new(mailbox.clone());
-        self.commands.push(Command::MyRights { mailbox });
-        self.pending
-            .push(Box::new(consumer) as Box<dyn ConsumerErased>);
-        Pipeline {
-            conn: self.conn,
-            pending: self.pending,
-            commands: self.commands,
-            _marker: PhantomData,
-        }
+    pub fn my_rights(self, mailbox: MailboxName) -> Pipeline<'conn, (String, T)> {
+        self.push(request::MyRights { mailbox })
     }
 }
 

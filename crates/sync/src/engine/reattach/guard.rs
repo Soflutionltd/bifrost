@@ -27,20 +27,12 @@ pub(super) async fn unwind_replacement_subscriptions(
     replacements: &mut ReattachGuard,
     pacing: &mut RepairPacing,
 ) {
+    let teardown = ctx.subscriptions.teardown(&ctx.account_id, &ctx.throttles);
     while let Some(front) = replacements.live.first() {
-        let result = next.push_unsubscribe(front.handle.clone()).await;
-        let replacement = replacements.live.remove(0);
-        if let Err(cleanup) = result {
-            pacing.record_holds(ctx, &cleanup);
-            tracing::warn!(
-                target: "bifrost.sync.reopen",
-                account = ?&ctx.account_id,
-                error = %cleanup,
-                "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
-            );
-            // Cleanup can outlive detach. Refusal means this attachment can no
-            // longer retry the handle; the next attachment owns another registry.
-            register_orphans(&ctx.subscriptions, &ctx.account_id, vec![replacement]);
+        let result = teardown.delete_or_orphan(next, front).await;
+        replacements.live.remove(0);
+        if let Err(refusal) = result {
+            pacing.local_deadline = pacing.local_deadline.max(refusal.local_deadline);
         }
     }
 }
@@ -105,6 +97,7 @@ pub(in crate::engine) struct ReattachGuard {
     pub(super) account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
+    throttles: Arc<crate::throttle::ThrottleBucket>,
     /// The slot's reopen lock, for the spawned cleanup's registry write.
     reopen_lock: Arc<AsyncMutex<()>>,
     /// The account's writer queue, for the synchronous compensation on drop.
@@ -147,6 +140,7 @@ impl ReattachGuard {
             account,
             subscriptions: Arc::clone(&ctx.subscriptions),
             account_id: ctx.account_id.clone(),
+            throttles: Arc::clone(&ctx.throttles),
             reopen_lock: Arc::clone(&ctx.reopen_lock),
             writer: ctx.writer.clone(),
             live: Vec::new(),
@@ -217,6 +211,7 @@ impl Drop for ReattachGuard {
         let account = Arc::clone(&self.account);
         let subscriptions = Arc::clone(&self.subscriptions);
         let account_id = self.account_id.clone();
+        let throttles = Arc::clone(&self.throttles);
         let reopen_lock = Arc::clone(&self.reopen_lock);
         match runtime {
             Some(runtime) => {
@@ -224,6 +219,7 @@ impl Drop for ReattachGuard {
                     account,
                     subscriptions,
                     account_id,
+                    throttles,
                     reopen_lock,
                     live,
                     close,
@@ -246,36 +242,11 @@ impl Drop for ReattachGuard {
                     "reattach dropped with no runtime to clean up on; registering replacement \
                      handles as orphans, and an account owed a close cannot be closed"
                 );
-                register_orphans(&subscriptions, &account_id, live);
+                subscriptions
+                    .teardown(&account_id, &throttles)
+                    .retain_orphans(live);
             }
         }
-    }
-}
-
-/// Restore refused handles only while this attachment can still retry them.
-/// The registry owns the slot's shutdown token and checks under its own lock,
-/// ordering a transfer against detach's final take. No later attachment can
-/// inherit this object, even when dropped reattach cleanup finishes late.
-fn register_orphans(
-    subscriptions: &SubscriptionRegistry,
-    account_id: &AccountId,
-    records: Vec<RegisteredSubscription>,
-) {
-    if records.is_empty() {
-        return;
-    }
-    let stranded = records.len();
-    let orphans = records
-        .into_iter()
-        .map(RegisteredSubscription::into_orphan)
-        .collect();
-    if !subscriptions.restore_orphans(orphans) {
-        tracing::warn!(
-            target: "bifrost.sync.reopen",
-            account = ?account_id,
-            stranded,
-            "slot detached before a refused push cleanup could be registered; leaving handles to provider expiry"
-        );
     }
 }
 
@@ -285,6 +256,7 @@ struct Stranded {
     pub(super) account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
+    throttles: Arc<crate::throttle::ThrottleBucket>,
     reopen_lock: Arc<AsyncMutex<()>>,
     pub(super) live: Vec<RegisteredSubscription>,
     /// The account still owed a `close()`: the replacement before the swap, the
@@ -315,25 +287,25 @@ async fn retire_stranded(stranded: Stranded) {
         account,
         subscriptions,
         account_id,
+        throttles,
         reopen_lock,
         live,
         close,
     } = stranded;
+    let teardown = subscriptions.teardown(&account_id, &throttles);
     let mut refused = Vec::new();
     for record in live {
-        if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
-            tracing::warn!(
-                target: "bifrost.sync.reopen",
-                account = ?account_id,
-                error = %error,
-                "replacement push cleanup failed after a dropped reattach; retaining handle for retry"
-            );
+        if teardown
+            .delete(account.as_ref(), &record.handle)
+            .await
+            .is_err()
+        {
             refused.push(record);
         }
     }
     if !refused.is_empty() {
         let _reopen_guard = reopen_lock.lock().await;
-        register_orphans(&subscriptions, &account_id, refused);
+        teardown.retain_orphans(refused);
     }
     if let Some(owed) = close
         && let Err(error) = owed.close().await
@@ -402,4 +374,61 @@ pub(super) async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &m
         );
     }
     guard.commit_owed = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_common::{StubAccount, StubFactory};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_reattach_teardown_records_shared_holds_before_orphaning_and_close() {
+        let engine = SyncEngine::builder().build().expect("engine");
+        let id = AccountId("dropped-cleanup".into());
+        engine
+            .attach(
+                id.clone(),
+                Arc::new(StubFactory::queue(vec![Arc::new(StubAccount::new(vec![]))])),
+            )
+            .await
+            .expect("attach");
+        let slot = Arc::clone(engine.accounts.get(&id).expect("slot").value());
+        let error = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
+            bifrost_types::Cause::Server(bifrost_types::ServerCause::RateLimited {
+                retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(37))),
+            }),
+        )
+        .throttle_scope(bifrost_types::ThrottleScope::Account)
+        .try_build()
+        .expect("throttle");
+        let mut replacement = StubAccount::new(vec![]);
+        replacement.unsubscribe_error_hook = Some(Arc::new(move |_| Some(error.clone())));
+        let replacement = Arc::new(replacement);
+        let writer = slot.writer();
+        let mut guard = ReattachGuard::new(
+            &slot.recovery(&writer),
+            Arc::<StubAccount>::clone(&replacement),
+        );
+        guard.push(RegisteredSubscription {
+            handle: bifrost_types::SubscriptionHandle("replacement".into()),
+            scopes: vec![],
+            state: crate::push::subscription::SubscriptionState::Live,
+        });
+        drop(guard);
+        for _ in 0..1000 {
+            if replacement.close_returned.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(replacement.close_returned.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::throttle::account_throttle_wait(&slot.throttles, &id),
+            Some(Duration::from_secs(37))
+        );
+        assert_eq!(slot.subscriptions.orphans().len(), 1);
+        engine.detach(&id).await.expect("detach");
+    }
 }

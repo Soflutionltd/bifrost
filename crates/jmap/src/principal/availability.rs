@@ -99,3 +99,6 @@ impl PrincipalGetAvailabilityResponse {
         self.list
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

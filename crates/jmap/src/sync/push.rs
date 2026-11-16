@@ -246,6 +246,7 @@ pub(crate) fn subscribe<T: PushTransport>(
             return Err(super::error::unsupported_error(
                 AccountOperation::PushSubscribe,
                 None,
+                bifrost_types::UnsupportedReason::CapabilityUnavailable,
                 "JMAP push requires WebSocket subprotocol support",
             ));
         }

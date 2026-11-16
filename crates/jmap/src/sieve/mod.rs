@@ -127,3 +127,6 @@ impl crate::core::SetCreate for SieveScriptCreate {
 crate::define_get_method!(SieveScriptGet, SieveScript);
 crate::define_set_method!(SieveScriptSet, SieveScript);
 crate::define_query_method!(SieveScriptQuery, SieveScript);
+
+#[cfg(test)]
+mod wire_tests;

@@ -68,8 +68,8 @@ use crate::delivery::{ChangeDelivery, EventScope, MultiplexerEvent};
 use crate::error::Error;
 use bifrost_types::{
     Account, AccountId, Change, CursorScope, InventoryEntry, InventoryRepairEvent,
-    InventoryRepairOutcome, InventoryRepairRequest, InventoryRepairTarget, ObjectChange,
-    ObjectChangeKind, ObligationKey, RegionRepairProof, RepairAttemptId, SyncEvent,
+    InventoryRepairOutcome, InventoryRepairRequest, InventoryRepairTarget, ObligationKey,
+    RegionRepairProof, RepairAttemptId, SyncEvent,
 };
 use futures::stream::StreamExt;
 
@@ -446,15 +446,7 @@ fn publish_recovered(
         return None;
     }
     let scope = scope.clone();
-    let changes: Vec<Change> = recovered
-        .iter()
-        .map(|id| {
-            Change::ObjectChange(ObjectChange {
-                id: id.clone(),
-                kind: ObjectChangeKind::Created,
-            })
-        })
-        .collect();
+    let changes: Vec<Change> = crate::inventory_walk::created(recovered).collect();
     // Carries no coverage report: a repair proves things about specific
     // obligations, not about a region of an enumeration, so it must not touch
     // the coverage lattice.

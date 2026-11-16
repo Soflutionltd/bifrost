@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -11,7 +10,7 @@ use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailChanges};
 use crate::mailbox::{Mailbox, MailboxChanges};
 
-use super::capabilities::CoreLimits;
+use super::capabilities::ObjectLimits;
 use super::state::{self, JmapScopeRepr};
 use super::state_cache::StateCache;
 #[cfg(test)]
@@ -119,7 +118,7 @@ pub(crate) fn stream<T: HttpTransport>(
 /// anchor. The callers retain their distinct event and coverage behavior.
 fn changes_walk<T, M, O>(
     mail: MailAccount<T>,
-    limits: CoreLimits,
+    limits: ObjectLimits,
     scope: CursorScope,
     mut since_state: crate::core::id::ObjectState<O>,
     owner: Option<TypesPrincipalId>,
@@ -145,7 +144,7 @@ where
         // takes and clears it, so consecutive pages partition the
         // traffic instead of each restating a running total.
         let (mail, tally) = mail.metered();
-        let max_changes = nonzero(limits.max_objects_in_get);
+        let max_changes = limits.max_objects_in_get;
         let mut walk = ChangesWalk::changes(scope.clone(), &since_state);
         loop {
             let started = Instant::now();
@@ -225,6 +224,7 @@ fn unsupported_scope(scope: CursorScope, name: &'static str) -> AccountStream<Sy
         yield super::error::terminated(super::error::unsupported_error(
             bifrost_types::AccountOperation::SyncChanges,
             Some(bifrost_types::ErrorScope::Cursor(scope)),
+            bifrost_types::UnsupportedReason::CursorScope,
             format!("JMAP {name} cursor changes are not supported by the v1 Account contract"),
         ));
     })
@@ -260,10 +260,6 @@ where
 fn checkpoint_for(scope: CursorScope, state_string: String) -> ChangeCursor {
     state::cursor_for_scope(scope, state_string)
         .expect("JMAP change loops only checkpoint supported cursor scopes")
-}
-
-fn nonzero(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
 }
 
 #[cfg(test)]
@@ -539,10 +535,10 @@ mod tests {
         .expect("test session parses")
     }
 
-    fn limits() -> CoreLimits {
-        CoreLimits {
-            max_objects_in_get: 256,
-            max_objects_in_set: 256,
+    fn limits() -> ObjectLimits {
+        ObjectLimits {
+            max_objects_in_get: std::num::NonZeroUsize::new(256).unwrap(),
+            max_objects_in_set: std::num::NonZeroUsize::new(256).unwrap(),
         }
     }
 

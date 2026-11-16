@@ -211,9 +211,9 @@ impl Drop for ChangesReceiver {
 /// consume no capacity and are never swept, so they are never stamped. A live
 /// publication that expects an ACKNOWLEDGEMENT still goes through
 /// [`Self::publish_acknowledgeable`], which takes the lock only to read the live
-/// numbered set at the send; events nobody acknowledges - warnings,
-/// terminations, barrier pages - send on [`Self::publish_unacked`] directly and take no
-/// lock.
+/// numbered set at the send; checkpoint-free inventory pages, barrier pages
+/// included, use it too. Events nobody acknowledges - warnings, terminations -
+/// send on [`Self::publish_unacked`] directly and take no lock.
 ///
 /// The raw broadcast sender is deliberately not exposed (no `sender()` accessor,
 /// no `changes_tx` on the handle): a raw send bypasses the numbered-receiver
@@ -237,7 +237,76 @@ pub struct PagePublisher {
     pub(crate) shutdown: CancellationToken,
 }
 
+/// Inventory forwarding keeps checkpoint-free pages under the same walk fence
+/// as checkpoint registration. Broadcast acceptance alone proves no progress.
+pub(crate) enum InventoryPublication {
+    Published,
+    Undelivered,
+    Refused(crate::cursor::CoverageClaim),
+}
+
 impl PagePublisher {
+    /// Both inventory front ends use this projection and fence-before-forward
+    /// rule. The caller supplies only its accepted or minted checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_inventory<'a>(
+        &self,
+        scope: &CursorScope,
+        batch: &bifrost_types::InventoryBatch,
+        ids: impl IntoIterator<Item = &'a bifrost_types::ObjectId>,
+        removed: impl IntoIterator<Item = &'a bifrost_types::ObjectId>,
+        checkpoint: Option<Checkpoint>,
+        generation: crate::cursor::WalkGeneration,
+        fence: crate::cursor::ScopeFence,
+    ) -> Result<InventoryPublication, bifrost_types::AccountError> {
+        if checkpoint.is_none() && self.coverage.scope_fence(scope) != fence {
+            return Ok(InventoryPublication::Refused(
+                crate::cursor::CoverageClaim {
+                    reports: Vec::new(),
+                    generation,
+                },
+            ));
+        }
+        let removals = crate::inventory_walk::removals(scope, removed).inspect_err(|error| {
+            self.delivery
+                .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
+        })?;
+        let synthetic = bifrost_types::Batch {
+            items: crate::inventory_walk::created(ids)
+                .chain(removals)
+                .collect(),
+            page_boundary: batch.page_boundary,
+            server_latency: batch.server_latency,
+            bytes_in: batch.bytes_in,
+            checkpoint: checkpoint.clone(),
+        };
+        let event = MultiplexerEvent {
+            scope: EventScope::Cursor(scope.clone()),
+            event: Arc::new(SyncEvent::Batch(synthetic)),
+            checkpoint: checkpoint.clone(),
+            publication: None,
+        };
+        let reached = if checkpoint.is_some() {
+            match self.publish_page(
+                event,
+                crate::cursor::CoverageClaim::new(batch.coverage.clone(), generation),
+                fence,
+            ) {
+                Ok(reached) => reached,
+                Err(claim) => return Ok(InventoryPublication::Refused(claim)),
+            }
+        } else {
+            // This page belongs to the prefix Done would certify, even though
+            // it has no standalone acknowledgement. Fusion must retry if lost.
+            self.delivery.publish_acknowledgeable(event)
+        };
+        Ok(if reached {
+            InventoryPublication::Published
+        } else {
+            InventoryPublication::Undelivered
+        })
+    }
+
     #[must_use]
     pub fn new(
         delivery: Arc<ChangeDelivery>,
@@ -515,8 +584,11 @@ impl ChangeDelivery {
     /// non-empty reached one of them - and a send made while it is empty
     /// reached nobody who can acknowledge, whatever else it reached.
     ///
-    /// Events that expect no acknowledgement - warnings, terminations, barrier
-    /// pages - go on [`Self::publish_unacked`] directly and take no lock.
+    /// Checkpoint-free inventory pages, barrier pages included, come here from
+    /// [`PagePublisher::publish_inventory`]: Done certifies their prefix, so a
+    /// page nobody numbered received must read as undelivered. Events that
+    /// expect no acknowledgement - warnings, terminations - go on
+    /// [`Self::publish_unacked`] directly and take no lock.
     pub fn publish_acknowledgeable(&self, event: MultiplexerEvent) -> bool {
         let state = self.guard();
         let _ = self.tx.send(event);

@@ -505,6 +505,12 @@ pub enum RequestCause {
     Malformed {
         detail: DiagnosticText,
     },
+    PayloadTooLarge {
+        detail: DiagnosticText,
+    },
+    PreconditionFailed {
+        detail: DiagnosticText,
+    },
     BatchInputInvalid {
         items: Vec<BatchInputInvalidItem>,
     },
@@ -532,7 +538,9 @@ pub enum RequestCause {
 impl RequestCause {
     fn detail(&self) -> Option<&str> {
         match self {
-            Self::Malformed { detail } => Some(detail.as_str()),
+            Self::Malformed { detail }
+            | Self::PayloadTooLarge { detail }
+            | Self::PreconditionFailed { detail } => Some(detail.as_str()),
             Self::InvalidArgument {
                 message: Some(message),
                 ..

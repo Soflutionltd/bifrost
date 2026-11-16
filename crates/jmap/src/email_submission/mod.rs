@@ -247,3 +247,6 @@ crate::define_set_method!(EmailSubmissionSet, EmailSubmission);
 crate::define_changes_method!(EmailSubmissionChanges, EmailSubmission);
 crate::define_query_method!(EmailSubmissionQuery, EmailSubmission);
 crate::define_query_changes_method!(EmailSubmissionQueryChanges, EmailSubmission);
+
+#[cfg(test)]
+mod wire_tests;

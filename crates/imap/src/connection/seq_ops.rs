@@ -18,13 +18,12 @@ impl ImapConnection {
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.fetch_impl(
-            Command::Fetch {
+        self.execute_request(
+            super::request::Fetch {
                 sequence_set: sequence_set.clone(),
                 items: items.to_vec().into(),
                 changed_since: None,
             },
-            None,
             timeout,
         )
         .await
@@ -43,13 +42,12 @@ impl ImapConnection {
         mod_seq: crate::types::ModSeq,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.fetch_impl(
-            Command::Fetch {
+        self.execute_request(
+            super::request::Fetch {
                 sequence_set: sequence_set.clone(),
                 items: items.to_vec().into(),
                 changed_since: Some(mod_seq),
             },
-            Some(mod_seq),
             timeout,
         )
         .await
@@ -142,7 +140,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<SearchResult<crate::types::Seq>, Error> {
         let criteria = criteria.into();
-        self.search_impl(Command::Search { criteria }, "SEARCH", timeout)
+        self.execute_request(super::request::Search { criteria }, timeout)
             .await
     }
 
@@ -163,12 +161,11 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
         let criteria = criteria.into();
-        self.search_esearch_impl(
-            Command::SearchReturn {
+        self.execute_request(
+            super::request::SearchReturn {
                 criteria,
                 return_opts: return_opts.iter().map(|s| (*s).into()).collect(),
             },
-            "SEARCH RETURN",
             timeout,
         )
         .await
@@ -187,7 +184,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         let criteria = criteria.into();
-        self.search_save_impl(Command::SearchSave { criteria }, timeout)
+        self.execute_request(super::request::SearchSave { criteria }, timeout)
             .await
     }
 
@@ -204,28 +201,8 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         let criteria = criteria.into();
-        self.search_save_impl(Command::UidSearchSave { criteria }, timeout)
+        self.execute_request(super::request::UidSearchSave { criteria }, timeout)
             .await
-    }
-
-    /// Shared implementation for SEARCH RETURN (SAVE) and UID SEARCH RETURN (SAVE)
-    /// (RFC 5182 Section 2).
-    pub(super) async fn search_save_impl(
-        &self,
-        cmd: Command,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        // RFC 6855 Section 6: SEARCH RETURN (SAVE) remains part of the SEARCH
-        // command family and must be rejected until UTF8=ACCEPT is enabled.
-        self.check_utf8_only_enforced()?;
-        // RFC 5182 Section 2: SEARCHRES capability is required.
-        self.require_searchres()?;
-        self.submit_regular(
-            cmd,
-            dispatch::SearchSaveConsumer::new(),
-            Some(tokio::time::Instant::now() + timeout),
-        )
-        .await
     }
 
     /// STORE by sequence number (RFC 3501 Section 6.4.6).
@@ -246,14 +223,13 @@ impl ImapConnection {
         // is not valid in STORE flag lists. Filter them out before encoding,
         // consistent with append() (RFC 3501 Section 6.3.11).
         let filtered_flags = filter_store_flags(flags);
-        self.store_impl(
-            Command::Store {
+        self.execute_request(
+            super::request::Store {
                 sequence_set: sequence_set.clone(),
                 operation,
                 flags: filtered_flags,
                 unchanged_since,
             },
-            unchanged_since,
             timeout,
         )
         .await
@@ -274,8 +250,8 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
         let mbox = mailbox.mailbox_name()?;
-        self.copy_impl(
-            Command::Copy {
+        self.execute_request(
+            super::request::Copy {
                 sequence_set: sequence_set.clone(),
                 mailbox: mbox,
             },
@@ -302,12 +278,11 @@ impl ImapConnection {
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
-        self.check_utf8_only_enforced()?;
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
 
         let mbox = mailbox.mailbox_name()?;
-        self.move_native_impl(
-            Command::Move {
+        self.execute_request(
+            super::request::Move {
                 sequence_set: sequence_set.clone(),
                 mailbox: mbox,
             },

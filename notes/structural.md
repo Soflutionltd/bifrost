@@ -214,29 +214,6 @@ places the message by `containers: Vec<ContainerId>` while inventory uses
 provider knowledge (Gmail fills the former with label ids, the latter with
 `MembershipScope::Label`).
 
-## STR-032 - `run_bulk_pipeline` is one 850-line function over untyped campaign state
-
-**Reported by:** sync-engine.
-
-About fifteen loose locals (`outcomes`, `effects`, `retry_slots`,
-`retry_owners`, `identities`, `cohorts`, `forwarded_directives`, `first_error`,
-`caller_conflict`, `blocked_by_engine`, `dedupe_count`, `cursor`, ...) are the
-campaign's state with no type or methods, so every phase rule (abort, engine
-block, reassert finalization) is a loop over cohorts inside the main loop.
-Proposal: a `Campaign` struct owning that state with `select_action()`,
-`submit()`, `read_back()`, `finalize()`; `MutationCohort` phases as an enum
-(STR-026); the CON-014 drive-start primitive for admission and holds.
-
-The sync-lanes hunter places it: `mutation/` holds `MutationCounters`,
-`fanout`, `PartialCommitObservation`, the vendor and read-back, while the
-campaign state machine (cohorts, scheduler, reassertion, read-back routing) is
-`engine/bulk.rs` at about 2,000 lines, and read-back's `ReadbackReport` /
-`ObjectReadback` are `pub(crate)` precisely so `engine/bulk.rs` can consume
-them. Proposal: the state machine moves into `mutation/campaign.rs` (pure state
-plus transitions), with `engine/bulk.rs` keeping the async driving.
-`MutationCounters` has public fields next to `record_*` methods, allowing both
-direct and method writes; pick one.
-
 ## STR-034 - The sync test layout mirrors history, not the design
 
 **Reported by:** sync-engine.
@@ -275,32 +252,17 @@ pin (`supervisor_*`, `delivery_*`, `campaign_*`, `establish_*`).
 
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
-**Reported by:** sync-lanes (owner ruling for demotions).
+**Reported by:** sync-lanes.
 
-It holds (1) the publication ledger (claims, lanes, persisted and folded
-watermarks, carry-forward); (2) backfill flow control (boundary entries as ring
-charge, `readers`, `delivered_at`, `subsumed`, the `live` mirror, the capacity
-`Notify`); (3) delivery-loss accounting (per-scope `undelivered` watermark,
-`discard_requests`, `tearing_down`, `last_backfill_mint`); (4) fencing
-(`fenced`, `fenced_backfill`, `fenced_account`, `burn_fence`); (5) minting
-(publication ids with instance segments, and walk generations, BUG-015). The
-single lock is justified, since transitions span 1, 2 and 4 (`register_in`,
-`invalidate_in`, `release_undelivered`); the single type is not. It has about 45
-`pub` methods, most callable only under an ordering the delivery gate or writer
-enforces (`mark_delivered` "under the delivery lock", `begin_teardown` "through
-`ChangeDelivery::begin_teardown`", `receiver_joined`), some half-operations
-(BUG-020). A consumer holding `Arc<PendingCoverage>` can break every invariant
-the engine relies on.
-
-Proposal: keep one mutex, give the guarded state sub-structs (`Claims`,
-`RingCharge`, `Fences`, `LossLedger`) whose methods are the named transitions,
-and expose a small facade (`register_page`, `register_marker`, `acknowledge`,
-`retire`, `invalidate_scope`, `on_receiver_read`, `on_receiver_departed`).
-Minting of persisted generations moves to the writer. Demote the rest to
-`pub(crate)`. The `Publications` alias should pick one name. Lateral:
-`LiveSupersedes` is filtered on every page through a `Mutex` although nothing
-populates it (`filter_inventory_supersedes` short-circuits on `is_empty()`,
-taking the lock once per page) - harmless, noted because it is the hot path.
+Residue. The guarded state is split into sub-structs (`Claims`, `RingCharge`,
+`Fences`, `LossLedger`, `PublicationMint`) under one mutex, and the ordering-
+sensitive methods are `pub(crate)`. Not done: the named transition facade
+(`register_page`, `register_marker`, `acknowledge`, `retire`,
+`invalidate_scope`, `on_receiver_read`, `on_receiver_departed`) was not built,
+so the crate-internal surface is still about forty methods; and walk-generation
+minting (`PendingCoverage::next_generation`, still `pub`) did not move to the
+writer. Worth doing only if a new ordering defect shows the wide internal
+surface is the cause.
 
 ## STR-043 - The backfill lane is split across `backfill/` and `engine/backfill.rs` along the wrong seam
 
@@ -418,47 +380,6 @@ response family), which also makes the CON-032 tables testable per row. The
 `capability_matrix` oracle is a test copy of production logic and should go once
 production is exhaustive.
 
-## STR-069 - Twelve `impl ImapConnection` files each restate their gates; a request layer collapses them
-
-**Reported by:** imap-connection.
-
-`auth.rs`, `helpers.rs`, `mailbox.rs`, `seq_ops.rs`, `uid_ops.rs`,
-`extensions.rs`, `sort_thread.rs`, `append.rs`, `idle.rs`, `lifecycle.rs`,
-`ergonomics.rs`, `search_validation.rs` each `use super::*` and open `impl
-ImapConnection`. Split by command family is fine, but every method is the same
-five steps: gate (BUG-029), build `Command`, pick a consumer, compute a deadline,
-`submit_*`. Command-consumer pairing is decided twice, here and in
-`pipeline/mod.rs` (pipelined `uid_fetch` always uses `FetchVanishedConsumer`; the
-handle picks among four). Proposal: `trait Request { type Consumer: Consumer; fn
-command(&self) -> Command; fn consumer(&self) -> Self::Consumer; }` with
-admission derived from `command()`; handle methods become one-liners over
-`submit(request, timeout)`, the pipeline builder pushes the same `Request`
-values, and the deadline discipline is enforced once. `helpers.rs` mixes snapshot
-accessors, gates, STATUS/LIST option parsing, NOOP, CHECK and CAPABILITY - the
-file of things with no other home.
-
-## STR-070 - IMAP connection setup runs outside the driver task
-
-**Reported by:** imap-connection.
-
-`lifecycle::connect_with_tls_connector_metered` runs the greeting, initial
-CAPABILITY and STARTTLS on stack-held `WireReader`, `ProtocolState`,
-`TagGenerator` and `DriverEventSink`, then spawns the driver with them, producing
-a second execution context with its own timeout model (`setup_timeout` maps
-expiry to `Error::Timeout { attempt: None }`, reading as `Unsent` even after the
-STARTTLS line was written - already an open item in `notes/todo.md`); its own
-ALERT delivery (`events_tx.try_send(TypedEvent::Alert(..))` on the raw channel,
-because `DriverEventSink::emit` is `pub(in crate::connection::driver)` - a
-visibility accident shaping the design); an ungated flavour of every driver
-routine (`run_one_command`, `run_starttls_upgrade` with `tls_active: None`, `gate:
-None`, which is why `starttls_upgrade` takes `Option<Arc<AtomicBool>>` and
-`Option<&CommitGate>`); and its own STARTTLS availability rule (BUG-029).
-Proposal: spawn the driver first; it runs a `Setup` phase, and the handle awaits
-a ready oneshot carrying the first snapshot or the setup error. One execution
-context, one evidence model, no Option parameters, and `tls_active` written in
-one place (today the driver writes it at the stream swap and
-`starttls_with_connector` writes it again).
-
 ## STR-071 - The IMAP pipeline has no production caller yet shapes the driver's hardest invariants
 
 **Reported by:** imap-connection (crate-private, but removal is an owner decision; flagged, not recommended).
@@ -473,7 +394,7 @@ anywhere outside its own tests. It shapes the driver: `PipelineRouting` with
 unreachable outside it. `pipeline/mod.rs` carries an "audit boundary: not
 line-audited" note. It bypasses every handle gate (BUG-029) and waits unbounded
 (BUG-041). Options: (a) keep it and route it through the request/admission layer
-(STR-069, BUG-029) so it stops being a gate bypass; (b) remove it and simplify
+(`connection/request.rs`, BUG-029) so it stops being a gate bypass; (b) remove it and simplify
 `wait_for_continuation` to one mode, dropping `PipelineRouting`,
 `untagged_routing_key` and the router.
 
@@ -493,38 +414,6 @@ as the account's transport and let the compiler find the dead surface by removin
 the allow from `connection/` alone (the crate-wide count was measured at 105;
 a connection-only removal gives the exact list). The current middle state pays
 the complexity of a public API without its users. Related: STR-061.
-
-## STR-073 - About 30 IMAP consumers each own an untagged buffer they almost always surrender
-
-**Reported by:** imap-connection.
-
-Roughly 30 consumers carry `buffered: Vec<UntaggedResponse>` and surrender it on
-every `finalize` arm; `Finalized::failure` takes the buffer as a mandatory
-argument so the choice is visible. The design is right about the failure mode
-(responses lost on `?`), but "this response is not mine" is decided at
-`on_response` time in nearly every consumer and only deferred to `finalize` by
-the shape. Proposal: `on_response` returns `Option<UntaggedResponse>` (declined)
-and the driver holds declined responses, removing most buffers and the chance of
-forgetting one; the few consumers that must decide at finalize (SELECT's
-`[CLOSED]` cut, APPENDUID's index) keep their own. This also gives BUG-036's
-"already emitted" flag a home in the driver.
-
-## STR-074 - Distinct failures collapse into `Request(Malformed)` because the shared vocabulary has no other slot
-
-**Reported by:** imap-account (cross-crate gap in `bifrost-types`).
-
-All derive `ClientBug`, and a caller cannot tell them apart: `container_delete`
-on a non-empty mailbox (`pim_malformed`, a precondition); `Error::AppendLimit`,
-`TOOBIG`, `MAXCONVERT*`, `METADATA MAXSIZE` (payload too large);
-`Error::FetchLimit` / `FetchLiteralLimit` / `SearchResultTruncated` (local budget
-exceeded on a server-acknowledged answer; the last is already an open item in
-`notes/todo.md`); sieve `ACTIVE` ("deactivate first" precondition); UIDVALIDITY
-changed (not the caller's fault at all; also open in `notes/todo.md`). Only
-`valid_uids` and `merge_folder` / `or_folder_restriction_error` are genuine
-caller errors. `RequestErrorKind` has only `Malformed` and `BatchInputInvalid`, so
-protocol crates have nowhere else to put these. Proposal: `PayloadTooLarge`,
-`PreconditionFailed` (or reuse `ConcurrencyConflict` for the not-empty/active
-cases), so a UI can say something true.
 
 ## STR-078 - Credentials and TLS mode, three copies each
 
@@ -622,37 +511,6 @@ hunter's reading is that the generic is unnecessary because a scripted
 `ReqwestTransport` already exists; both readings agree the current pin is what
 makes `JmapAccount` hard to drive.
 
-## STR-095 - JMAP test layout mirrors review history
-
-**Reported by:** jmap-protocol.
-
-`src/tests.rs` (about 3,800 lines) is a numbered list of sections, one per past
-review pass, each `#[cfg(...)]`-gated on feature combinations and testing modules
-it does not sit beside (mailbox wire, email submission wire, session capability
-fallbacks, URL template parsing, blob management, calendar, contacts, principal,
-quota ...). `core/tests.rs` (about 1,100 lines) is the same for core. Several
-sections exist only to hold two copies in step (CON-042, CON-043), and at least one
-pins a defect (BUG-061). Wire tests should live in the module whose wire shape
-they pin; the agreement tables go when their duplication goes.
-
-## STR-102 - JMAP refusals reach callers as prose
-
-**Reported by:** jmap-account (lower priority than the rest).
-
-`error::unsupported_error(op, scope, message)` is the universal refusal, and the
-reason a caller would branch on lives only in the `DiagnosticText`: submission
-absent, scheduled send window absent, foreign scheduled send, non-folder container
-kind, label kind, `FlagOp` variant, range transport hook, raw-MIME projection,
-legacy scope. `route_send_as` encodes a four-way precedence whose outcome a caller
-can tell apart only by reading text. The kind is mostly right; a typed refusal
-reason (or at least distinct message keys) would let a consumer tell "this account
-never sends" from "not scheduled, not for shares". Related: STR-010, STR-074.
-
-Blocked on bifrost-types: `RequestCause::Unsupported` carries only the
-operation and message keys are derived from the kind, so a typed refusal reason
-(with builder and accessor support) must land in bifrost-types first; the JMAP
-sites are commented to say so.
-
 ## STR-119 - Graph event and contact sync lanes have no scope producer
 
 **Reported by:** graph (needs a ruling, not a deletion: the published-API rule applies to the behaviour these lanes promise).
@@ -694,19 +552,6 @@ bifrost-net API first: `client/metering.rs`'s blocking admission loop belongs
 beside `BandwidthBudget` in bifrost-net as a blocking budget API, which does not
 exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
 
-## STR-139 - The SMTP sans-IO core stops one layer too low
-
-**Reported by:** smtp-sasl.
-
-The session machine, the shared `ReplyAssembler` (`client/reply.rs`, EOF now a
-transport loss), and the transcript-driven `client/conformance.rs` suite have
-landed. What remains: the send-path transcript suites are still twinned across
-`client/connection.rs` and `client/async_connection.rs` (for example
-`a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection` and
-`a_421_data_final_reply_aborts_the_batch_connection_too` exist in both), so a
-send rule is still pinned twice and can drift once. Move them into the
-conformance suite, run through both adapters.
-
 ## STR-141 - The SMTP 2x2 product at the public surface, and a Lettre-vestige executor that owns dialing
 
 **Reported by:** smtp-sasl (both need owner rulings).
@@ -722,7 +567,7 @@ paper over two of the four builders, and the setters drift in small ways (the as
 LMTP builder's `tls` clears `unix_socket` and is redundantly `#[cfg(feature =
 "tokio")]` inside an always-tokio file). Proposal: one `Builder<D: Dialect, R:
 Runtime>` over `SmtpInfo` and one `Transport<D, R>` whose methods are written once
-over a runtime-abstract connection (feasible once STR-139 lands), with the current
+over a runtime-abstract connection (feasible now that the sans-IO session machine has landed), with the current
 names surviving as type aliases (structs becoming aliases needs the owner).
 Separately, `Executor` is sealed with exactly one implementor (`TokioExecutor`),
 every async transport is generic over `E` with `#[allow(private_bounds)]` on most

@@ -16,15 +16,14 @@ use tracing::{debug, warn};
 use crate::error::Error;
 use crate::types::{
     AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
-    FetchAttr, FetchResponse, Flag, ListRightsResponse, MailboxAttribute, MailboxFilter,
-    MailboxInfo, MailboxName, MetadataResult, MoveResult, NamespaceResponse, NotifySetParams,
-    QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions,
-    SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation, StoreResult,
-    ThreadNode, UidRange,
+    FetchAttr, FetchResponse, Flag, ListRightsResponse, MailboxAttribute, MailboxInfo, MailboxName,
+    MetadataResult, MoveResult, NamespaceResponse, NotifySetParams, QresyncParams, QuotaResource,
+    QuotaRootResponse, ResponseCode, SelectOptions, SelectedMailbox, SequenceSet, StatusItem,
+    StatusResult, StoreOperation, StoreResult, ThreadNode, UidRange,
 };
 
 #[cfg(test)]
-use crate::types::{UntaggedResponse, UntaggedStatus};
+use crate::types::{Response, UntaggedResponse, UntaggedStatus};
 
 pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -42,6 +41,7 @@ mod lifecycle;
 mod mailbox;
 pub(super) mod pipeline;
 mod reply;
+mod request;
 mod search_validation;
 mod seq_ops;
 mod sort_thread;

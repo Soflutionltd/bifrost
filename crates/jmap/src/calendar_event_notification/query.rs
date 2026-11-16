@@ -53,3 +53,6 @@ impl QueryObject for CalendarEventNotification {
     type Filter = Filter;
     type Sort = Comparator;
 }
+
+#[cfg(test)]
+mod wire_tests;

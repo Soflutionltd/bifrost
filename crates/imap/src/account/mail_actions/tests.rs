@@ -198,7 +198,7 @@ async fn result_copy_preserves_live_epoch_commit_beside_stale_target() {
     let error = folder_progress_error(failure);
     assert!(matches!(
         error.kind(),
-        AccountErrorKind::Request(RequestErrorKind::Malformed)
+        AccountErrorKind::Request(RequestErrorKind::PreconditionFailed)
     ));
     let record = error.partial_commit().unwrap();
     assert_eq!(record.primary().effect, None);

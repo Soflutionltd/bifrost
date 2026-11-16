@@ -47,10 +47,7 @@ impl<Tr: HttpTransport> Client<Tr> {
         let data: Vec<u8> = data.into();
         // Refuse a known oversize file before handing its bytes to the
         // transport; the server's maxSizeUpload applies per upload request.
-        if let Some(max) = state
-            .session()
-            .core_capabilities()
-            .and_then(crate::core::session::CoreCapabilities::max_size_upload)
+        if let Some(max) = state.session().core_limits().max_size_upload()
             && data.len() > max
         {
             return Err(crate::Error::UploadSizeLimit {

@@ -74,6 +74,9 @@
 //! Older rows retain their native Mailbox scope spelling; ambiguous historical
 //! ids are never guessed into principals.
 //!
+//! Version 14 adds PayloadTooLarge and PreconditionFailed request subkinds
+//! (tags 2 and 3 under kind tag 6); older rows reject these new tags.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -113,8 +116,8 @@ use bifrost_types::{ObligationKey, wire::Reader};
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-// Version 13 adds the principal error scope.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 13;
+// Version 14 adds payload and target-state request refusal kinds.
+pub const LEDGER_ENVELOPE_VERSION: u32 = 14;
 const _: () = assert!(LEDGER_ENVELOPE_VERSION >= bifrost_types::wire::ledger::VOCABULARY_VERSION);
 
 /// Lowest ledger envelope version still readable by this engine.

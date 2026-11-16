@@ -374,6 +374,7 @@ pub(crate) fn send_message<T: HttpTransport>(
                 return Err(crate::sync::error::unsupported_error(
                     AccountOperation::Send,
                     None,
+                    bifrost_types::UnsupportedReason::ScheduledSendUnavailable,
                     "JMAP relay advertises no scheduled-send window",
                 ));
             }

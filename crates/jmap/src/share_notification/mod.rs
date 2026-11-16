@@ -140,3 +140,6 @@ crate::define_set_method!(ShareNotificationSet, ShareNotification);
 crate::define_changes_method!(ShareNotificationChanges, ShareNotification);
 crate::define_query_method!(ShareNotificationQuery, ShareNotification);
 crate::define_query_changes_method!(ShareNotificationQueryChanges, ShareNotification);
+
+#[cfg(test)]
+mod wire_tests;

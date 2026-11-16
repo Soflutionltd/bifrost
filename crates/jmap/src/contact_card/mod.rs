@@ -71,3 +71,6 @@ crate::define_changes_method!(ContactCardChanges, ContactCard);
 crate::define_query_method!(ContactCardQuery, ContactCard);
 crate::define_query_changes_method!(ContactCardQueryChanges, ContactCard);
 crate::define_copy_method!(ContactCardCopy, ContactCard);
+
+#[cfg(test)]
+mod wire_tests;

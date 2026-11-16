@@ -51,10 +51,11 @@ impl Consumer for SelectConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // Accumulate everything. Partitioning on [CLOSED] and filtering
         // non-SELECT types happens in finalize.
         self.responses.push(resp);
+        None
     }
 
     fn finalize(

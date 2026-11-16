@@ -15,16 +15,11 @@ use super::{Consumer, ConsumerContext, Finalized};
 pub(crate) struct NotifySetConsumer {
     /// Whether NOTIFICATIONOVERFLOW was seen in untagged responses.
     saw_overflow: bool,
-    /// All untagged responses, reclassified as events.
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl Consumer for NotifySetConsumer {
     /// `true` when NOTIFICATIONOVERFLOW was detected (RFC 5465 Section5.8).
-    /// The rejection (NO/BAD) travels in `Finalized::output`, so
-    /// `reclassified_as_events` is always emitted, even on the failure
-    /// path (EXISTS/RECENT classified as `Either` during NOTIFY SET must
-    /// not be silently dropped).
+    /// Implicit NOOP observations are declined before completion, including NO/BAD.
     type Output = bool;
 
     fn on_response(
@@ -32,7 +27,7 @@ impl Consumer for NotifySetConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         // RFC 5465 Section5.8: detect NOTIFICATIONOVERFLOW in untagged
         // responses (status with the overflow response code).
         if matches!(
@@ -45,7 +40,7 @@ impl Consumer for NotifySetConsumer {
             self.saw_overflow = true;
         }
         // All responses from the implicit NOOP are unsolicited.
-        self.buffered.push(resp);
+        Some(resp)
     }
 
     fn finalize(
@@ -59,15 +54,14 @@ impl Consumer for NotifySetConsumer {
                 // the tagged response code.
                 let overflow = self.saw_overflow
                     || matches!(tagged.code, Some(ResponseCode::NotificationOverflow(_)));
-                Finalized::success(overflow, self.buffered)
+                Finalized::success(overflow, Vec::new())
             }
             StatusKind::No => {
-                Finalized::failure(Error::no_with_code(tagged.text, tagged.code), self.buffered)
+                Finalized::failure(Error::no_with_code(tagged.text, tagged.code), Vec::new())
             }
-            StatusKind::Bad => Finalized::failure(
-                Error::bad_with_code(tagged.text, tagged.code),
-                self.buffered,
-            ),
+            StatusKind::Bad => {
+                Finalized::failure(Error::bad_with_code(tagged.text, tagged.code), Vec::new())
+            }
         }
     }
 }

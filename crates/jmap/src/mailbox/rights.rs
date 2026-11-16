@@ -68,3 +68,7 @@ mod tests {
         assert!(legacy.acl_list().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "rights/wire_tests.rs"]
+mod wire_tests;

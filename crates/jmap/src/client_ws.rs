@@ -669,8 +669,8 @@ impl Client {
         let max_size_request = request
             .session_state()
             .session()
-            .core_capabilities()
-            .and_then(crate::core::session::CoreCapabilities::max_size_request);
+            .core_limits()
+            .max_size_request();
         let request_id = self.next_ws_request_id();
 
         let frame = serde_json::to_string(&WebSocketRequest {
@@ -680,17 +680,8 @@ impl Client {
         })
         .map_err(crate::Error::RequestEncode)?;
 
-        // Only an advertised, non-zero limit is enforced, for the same
-        // reason `CallLimit` refuses to enforce its two unusable states:
-        // an absent or zero `maxSizeRequest` is a session-validation
-        // matter, and enforcing it here would turn it into a client bug
-        // on a request that could never fit anything.
-        // An OMITTED `maxSizeRequest` and an advertised `0` are both
-        // unusable here for the same reason `CallLimit` declines both of
-        // its unusable states, but they are distinct on the wire and the
-        // session validator classifies them differently.
+        // Read the same cached bound as HTTP, from the request's snapshot.
         if let Some(max) = max_size_request
-            && max > 0
             && frame.len() > max
         {
             return Err(crate::Error::RequestSizeLimit {
@@ -1699,9 +1690,9 @@ mod tests {
     }
 
     /// An unadvertised or zero `maxSizeRequest` is not enforced, for the
-    /// same reason `CallLimit` refuses to enforce its two unusable
-    /// states: session validation is the gate for both, and enforcing a
-    /// zero here would fail every request as a client bug.
+    /// same reason cached positive bounds decline unusable advertisements:
+    /// session validation is the gate for both, and enforcing a zero here
+    /// would fail every request as a client bug.
     #[cfg(feature = "mail")]
     #[test]
     fn a_zero_max_size_request_is_not_enforced() {

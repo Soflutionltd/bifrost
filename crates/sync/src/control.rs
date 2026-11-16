@@ -112,7 +112,7 @@ struct SyncControlInner {
     /// or never delivered), abandonment after a subscriber lag, or
     /// supersession by a newer broadcast in the same stream - so an
     /// unacked batch can never wedge boundary waiters indefinitely.
-    publications: Arc<crate::cursor::Publications>,
+    publications: Arc<crate::cursor::PendingCoverage>,
     priority: watch::Sender<Priority>,
     bandwidth_cap: watch::Sender<Option<bifrost_types::BandwidthCap>>,
     bandwidth_observed: AtomicU64,
@@ -131,7 +131,7 @@ impl SyncControl {
             boundary,
             priority,
             bandwidth_cap,
-            Arc::new(crate::cursor::Publications::new()),
+            Arc::new(crate::cursor::PendingCoverage::new()),
         )
     }
 
@@ -144,7 +144,7 @@ impl SyncControl {
         boundary: Boundary,
         priority: watch::Sender<Priority>,
         bandwidth_cap: watch::Sender<Option<bifrost_types::BandwidthCap>>,
-        publications: Arc<crate::cursor::Publications>,
+        publications: Arc<crate::cursor::PendingCoverage>,
     ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
             generation: CheckpointGeneration(0),

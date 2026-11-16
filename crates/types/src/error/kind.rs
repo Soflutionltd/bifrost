@@ -21,8 +21,8 @@ pub enum AccountErrorKind {
     /// A failure on the CLIENT side of the wire: this library, or any
     /// `Account` implementation (bifrost's own or a consumer's), never the
     /// provider and never the caller's request. `Protocol(_)` means the
-    /// provider sent something wrong and `Request(_)` means the caller asked
-    /// for something inexpressible; this is the third party, the code in
+    /// provider sent something wrong and `Request(_)` describes invalid input,
+    /// provider input limits or unsatisfied target state; this is the code in
     /// between. It derives `RecoveryClass::InternalFailure` (or a
     /// read-back reconcile when a non-idempotent operation may already have
     /// reached the server) and remediation `ReportBug`.
@@ -68,6 +68,35 @@ pub enum TransportErrorKind {
 pub enum RequestErrorKind {
     Malformed,
     BatchInputInvalid,
+    /// Input exceeds a provider's size or cardinality limit.
+    PayloadTooLarge,
+    /// The request is valid, but its target state does not permit it.
+    /// Requires a caller decision or a new target, not an automatic retry.
+    PreconditionFailed,
+}
+
+/// Why a locally unsupported operation was refused. Independent of provider
+/// prose and recovery: callers can explain the unavailable feature precisely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum UnsupportedReason {
+    OperationUnavailable,
+    CapabilityUnavailable,
+    SubmissionUnavailable,
+    ScheduledSendUnavailable,
+    SendAsUnavailable,
+    ForeignScheduledSend,
+    ForeignSubmissionUnavailable,
+    ContainerKind,
+    LabelKind,
+    FlagOperation,
+    CursorScope,
+    Projection,
+    RangeTransport,
+    RequestShape,
+    DataRepresentation,
+    MissingMailboxRole,
+    IdentitySelection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

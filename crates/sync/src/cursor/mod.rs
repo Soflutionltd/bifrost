@@ -30,7 +30,7 @@ use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
 pub use coverage::{
     AckToken, ClaimLookup, CoverageClaim, PendingCoverage, PublicationNumber, PublicationReceipt,
-    Publications, ScopeFence, UndeliveredMark, WalkGeneration,
+    ScopeFence, UndeliveredMark, WalkGeneration,
 };
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,

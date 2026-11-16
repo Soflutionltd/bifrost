@@ -75,9 +75,7 @@ fn require_ok_auth(
 /// post-authentication CAPABILITY refresh is owed is decided by the driver
 /// from the tagged OK alone (`ProtocolState::take_transition`), not here.
 #[derive(Default)]
-pub(crate) struct LoginConsumer {
-    buffered: Vec<UntaggedResponse>,
-}
+pub(crate) struct LoginConsumer {}
 
 impl Consumer for LoginConsumer {
     type Output = ();
@@ -87,18 +85,15 @@ impl Consumer for LoginConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
-        self.buffered.push(resp);
+    ) -> Option<UntaggedResponse> {
+        Some(resp)
     }
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
-        // `buffered` is `Either`-classified data whose only carrier is the
-        // event stream, so a rejected LOGIN surrenders it rather than
-        // dropping it with the consumer.
         if let Err(e) = require_ok_auth(tagged, AuthMechanism::ImapLogin) {
-            return Finalized::failure(e, self.buffered);
+            return Finalized::failure(e, Vec::new());
         }
-        Finalized::success((), self.buffered)
+        Finalized::success((), Vec::new())
     }
 }
 
@@ -107,7 +102,6 @@ pub(crate) struct AuthenticateSaslConsumer {
     client: SaslClient,
     initial: Option<SecretString>,
     pending: Option<SecretString>,
-    buffered: Vec<UntaggedResponse>,
 }
 
 impl AuthenticateSaslConsumer {
@@ -122,7 +116,6 @@ impl AuthenticateSaslConsumer {
             client,
             pending: if sasl_ir_used { None } else { initial.clone() },
             initial,
-            buffered: Vec::new(),
         }
     }
 
@@ -153,12 +146,12 @@ impl Consumer for AuthenticateSaslConsumer {
         resp: UntaggedResponse,
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
-    ) {
-        self.buffered.push(resp);
+    ) -> Option<UntaggedResponse> {
+        Some(resp)
     }
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         if let Err(error) = require_ok_auth(tagged, self.client.mechanism()) {
-            return Finalized::failure(error, self.buffered);
+            return Finalized::failure(error, Vec::new());
         }
         // An enterprise user needs a verified session even when the server
         // claims success early. The driver retires a failed tagged-OK exchange.
@@ -167,14 +160,14 @@ impl Consumer for AuthenticateSaslConsumer {
                 Error::Provider(crate::error::ProviderFailure::Protocol(
                     "SASL initial response was never sent".into(),
                 )),
-                self.buffered,
+                Vec::new(),
             );
         }
         if let Err(error) = self.client.finish() {
             let error = self.named_sasl_error(error);
-            return Finalized::failure(error, self.buffered);
+            return Finalized::failure(error, Vec::new());
         }
-        Finalized::success((), self.buffered)
+        Finalized::success((), Vec::new())
     }
 }
 
@@ -242,8 +235,13 @@ impl AuthenticateScramConsumer {
 }
 impl Consumer for AuthenticateScramConsumer {
     type Output = ();
-    fn on_response(&mut self, resp: UntaggedResponse, notify: NotifyFlags, ctx: &ConsumerContext) {
-        self.0.on_response(resp, notify, ctx);
+    fn on_response(
+        &mut self,
+        resp: UntaggedResponse,
+        notify: NotifyFlags,
+        ctx: &ConsumerContext,
+    ) -> Option<UntaggedResponse> {
+        self.0.on_response(resp, notify, ctx)
     }
     fn finalize(self: Box<Self>, tagged: TaggedResponse, ctx: &ConsumerContext) -> Finalized<()> {
         Box::new(self.0).finalize(tagged, ctx)

@@ -603,3 +603,6 @@ mod error_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

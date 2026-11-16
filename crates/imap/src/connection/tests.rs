@@ -101,7 +101,7 @@ impl dispatch::Consumer for PanickingConsumer {
         _resp: UntaggedResponse,
         _notify: NotifyFlags,
         _ctx: &dispatch::ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
         panic!("intentional panic for test");
     }
 
@@ -126,7 +126,8 @@ impl dispatch::Consumer for UninterpretableConsumer {
         _resp: UntaggedResponse,
         _notify: NotifyFlags,
         _ctx: &dispatch::ConsumerContext,
-    ) {
+    ) -> Option<UntaggedResponse> {
+        None
     }
 
     fn finalize(

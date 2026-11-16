@@ -71,14 +71,14 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
             let Ok((account, _activity, _admission)) = gate.acquire(&record.scopes).await else {
                 break;
             };
-            let handle = record.handle;
+            let teardown = ctx.subscriptions.teardown(&ctx.account_id, &ctx.throttles);
             let _topology = super::TopologyBump(&ctx.push_topology_tx);
             let result = tokio::select! {
                 biased;
                 () = ctx.shutdown.cancelled() => return,
                 result = tokio::time::timeout(
                     ATTEMPT_TIMEOUT,
-                    account.push_unsubscribe(handle.clone()),
+                    teardown.delete(account.as_ref().as_ref(), &record.handle),
                 ) => result,
             };
             // Detach cancels before it takes the registry, so a removal that
@@ -88,20 +88,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 return;
             }
             match result {
-                Ok(Ok(())) => ctx.subscriptions.remove_orphan(&handle),
-                Ok(Err(error)) => {
-                    crate::recovery::observe_failure_throttles(
-                        &ctx.throttles,
-                        &ctx.account_id,
-                        &error,
-                    );
-                    tracing::debug!(
-                        target: "bifrost.sync.push",
-                        account = ?ctx.account_id,
-                        error = %error,
-                        "scheduled orphan teardown failed; retrying next pass"
-                    );
-                }
+                Ok(result) => teardown.settle_registered(&record, &result),
                 Err(_elapsed) => {
                     tracing::debug!(
                         target: "bifrost.sync.push",

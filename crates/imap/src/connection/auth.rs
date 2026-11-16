@@ -231,8 +231,6 @@ impl ImapConnection {
     /// caller is responsible for ensuring the connection is encrypted (the
     /// `LOGINDISABLED` capability is still honored).
     pub async fn login(&self, user: &str, pass: &str, timeout: Duration) -> Result<(), Error> {
-        use super::dispatch::LoginConsumer;
-
         // Reject before the command enters the driver. SASL credentials take
         // their separately framed AUTHENTICATE paths; this validation is only
         // for the line-oriented LOGIN command.
@@ -268,15 +266,14 @@ impl ImapConnection {
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
-        let cmd = Command::Login {
+        let cmd = super::request::Login {
             user: user.to_owned(),
             pass: pass.to_owned().into(),
         };
 
         // The driver completes the post-authentication CAPABILITY refresh
         // inside the same claimed command (`required_capability_refresh`).
-        self.submit_regular(cmd, LoginConsumer::default(), Some(deadline))
-            .await
+        self.submit_request(cmd, Some(deadline)).await
     }
 
     /// Authenticate with SASL PLAIN mechanism (RFC 4616).
@@ -615,12 +612,8 @@ impl ImapConnection {
     pub async fn unauthenticate(&self, timeout: Duration) -> Result<(), Error> {
         let deadline = tokio::time::Instant::now() + timeout;
 
-        self.submit_regular(
-            Command::Unauthenticate,
-            super::dispatch::TaggedOkConsumer::default(),
-            Some(deadline),
-        )
-        .await?;
+        self.submit_request(super::request::Unauthenticate {}, Some(deadline))
+            .await?;
 
         Ok(())
     }
@@ -639,8 +632,6 @@ impl ImapConnection {
     /// The driver arms the LOGOUT effect automatically when it sees
     /// `Command::Logout`.
     pub async fn logout(&self) -> Result<(), Error> {
-        use super::dispatch::LogoutConsumer;
-
         // RFC 3501 Section 3.4: already in Logout state  -  no-op.
         if self.state_rx.borrow().session_state == SessionState::Logout {
             return Ok(());
@@ -649,15 +640,33 @@ impl ImapConnection {
         // No deadline of its own, by design: each caller decides whether to
         // bound LOGOUT. Dropping this future before the driver claims the
         // LOGOUT withdraws it unsent.
-        let _: () = self
-            .submit_regular(Command::Logout, LogoutConsumer::default(), None)
-            .await?;
+        let _: () = self.submit_request(super::request::Logout {}, None).await?;
         Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Submit helpers
     // -----------------------------------------------------------------------
+
+    pub(super) async fn execute_request<R: super::request::Request>(
+        &self,
+        request: R,
+        timeout: Duration,
+    ) -> Result<<R::Consumer as super::dispatch::Consumer>::Output, Error> {
+        self.submit_request(request, Some(tokio::time::Instant::now() + timeout))
+            .await
+    }
+
+    /// Submit a typed request with its single command-consumer pairing. The
+    /// existing common submission path owns snapshot admission and the deadline.
+    pub(super) async fn submit_request<R: super::request::Request>(
+        &self,
+        request: R,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<<R::Consumer as super::dispatch::Consumer>::Output, Error> {
+        let (command, consumer) = request.into_parts();
+        self.submit_regular(command, consumer, deadline).await
+    }
 
     /// Submit a regular (non-continuation) command to the driver task and
     /// await the typed result, bounded by `deadline` (`None`: unbounded).

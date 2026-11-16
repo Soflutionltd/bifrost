@@ -146,3 +146,6 @@ impl SearchSnippetGetResponse {
         self.not_found.as_deref()
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

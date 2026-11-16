@@ -310,6 +310,7 @@ pub(super) async fn search_email_ids<T: HttpTransport>(
                 crate::sync::error::unsupported_error(
                     op,
                     None,
+                    bifrost_types::UnsupportedReason::DataRepresentation,
                     format!("JMAP search total does not fit u64: {error}"),
                 )
             })
@@ -591,6 +592,7 @@ fn search_filter_to_jmap(
             return Err(crate::sync::error::unsupported_error(
                 AccountOperation::Search,
                 None,
+                bifrost_types::UnsupportedReason::RequestShape,
                 "JMAP does not support this SearchFilter variant",
             ));
         }

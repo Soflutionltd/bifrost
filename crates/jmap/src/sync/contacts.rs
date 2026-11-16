@@ -1017,6 +1017,7 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
         super::error::unsupported_error(
             operation,
             None,
+            bifrost_types::UnsupportedReason::DataRepresentation,
             format!("JMAP contact total does not fit u64: {error}"),
         )
     })
@@ -1026,11 +1027,23 @@ fn require_contacts<T: HttpTransport>(
     contacts: Option<ContactAccount<T>>,
     operation: AccountOperation,
 ) -> Result<ContactAccount<T>, AccountError> {
-    contacts.ok_or_else(|| unsupported(operation, "JMAP contacts capability is unavailable"))
+    contacts.ok_or_else(|| {
+        super::error::unsupported_error(
+            operation,
+            None,
+            bifrost_types::UnsupportedReason::CapabilityUnavailable,
+            "JMAP contacts capability is unavailable",
+        )
+    })
 }
 
 fn unsupported(operation: AccountOperation, message: &str) -> AccountError {
-    super::error::unsupported_error(operation, None, message)
+    super::error::unsupported_error(
+        operation,
+        None,
+        bifrost_types::UnsupportedReason::DataRepresentation,
+        message,
+    )
 }
 
 fn to_acct_err(operation: AccountOperation) -> impl Fn(crate::Error) -> AccountError {

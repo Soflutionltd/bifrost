@@ -77,3 +77,6 @@ impl QueryObject for Quota {
     type Filter = Filter;
     type Sort = Comparator;
 }
+
+#[cfg(test)]
+mod wire_tests;

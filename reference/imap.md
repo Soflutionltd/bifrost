@@ -12,6 +12,17 @@ The public consumer surface is intentionally small after S1-W3: `ImapAccountFact
 
 One tokio task owns the socket, parser state, and a watch channel exposing connection state. `DriverTask` keeps its join handle for close and an exit slot for retained session leases. `DriverScope` destroys the driver future and transport before publishing exit or releasing those leases, including abort before first poll, panic and runtime teardown. `ImapConnection` is a cheap internal handle around the driver. Connection methods take `&self` and talk to the driver over channels.
 
+`driver/setup.rs` runs greeting, initial CAPABILITY and STARTTLS before entering
+the command loop, in that same driver task. Readiness publishes the first state
+snapshot before returning the handle. A guard aborts the task if the readiness
+wait is cancelled; setup failures join teardown before returning. Retained pool
+leases therefore cover bootstrap too. One absolute setup deadline and one
+cumulative peer allowance cover all bootstrap exchanges. Absolute expiry uses
+socket progress to distinguish Unsent from InFlight. Greeting ALERTs use the
+driver event sink, and the STARTTLS stream swap alone publishes encryption.
+An enterprise user expects interrupted account setup to release its connection
+and permit a retry, with evidence of setup commands that reached the server.
+
 The driver model is load-bearing for cancellation safety, atomic stream upgrades (STARTTLS, COMPRESS), typed event-queue draining without contending with command I/O, and streaming FETCH without raw stream access.
 
 No boxed-transport escape hatch. Supported transport is `tokio::net::TcpStream` plus optional `tokio_native_tls::TlsStream`.
@@ -111,6 +122,27 @@ Caller-written literals in raw SEARCH-family criteria are the one place literal 
 
 Command admission belongs to `connection/admission.rs`. The handle reports snapshot refusals before submission (`MissingCapability`, worded `<cmd> requires <cap>` for every capability gate; `InvalidState`; `InvalidInput`; ...). The driver reports changed session or capability prerequisites as `StateChangedBeforeSend`. QRESYNC parameters and VANISHED require confirmed `ENABLE QRESYNC`; advertised-but-disabled modes are sequencing errors (`InvalidState`), not unsupported operations. The encoder validates syntax and chooses wire representation without deciding command availability.
 
+`connection/request.rs` pairs each ordinary typed request with its command and
+consumer once. Handle submission and pipeline construction consume these same
+requests. `execute_request` constructs a relative deadline; `submit_request`
+preserves an existing absolute deadline across authentication or APPEND preflight.
+Streaming FETCH and SASL retain their channel and negotiation state. Ordinary
+FETCH and VANISHED-aware FETCH intentionally have different output types; the
+pipeline's tuple-valued UID FETCH uses the same VANISHED-aware request as the
+corresponding handle operation. Pipeline accumulators name consumer values,
+with one Result added by execution, so LIST and SEARCH do not acquire a second
+Result and fail their downcast.
+
+`Consumer::on_response` returns a declined untagged response immediately. Both
+driver routers publish it using the read frame's `code_emitted` flag, preserving
+ordinary events before a later transport failure without duplicating ALERT or
+NOTIFICATIONOVERFLOW. Most consumers retain only their solicited payload.
+SELECT, APPENDUID, COPYUID and mutation-evidence consumers still retain responses
+whose disposition depends on completion; their infallible `Finalized` envelope
+keeps that evidence on NO/BAD as well as OK. Known LIST notification markers
+are declined at receipt, in arrival order. Enterprise users expect unsolicited
+mailbox observations to survive a failed command and arrive once.
+
 Literal-free pipeline batches coalesce their chunk handles into one unsegmented `WireCommand` (`WireCommand::coalesce_unsegmented`) and pass through `send_wire_command`, preserving one flush without copying payload bytes.
 
 **Session legality** is a property of the command: `CommandKind::legal_states` is the one table (RFC 3501 Section 6 and each extension's section; ID, CAPABILITY, NOOP and LOGOUT in every live state, LOGIN / AUTHENTICATE / STARTTLS in NotAuthenticated, ENABLE in Authenticated only, IDLE and the mailbox, APPEND, METADATA, NOTIFY, QUOTA, ACL, COMPRESS and UNAUTHENTICATE commands in Authenticated or Selected, message commands in Selected; no command in Logout). It is read twice, and the two reads report different facts. The handle reads it to refuse a command the caller should not have issued (`require_state(kind)`, `InvalidState`; `Pipeline::execute_raw` checks every command of a batch at execution and `idle()` checks IDLE). The driver reads it again when the command reaches the head of its queue (`prepare_command`, and `run_pipeline` for every command of a batch before any byte), and a refusal there means the session moved while the command waited: `StateChangedBeforeSend`, or `Closed` with `Unsent` in Logout. The driver's own internal commands (connection setup's CAPABILITY, the STARTTLS and COMPRESS upgrades, and the CAPABILITY refresh after STARTTLS, LOGIN / AUTHENTICATE and UNAUTHENTICATE) run under the stated invariant that their admission follows from state the driver owns; the check still runs for them. Session HISTORY is read beside the table at both sites: RFC 5161 Section 3.1 forbids ENABLE once any mailbox has been selected in the session, even after CLOSE or UNSELECT returns it to Authenticated. `ProtocolState::mailbox_selected` records that a SELECT or EXAMINE has succeeded (a refused one selects nothing), the snapshot publishes it, and `CommandKind::refused_after_selection` names the commands it gates (ENABLE only): the handle refuses with `InvalidState`, the driver with `StateChangedBeforeSend`. UNAUTHENTICATE starts a new session and clears it (RFC 8437 Section 2).
@@ -123,7 +155,7 @@ Literal-free pipeline batches coalesce their chunk handles into one unsegmented 
 
 ESEARCH `ALL` sets are normalized before expansion into the flat compatibility `SearchResult`. Parsed sequence bounds retain `*` as `SeqBound::Star`, distinct from the legal numeric UID `4294967295`; `*` is refused wherever it appears because its concrete value is unknowable from the response. Legal numeric maximum values can therefore be expanded normally. Legal overlap or repetition is sorted and merged, so both the 1e6 safety cap and the expanded ids count each UID once. An expansion that cannot be completed is `ResultLimit::SearchTruncated`, never a partial list presented as complete, and the solicited ESEARCH stays consumed by the command rather than being republished as an asynchronous event.
 
-APPEND and MULTIAPPEND are `Command::Append { mailbox, messages, multi }`, encoded, validated and sent by the driver from live protocol state when the command reaches the head of the queue, exactly like every other command (see "One command path"). The handle (`ImapConnection::append` / `append_message` / `multi_append`) does only the client-side APPENDLIMIT check, then submits the command through `submit_regular` with `AppendConsumer` / `MultiAppendConsumer`; it makes no wire decision. That is the invariant: an earlier design built the bytes handle-side and queued them, which froze the mailbox encoding (modified UTF-7 versus UTF-8), the RFC 6855 `UTF8 (` wrapper, the RFC 7888 `+` markers and literal8 eligibility while the command sat behind another one. APPEND uses the driver's tag generator like every command. APPEND is not pipelinable (`CommandKind::pipelinable`): a batch does not run its APPENDLIMIT preflight, and the batch router does not hand an untagged `* OK [APPENDUID ...]` to an APPEND consumer that a head consumer claims first.
+APPEND and MULTIAPPEND are `Command::Append { mailbox, messages, multi }`, encoded, validated and sent by the driver from live protocol state when the command reaches the head of the queue, exactly like every other command (see "One command path"). The handle (`ImapConnection::append` / `append_message` / `multi_append`) does only the client-side APPENDLIMIT check, then submits `AppendOne` / `AppendMany` requests with their paired `AppendConsumer` / `MultiAppendConsumer`; it makes no wire decision. That is the invariant: an earlier design built the bytes handle-side and queued them, which froze the mailbox encoding (modified UTF-7 versus UTF-8), the RFC 6855 `UTF8 (` wrapper, the RFC 7888 `+` markers and literal8 eligibility while the command sat behind another one. APPEND uses the driver's tag generator like every command. APPEND is not pipelinable (`CommandKind::pipelinable`): a batch does not run its APPENDLIMIT preflight, and the batch router does not hand an untagged `* OK [APPENDUID ...]` to an APPEND consumer that a head consumer claims first.
 
 The APPEND arm of the encoder (`commands/append.rs`) validates against the live options: `MissingCapability("MULTIAPPEND")` when `multi` and the capability is absent, `InvalidInput` for an empty or wrongly-shaped message list, `InvalidAppendDate`, and flag-keyword errors; `\Recent` and `\*` are dropped from flags. The mailbox uses `opts.utf8_mode` (`UTF8=ACCEPT` or active rev2) like every other command. The body form is chosen WRAPPER FIRST: once `UTF8=ACCEPT` is enabled every message rides the RFC 6855 Section 4 `UTF8 (~{n}` ... `)` wrapper (active rev2 alone does not select it), and its literal8 payload is defined by RFC 6855 independently of the BINARY advertisement, so a NUL-bearing body inside the wrapper needs no BINARY. Outside the wrapper a NUL-bearing body takes `~{n}` and requires an advertised BINARY (RFC 3516 Section 4.4; active `IMAP4rev2` does not stand in, since rev2 folds in only BINARY's FETCH side), else `MissingCapability`. Every marker is the writer's choice: non-synchronizing per RFC 7888 (LITERAL+ any size, LITERAL- and rev2 up to 4096), and both literal8 forms additionally need BINARY and a non-rev2 connection.
 
@@ -1055,7 +1087,7 @@ race cannot be closed by this client.
   `imapthread1`/`imapthread2` handles retain their explicit UID snapshot
   semantics and remain the fallback when neither key exists.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
-- Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. How UIDVALIDITY changes are classified elsewhere in the account is a separate open question. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
+- Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. Stale message ids and part handles instead return terminal `Request(PreconditionFailed)`: the user must refresh the target, and replaying an old UID in a new epoch is unsafe. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
 - Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
@@ -1203,7 +1235,7 @@ for requested UIDs; later mutable fields win and immutable data fills gaps.
 
 Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
 
-- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
+- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(PreconditionFailed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - Wire selection and conversion kind are chosen together by one projection
   plan. Unknown projections fail each item as Unsupported before any folder
   checkout; MIME projections whose
@@ -1354,15 +1386,13 @@ count, and trailing reads after the last emitted batch have no batch field;
 these figures are batch observations, not complete command or TCP/TLS totals.
 
 An IDLE read pre-spends a slot before waiting on the peer; it holds no budget
-lock or exclusive turn. Bootstrap greeting, CAPABILITY and STARTTLS each have
-one absolute exchange deadline that includes admission, unsolicited responses,
-and (for STARTTLS) the handshake and post-upgrade CAPABILITY. Each exchange also
-has a cumulative peer-wait allowance: admitted I/O spends it, admission does
-not, and individual reads cannot reset it. The allowance is shared across
-stream upgrades and charges cancelled pending I/O as well. Bootstrap creates
-one peer budget before reading the greeting and reuses it for an initial
-CAPABILITY fetch and STARTTLS, including the TLS handshake and post-upgrade
-CAPABILITY. Re-entering a setup phase cannot reset the allowance.
+lock or exclusive turn. Bootstrap (greeting, initial CAPABILITY, STARTTLS, the
+TLS handshake and post-upgrade CAPABILITY) runs under one absolute setup
+deadline spanning every phase, not one per phase. It also has one cumulative
+peer-wait allowance: admitted I/O spends it, admission does not, and individual
+reads cannot reset it. The allowance is shared across stream upgrades and
+charges cancelled pending I/O as well. Re-entering a setup phase cannot reset
+either bound.
 ManageSieve places a cumulative peer-read allowance below `MeteredStream`,
 covering one whole line or literal while excluding admission waits. Explicit
 command deadlines still bound the whole operation, including admission.
@@ -1523,7 +1553,7 @@ The shared account translation finalizer applies the same context and attempt
 rules to both protocols. The filter adapter keeps all five operations and
 the existing CHECKSCRIPT diagnostics behavior.
 
-`classify_sieve` overrides that default only where it is actively wrong: `TRYLATER` -> `Server(Unavailable)` (retryable - it explicitly asks to be retried, and was previously permanent), `QUOTA[/MAXSCRIPTS|/MAXSIZE]` -> `Server(QuotaExhausted)` + account throttle, `NONEXISTENT` -> `NotFound(Filter)`, `ALREADYEXISTS` -> `ConcurrencyConflict`, `ACTIVE` -> `Request(Malformed)` (a precondition the caller must satisfy), `AUTH-TOO-WEAK` / `ENCRYPT-NEEDED` -> `Authorization(PolicyBlocked)`, `TRANSITION-NEEDED` / `SASL` -> `Authentication(ReauthorizationRequired)`, `REFERRAL` -> `Unsupported(op)`. An absent, advisory (`WARNINGS`, `TAG`), or unmodelled extension code keeps the terminal default - "the server refused and did not say why" - and `Other(_)` preserves the raw spelling for diagnostics.
+`classify_sieve` overrides that default only where it is actively wrong: `TRYLATER` -> `Server(Unavailable)` (retryable - it explicitly asks to be retried, and was previously permanent), `QUOTA[/MAXSCRIPTS|/MAXSIZE]` -> `Server(QuotaExhausted)` + account throttle, `NONEXISTENT` -> `NotFound(Filter)`, `ALREADYEXISTS` -> `ConcurrencyConflict`, `ACTIVE` -> `Request(PreconditionFailed)` (deactivate first; terminal, not a caller bug), `AUTH-TOO-WEAK` / `ENCRYPT-NEEDED` -> `Authorization(PolicyBlocked)`, `TRANSITION-NEEDED` / `SASL` -> `Authentication(ReauthorizationRequired)`, `REFERRAL` -> `Unsupported(op)`. An absent, advisory (`WARNINGS`, `TAG`), or unmodelled extension code keeps the terminal default - "the server refused and did not say why" - and `Other(_)` preserves the raw spelling for diagnostics.
 
 CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the validation verdict, so it becomes `FilterValidation` diagnostics. `validation_outcome` makes the transient codes the exception - a `TRYLATER` means the server never compiled the script, so reporting it as a validation failure would tell the user their script is broken when it may be fine, and would discard the retryable classification.
 
@@ -1539,6 +1569,27 @@ Repeatable because the cache is cleared; caller ConditionalFlags are Blocking
 because their unchanged-since precondition was made false. The remove primary
 is Repeatable and retains its leaf. Item lanes read the recorded primary's
 application, never the historical successful command's evidence.
+
+### Request limits and target preconditions
+
+`APPENDLIMIT`, `TOOBIG`, `MAXCONVERTMESSAGES`, `MAXCONVERTPARTS` and
+`METADATA MAXSIZE` are `Request(PayloadTooLarge)`. Native response codes and
+acknowledgement remain on server refusals; the preflight APPENDLIMIT guard is
+unsent. These cover cardinality as well as byte size.
+
+Non-empty mailbox deletion and ManageSieve ACTIVE are
+`Request(PreconditionFailed)`. All stale-epoch message accesses share the same
+classification: mutation, hydration, PIM reads, raw reads and part handles.
+An enterprise Outlook user expects a meaningful refusal and a refreshed target,
+not a bug report or a retry of an obsolete UID. These preconditions are terminal
+`ProviderRefused`; they do not reset durable folder cursors. Search page state
+still uses its separate repeat-the-search conflict, and sync cursors still
+restart their folder on UIDVALIDITY change.
+
+Local FETCH retained-result, literal and SEARCH expansion budgets use
+`Internal(LimitExceeded)`. These are implementation safety limits, not malformed
+input from the user. Completed FETCH and SEARCH answers retain Acknowledged;
+a literal cap fires before consuming the full reply and carries InFlight.
 
 ### Push lifecycle
 
@@ -1721,10 +1772,10 @@ crates/imap/src/
 |   |-- auth.rs      - PLAIN/LOGIN/XOAUTH2/OAUTHBEARER/CRAM-MD5/SCRAM wire
 |   |-- config.rs    - ImapConfig, internal account dial path
 |   |-- dispatch.rs  - command dispatch, FETCH consumer
-|   |-- driver/      - driver task
+|   |-- driver/      - driver task; setup.rs runs greeting, CAPABILITY, STARTTLS
 |   |-- ergonomics.rs - uid_fetch_each, _limited, _full_messages
 |   |-- helpers.rs   - server_profile, drain_events, ...
-|   |-- lifecycle.rs - greeting, STARTTLS, ENABLE
+|   |-- lifecycle.rs - connect, readiness wait and setup guard, STARTTLS entry
 |   |-- pipeline/    - command pipelining
 |   |-- reply.rs     - queued/claimed/committed/withdrawn admission arbiter
 |   |-- seq_ops.rs   - sequence-number command surface
@@ -1838,7 +1889,7 @@ Every error keeps the calling PIM operation for recovery classification.
 
 The Result adapter retains committed per-window effects and the failing stage
 in crate-local `FolderProgress`. Windows use `mutation_batch_size` (at least
-one). A stale-epoch target receives the shared `Request(Malformed)` answer;
+one). A stale-epoch target receives the shared `Request(PreconditionFailed)` answer;
 valid targets in the same window can still commit. The first failure becomes
 the single Result error, with any additional failures retained as sibling legs
 when a partial-commit record is needed. An Outlook user expects an applied
